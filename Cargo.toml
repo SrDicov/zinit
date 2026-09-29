@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = ["crates/zcore", "crates/zconfig", "crates/zrt"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/SrDicov/zinit"
+description = "zinit - an init system with a single concept: desired state"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Release: abort on panic.
+#
+# Rationale: the supervisor is a child of PID 1. If it panics, PID 1 relaunches
+# it and re-attaches to live services. Aborting is strictly better than
+# unwinding here, because unwinding through a C-level frame is undefined.
+# -------------------------------------------------------------------------- 
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = "s"
+strip = true
+
+[profile.dev]
+panic = "abort"
+
+# NOTE: `panic` in `[profile.test]` is ignored by cargo - the test harness
+# always uses unwind, which is what we want. The `[profile.dev]` setting above
+# therefore governs `cargo test` in practice for the lib being built, and the
+# harness is unaffected.

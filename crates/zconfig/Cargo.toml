@@ -1,0 +1,21 @@
+[package]
+name = "zconfig"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "zinit service description parser, dependency graph and frozen plan"
+
+[dependencies]
+zcore = { path = "../zcore" }
+
+# INTENTIONALLY EMPTY beyond zcore.
+#
+# zconfig turns `&str` into a `Plan`. It never opens a file and never reads
+# the clock: the caller (zsup, zctl or zcheck) supplies the text. That is what
+# lets `zcheck` validate a description without touching the filesystem, and
+# lets zctl parse an inline description for `--from-stdin`.
+
+[lints]
+workspace = true

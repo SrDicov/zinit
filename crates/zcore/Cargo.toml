@@ -1,0 +1,22 @@
+[package]
+name = "zcore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "zinit core: pure state machine, no I/O, no libc"
+
+[dependencies]
+# INTENTIONALLY EMPTY.
+#
+# zcore models the service state machine and nothing else. It cannot open a
+# file, cannot call a syscall, cannot read the clock and cannot allocate from a
+# global heap: it takes `now_ms` as a parameter and returns `Vec<Action>`.
+#
+# This is enforced mechanically by `#![no_std]` + `#![forbid(unsafe_code)]`,
+# not by convention. If the core needs to do something impure, the answer is
+# always "return an Action and let zrt do it", never "add a dependency".
+
+[lints]
+workspace = true

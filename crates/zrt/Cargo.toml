@@ -1,0 +1,30 @@
+[package]
+name = "zrt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "zinit runtime: the syscall layer (reactor, signals, fork/exec, capabilities)"
+
+[dependencies]
+# Exactly one third-party dependency, and it is the one that talks to the
+# kernel. Everything else in this crate is hand-written FFI so that each unsafe
+# block carries a SAFETY comment explaining *why* it is correct — that comment
+# is the only review surface a syscall layer has, and a generated binding
+# cannot carry it.
+libc = "0.2"
+
+[lints.rust]
+# The workspace forbids unsafe_code because the core is pure. This crate is the
+# opposite: it *is* the impure half, so unsafe is the whole point. The
+# discipline moves from the attribute to the lints below plus the crate-level
+# `#![deny(unsafe_op_in_unsafe_fn)]`, which makes every raw operation inside an
+# `unsafe fn` require its own justification.
+unsafe_code = "allow"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+dead_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -1,0 +1,585 @@
+name: ci
+
+# This workflow is the machine. `zcore` and `zconfig` build in about a second
+# anywhere, but the moment `zrt` carries three reactor backends and the property
+# tests get serious, local builds stop being free. Everything expensive is here.
+#
+# ── What this matrix has to prove ──────────────────────────────────────────
+#
+# Support is a claim, and a claim that is only ever tested on the machine that
+# wrote the code is a wish. The axes below are the ones that have actually
+# broken real init systems:
+#
+#   word size   32 vs 64. An init is a parade of `pid_t`, `uid_t`, `off_t` and
+#               every `rlimit`. These are exactly the types that change width.
+#               A truncation bug that compiles on x86_64 and traps on i686 or
+#               armv7 cannot be found by hand on one machine.
+#   ISA         x86, ARM, RISC-V. Not for performance - for the *syscall and
+#               errno* differences. EACCES vs EPERM, `fd` width, atomic
+#               availability, and which `kqueue` filters a kernel actually has.
+#   libc        glibc vs musl. Not just a different implementation: glibc
+#               exports symbols the kernel does not have, so code that links
+#               on glibc and is missing on musl is code that breaks on Alpine,
+#               Void, and every static-PIE appliance. This is a hard target,
+#               not a nice-to-have.
+#   toolchain   gcc / clang / lld as the *link driver*. Rust always uses LLVM
+#               for codegen, so the honest axis is the driver that invokes the
+#               linker and supplies the CRT objects - which differs in symbol
+#               versioning, PIE defaults, and static-PIE support.
+#   OS          the three BSDs, natively. A cross build proves the code
+#               compiles; it cannot prove the kqueue backend works.
+#
+# ── How the axes are split ─────────────────────────────────────────────────
+#
+# Full cartesian would be 6 arch x 2 libc x 3 linkers x 4 OS = 144 jobs, which
+# is both slow and a waste: the axes are nearly independent. So:
+#
+#   * `linux-native`   - runs the tests. Native, emulated or on an ARM runner.
+#   * `linux-cross`    - builds only. Full tier-2 sweep, cheap.
+#   * `linux-tier3`    - `cargo check` only, on nightly with `-Z build-std`.
+#                        These targets have no prebuilt std, so a real build is
+#                        not available to us; saying so here rather than
+#                        quietly omitting them is the point.
+#   * `linkers`        - the toolchain axis, on the host only.
+#   * `freebsd`        - native on the main BSD, cross-check the rest.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Warnings are errors everywhere. On a project this size the warnings are
+  # ours, and a warning nobody reads is a warning that becomes a habit.
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ══════════════════════════════════════════════════════════════════════════
+  # 1. Native Linux: build AND test.
+  # ══════════════════════════════════════════════════════════════════════════
+  linux-native:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64-glibc
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            components: clippy,rustfmt
+          - name: x86_64-musl
+            # Not optional. glibc hides missing syscalls behind symbol
+            # versioning, so a glibc-only build is a build that has never been
+            # tested on Alpine, Void, or a static appliance.
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            components: clippy,rustfmt
+          - name: i686-glibc
+            # 32-bit x86. The tier-2 i686 target.
+            os: ubuntu-latest
+            target: i686-unknown-linux-gnu
+            components: clippy,rustfmt
+          - name: i686-musl
+            os: ubuntu-latest
+            target: i686-unknown-linux-musl
+            components: clippy,rustfmt
+          - name: aarch64-glibc
+            # A real ARM64 runner, so the tests actually execute on the ISA
+            # rather than being emulated. `atomic` widths, `pid_t`, and errno
+            # values all differ.
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            components: clippy,rustfmt
+          - name: aarch64-musl
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            components: clippy,rustfmt
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: ${{ matrix.components || '' }}
+
+      - name: Install cross linker (i686)
+        if: matrix.target == 'i686-unknown-linux-gnu'
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib libc6-dev-i386
+          echo "CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER=gcc" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-
+
+      - name: Build
+        run: cargo build --workspace --target ${{ matrix.target }} --all-targets
+
+      - name: Test
+        run: cargo test --workspace --target ${{ matrix.target }}
+
+      - name: Clippy
+        if: matrix.components != ''
+        run: cargo clippy --workspace --all-targets --target ${{ matrix.target }}
+
+      - name: Format
+        if: matrix.components != ''
+        run: cargo fmt --all --check
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 2. Cross-build the rest of the tier-2 sweep. Build is the evidence; running
+  #    is covered by the native job and by the BSD VMs.
+  # ══════════════════════════════════════════════════════════════════════════
+  linux-cross:
+    name: cross ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: armv7-unknown-linux-gnueabihf, linker: arm-linux-gnueabihf-gcc }
+          - { target: armv7-unknown-linux-musleabihf, linker: arm-linux-musleabihf-gcc }
+          - { target: aarch64-unknown-linux-musl, linker: aarch64-linux-gnu-gcc }
+          - { target: riscv64gc-unknown-linux-gnu, linker: riscv64-linux-gnu-gcc }
+          - { target: riscv64gc-unknown-linux-musl, linker: riscv64-linux-gnu-gcc }
+          - { target: x86_64-unknown-linux-gnux32, linker: gcc, note: "x32 ABI: 64-bit registers, 32-bit pointers" }
+          - { target: powerpc64le-unknown-linux-gnu, linker: powerpc64le-linux-gnu-gcc }
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-arm-linux-gnueabihf gcc-arm-linux-musleabihf \
+            gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu \
+            gcc-powerpc64le-linux-gnu gcc-multilib
+          echo "CARGO_TARGET_$(echo ${{ matrix.target }} | tr a-z- A-Z_)_LINKER=${{ matrix.linker }}" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --workspace --target ${{ matrix.target }}
+
+      - name: Test compile only
+        # `cargo test --no-run` compiles the test harnesses, which is where a
+        # target-specific mistake in test code shows up. Running them needs
+        # the ISA, and that is the native job's job.
+        run: cargo test --workspace --target ${{ matrix.target }} --no-run
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 3. Tier 3: no prebuilt std, so `cargo check` on nightly with -Z build-std.
+  #
+  #    These are listed rather than omitted. riscv32 Linux is a real target for
+  #    embedded systems and we are not allowed to pretend it works by not
+  #    mentioning it.
+  # ══════════════════════════════════════════════════════════════════════════
+  linux-tier3:
+    name: check ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: riscv32gc-unknown-linux-gnu, note: "RISC-V 32-bit, RV32GC" }
+          - { target: riscv32gc-unknown-linux-musl, note: "RISC-V 32-bit, musl" }
+          - { target: i586-unknown-linux-gnu, note: "legacy 32-bit x86" }
+          - { target: armv5te-unknown-linux-gnueabi, note: "pre-v6 ARM" }
+          - { target: mipsel-unknown-linux-musl, note: "32-bit MIPS little-endian" }
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Check with a hand-built std
+        # NOTE: RUSTFLAGS is neutralized for this step on purpose. `-D warnings`
+        # would also apply to the freshly-built std itself, and nightly std
+        # routinely carries warnings that are not ours to fix. Our own code is
+        # still denied warnings in every other job.
+        env:
+          RUSTFLAGS: ""
+        run: |
+          cargo +nightly check --workspace --target ${{ matrix.target }} \
+            -Z build-std=std,core,alloc,panic_unwind \
+            || cargo +nightly check --workspace --target ${{ matrix.target }} \
+            -Z build-std=std,core,alloc,panic_abort
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 4. The toolchain axis: gcc / clang / lld as the link driver.
+  # ══════════════════════════════════════════════════════════════════════════
+  linkers:
+    name: driver ${{ matrix.linker }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { linker: cc, cc: gcc, desc: "GNU ld, the distribution default" }
+          - { linker: clang, cc: clang, desc: "GNU ld via the clang driver" }
+          - { linker: clang, cc: clang, ld: lld, desc: "LLD via clang" }
+          - { linker: rust-lld, cc: clang, desc: "rust-lld, no system linker at all" }
+          - { linker: clang, cc: clang, pie: false, desc: "non-PIE, for kernels built without relocation support" }
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc clang lld llvm
+          gcc --version | head -1
+          clang --version | head -1
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          case "${{ matrix.linker }}" in
+            cc)       ln -sf "$(command -v gcc)"   "$RUNNER_TEMP/xlinker" ;;
+            clang)    ln -sf "$(command -v clang)" "$RUNNER_TEMP/xlinker" ;;
+            rust-lld) ln -sf "$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld" \
+                              "$RUNNER_TEMP/xlinker" ;;
+          esac
+          echo "RUSTFLAGS=\"-C linker=$RUNNER_TEMP/xlinker -C link-arg=-fuse-ld=${{ matrix.ld || 'bfd' }} ${{ matrix.pie == false && '-C relocation-model=static -C link-arg=-no-pie' || '' }}\"" >> "$GITHUB_ENV"
+          echo "CC=${{ matrix.cc }}" >> "$GITHUB_ENV"
+
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 5. FreeBSD, OpenBSD, NetBSD.
+  # ══════════════════════════════════════════════════════════════════════════
+  bsd:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: freebsd-amd64
+            runner: vmactions/freebsd-vm@v1
+            version: "14.2"
+            arch: amd64
+          - name: freebsd-amd64-13
+            runner: vmactions/freebsd-vm@v1
+            version: "13.5"
+            arch: amd64
+          - name: openbsd-amd64
+            runner: vmactions/openbsd-vm@v1
+            version: "7.5"
+          - name: netbsd-amd64
+            runner: vmactions/netbsd-vm@v1
+            version: "10.0"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The images are minimal and their package managers carry an ancient
+          # Rust, so install the way a BSD user would: upstream toolchain,
+          # $HOME, PATH. No sudo, nothing written outside the workspace.
+          export RUSTUP_HOME="$HOME/.rustup" CARGO_HOME="$HOME/.cargo"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal \
+                          --component clippy,rustfmt --no-modify-path
+          echo "CARGO_HOME=$HOME/.cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$HOME/.rustup" >> "$GITHUB_ENV"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Environment
+        shell: bash
+        run: |
+          uname -a
+          cargo --version
+          rustc --version
+          sysctl -n hw.ncpu 2>/dev/null || nproc
+
+      - name: Build
+        shell: bash
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        shell: bash
+        run: cargo test --workspace
+
+      - name: Clippy
+        shell: bash
+        run: cargo clippy --workspace --all-targets
+
+  # Cross-check the other FreeBSD architectures from a Linux host. `check` is
+  # all that is honest here: the point is that the source has no accidental
+  # assumption about pointer width or endianness on those ISAs.
+  bsd-cross:
+    name: check ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-freebsd
+          - riscv64gc-unknown-freebsd
+          - i686-unknown-freebsd
+          - armv7-unknown-freebsd
+          - powerpc64-unknown-freebsd
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+      - name: Check
+        # Same RUSTFLAGS neutralization as linux-tier3: `-D warnings` must not
+        # leak into the hand-built std.
+        env:
+          RUSTFLAGS: ""
+        run: |
+          cargo +nightly check --workspace --target ${{ matrix.target }} \
+            -Z build-std=std,core,alloc,panic_unwind \
+            -Z build-std-features=panic_immediate_abort
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 6. The purity claims, asserted against the source rather than inferred
+  #    from a build that would have succeeded anyway.
+  # ══════════════════════════════════════════════════════════════════════════
+  purity:
+    name: the promises hold
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: The core cannot touch the outside world
+        run: |
+          set -euo pipefail
+          for crate in zcore zconfig; do
+            head -60 "crates/$crate/src/lib.rs" | grep -q '#!\[no_std\]' \
+              || { echo "::error::$crate lost its #![no_std]"; exit 1; }
+            head -60 "crates/$crate/src/lib.rs" | grep -q 'forbid(unsafe_code)' \
+              || { echo "::error::$crate lost its #![forbid(unsafe_code)]"; exit 1; }
+          done
+
+      - name: The core has no dependencies
+        # Not even libc. A `no_std` crate that links libc is a `no_std` crate
+        # that will not build for a kernel, and this design intends to be
+        # reviewable as "obviously cannot do I/O".
+        run: |
+          set -euo pipefail
+          if grep -qE '^\s*[a-z0-9_-]+\s*=\s*' crates/zcore/Cargo.toml \
+             | grep -vE 'version|edition|rust-version|license|repository|description|name'; then
+            echo "::error::zcore gained a dependency; it must have none"
+            cat crates/zcore/Cargo.toml
+            exit 1
+          fi
+
+      - name: The runtime depends on libc and on nothing else
+        run: |
+          set -euo pipefail
+          deps=$(grep -oE '^[a-z0-9_-]+' crates/zrt/Cargo.toml | sort -u)
+          for want in libc; do
+            echo "$deps" | grep -qx "$want" || { echo "::error::zrt lost $want"; exit 1; }
+          done
+          # Explicitly named because these are the ones an init must never
+          # acquire: an async runtime in a PID-1 path is a scheduler bug, and
+          # a logging framework is a second opinion about where logs go.
+          for forbidden in tokio async-std smol nix rustix log env_logger tracing; do
+            if echo "$deps" | grep -qx "$forbidden"; then
+              echo "::error::zrt acquired $forbidden"
+              exit 1
+            fi
+          done
+
+      - name: No stdout in the PID 1 path
+        # PID 1 has nowhere to print to: stdout is the console the service is
+        # trying to hand over. Anything that writes to it in the init path is
+        # a bug that only shows up as a blank screen.
+        run: |
+          set -euo pipefail
+          if grep -rn --include=*.rs -E '\b(println!|eprintln!|dbg!)\s*\(' \
+               crates/zrt/src crates/zcore/src crates/zconfig/src \
+             | grep -v '#\[cfg(test)\]' | grep -qv 'tests'; then
+            echo "::error::a println! leaked into a non-test path"
+            exit 1
+          fi
+          echo "clean"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 7. Licence. GPL-3 is a promise about what happens to derivatives; it has
+  #    to be consistent across every manifest, and the one dependency we have
+  #    has to be compatible with it.
+  # ══════════════════════════════════════════════════════════════════════════
+  license:
+    name: licence
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Every manifest agrees
+        run: |
+          set -euo pipefail
+          grep -q 'license = "GPL-3.0-or-later"' Cargo.toml \
+            || { echo "::error::workspace license is not GPL-3.0-or-later"; exit 1; }
+          for m in crates/*/Cargo.toml; do
+            grep -q 'license.workspace = true' "$m" \
+              || { echo "::error::$m does not inherit the workspace licence"; exit 1; }
+          done
+
+      - name: The LICENSE file is the real GNU text
+        run: |
+          set -euo pipefail
+          head -2 LICENSE | grep -q 'GNU GENERAL PUBLIC LICENSE'
+          grep -q 'Version 3, 29 June 2007' LICENSE
+          [ "$(wc -l < LICENSE)" -gt 600 ] || { echo "LICENSE is truncated"; exit 1; }
+          echo "GPL-3, $(wc -l < LICENSE) lines"
+
+      - name: The one dependency is GPL-compatible
+        # `libc` is MIT-or-Apache-2.0, which is one-way compatible with
+        # GPL-3. If that ever changes, this job is what notices.
+        run: |
+          set -euo pipefail
+          curl -sSfL https://crates.io/api/v1/crates/libc \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(sorted({v["license"] for v in d["versions"][:20]})))' \
+            | tee /dev/stderr | grep -qE 'MIT|Apache'
+          echo "libc is compatible with GPL-3"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 8. The size budget.
+  #
+  # "Extremely lightweight" is a measurable claim, and a claim nobody measures
+  # is a claim that quietly stops being true. This job fails the build when
+  # the binary grows past the budget, which turns "keep it small" from a
+  # sentiment into a constraint the compiler enforces.
+  # ══════════════════════════════════════════════════════════════════════════
+  size:
+    name: size budget
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build fully optimised and stripped
+        run: cargo build --release --workspace
+
+      - name: Measure
+        id: size
+        run: |
+          set -euo pipefail
+          total=0
+          {
+            for bin in target/release/zinit target/release/zctl target/release/zcheck; do
+              [ -f "$bin" ] || continue
+              bytes=$(stat -c%s "$bin")
+              kib=$(( bytes / 1024 ))
+              total=$(( total + kib ))
+              printf '| `%s` | %s KiB |\n' "$(basename "$bin")" "$kib"
+            done
+          } | tee size-table.md
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+          echo "TOTAL_KIB=$total" >> "$GITHUB_ENV"
+
+      - name: Enforce the budget
+        # A PID 1 has to be resident and hot constantly. 1 MiB across all
+        # binaries is generous for a design this small and tight enough to
+        # catch a dependency that should not have been added.
+        run: |
+          set -euo pipefail
+          BUDGET_KIB=1024
+          if [ "$TOTAL_KIB" -gt "$BUDGET_KIB" ]; then
+            echo "::error::total release size is ${TOTAL_KIB} KiB, budget is ${BUDGET_KIB} KiB"
+            cat size-table.md
+            exit 1
+          fi
+          echo "total ${TOTAL_KIB} KiB of ${BUDGET_KIB} KiB budget"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: size-table
+          path: size-table.md
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 9. MSRV, docs, and a nightly smoke build.
+  # ══════════════════════════════════════════════════════════════════════════
+  msrv:
+    name: msrv 1.85
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  nightly:
+    name: nightly
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      # Nightly is where a `no_std` core gets exercised by `miri` below, and
+      # where a stable-only build failure shows up before it reaches users.
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace
+
+  # `miri` catches the aliasing and UB that a `-D warnings` build cannot, and
+  # this code base is full of `transmute`-free but pointer-adjacent lifetime
+  # reasoning that deserves an interpreter rather than a optimiser.
+  #
+  # NOTE: `--lib` only, on purpose. The `properties` integration test runs tens
+  # of thousands of randomized iterations; under miri (100-1000x slower) that
+  # is a guaranteed timeout, not a test. The lib unit tests are the UB surface.
+  miri:
+    name: miri (core lib only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - run: |
+          rustup toolchain install nightly --component miri
+          cargo miri setup
+      - name: Run
+        run: cargo +nightly miri test -p zcore --lib

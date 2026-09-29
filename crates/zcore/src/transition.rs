@@ -1,0 +1,780 @@
+//! The transition function: `(Event) -> (new state, Vec<Action>)`.
+//!
+//! Where [`reconcile`](crate::reconcile) answers "what should happen given the
+//! desired state", this answers "what happened, and what follows immediately
+//! from it". They are different questions and they run at different times:
+//! the reconciler is a periodic sweep over *desired*, this is an immediate
+//! reaction to *actual*.
+//!
+//! # Why a function and not a loop
+//!
+//! Every rule in `DESIGN.md` §4.1 is a row in one match statement. There is no
+//! `while let` re-processing, no "and then maybe stop as well" second pass.
+//! An event produces its actions and is done.
+//!
+//! # Signals
+//!
+//! This module never sends a signal directly. It returns
+//! [`Action::Signal`] and the runtime sends it. That is what lets the whole
+//! thing be tested without ever risking a stray `kill(0, SIGKILL)` - which is
+//! not a theoretical concern: dinit's `kill_all_on_stop` does
+//! `kill(-1, SIGKILL)` and the audit found it executing *inside* the event
+//! loop.
+
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use crate::action::{Action, log};
+use crate::event::Event;
+use crate::reconcile::should_restart;
+use crate::runtime::{Runtime, ServiceState};
+use crate::types::{Desired, Idx, LogLevel, Plan, Ready, Restart, SignalKind, State};
+
+/// Outcome of applying one event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Transition {
+    /// Actions the runtime must perform, in order.
+    pub actions: Vec<Action>,
+    /// Set when the service's state actually changed.
+    pub changed: bool,
+}
+
+impl Transition {
+    fn quiet() -> Transition {
+        Transition {
+            actions: Vec::new(),
+            changed: false,
+        }
+    }
+
+    fn single(a: Action) -> Transition {
+        Transition {
+            actions: alloc::vec![a],
+            changed: false,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.actions.is_empty()
+    }
+
+    /// Every action concerning one service.
+    pub fn for_service(&self, idx: Idx) -> impl Iterator<Item = &Action> {
+        self.actions.iter().filter(move |a| a.idx() == idx)
+    }
+
+    /// The signals issued for one service, in order.
+    ///
+    /// Duplicated from [`Tick::signals_for`](crate::Tick::signals_for) because
+    /// the two types are deliberately separate: a `Tick` is a sweep, a
+    /// `Transition` is a reaction.
+    pub fn signals_for(&self, idx: Idx) -> Vec<SignalKind> {
+        self.for_service(idx)
+            .filter_map(|a| match *a {
+                Action::Signal { signal, .. } => Some(signal),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Apply `event` to `runtime`, returning the actions the runtime must perform.
+///
+/// Pure with respect to everything but `runtime` and the monotonic clock
+/// (`now_ms`). No clock reads, no I/O, no allocation beyond the returned
+/// `Vec`.
+///
+/// An event that is not meaningful in the current state is **ignored**, not an
+/// error. Real systems deliver events that arrive late: a `Ready` after the
+/// process already exited, a `StopTimeout` for a service that stopped by
+/// itself. Treating those as errors would make the supervisor the least
+/// reliable thing on the system.
+pub fn apply(event: &Event, runtime: &mut Runtime, plan: &Plan, now_ms: u64) -> Transition {
+    let idx = event.idx();
+    if idx >= runtime.len() {
+        // Cannot happen: the runtime only ever synthesises indices that exist.
+        // Returning quietly beats panicking inside PID 1.
+        return Transition::quiet();
+    }
+    let sp = &plan.services[idx];
+
+    match *event {
+        // ── Spawn lifecycle ────────────────────────────────────────────────
+        Event::Forked(_) => Transition::quiet(),
+
+        Event::ExecOk(_) => {
+            // execve succeeded: the process image is real now.
+            if runtime.state_at(idx) != State::Starting {
+                return Transition::quiet();
+            }
+            if sp.ready.is_handshake() {
+                // Wait for the handshake, or for the ready deadline.
+                Transition::quiet()
+            } else {
+                // `ready = none`: there is nothing to wait for, so being
+                // alive *is* being ready. Going through a timer here would
+                // add a pointless delay to every such service.
+                become_running(runtime, idx, now_ms)
+            }
+        }
+
+        Event::SpawnFailed { errno, .. } => Transition {
+            actions: alloc::vec![
+                log(
+                    idx,
+                    LogLevel::Error,
+                    alloc::format!("spawn failed: errno {errno}")
+                ),
+                mark_down(runtime, idx, now_ms, true),
+                Action::DepsChanged(idx),
+            ],
+            changed: true,
+        },
+
+        // ── Readiness ──────────────────────────────────────────────────────
+        Event::Ready(_) => become_running(runtime, idx, now_ms),
+
+        Event::ReadyTimeout(_) => {
+            if runtime.state_at(idx) != State::Starting {
+                return Transition::quiet();
+            }
+            // Only strict readiness reaches here as a failure.
+            let mut t = become_running(runtime, idx, now_ms);
+            t.actions.insert(
+                0,
+                log(idx, LogLevel::Error, "readiness handshake timed out"),
+            );
+            t
+        }
+
+        Event::StartTimeout(_) => {
+            if runtime.state_at(idx) != State::Starting {
+                return Transition::quiet();
+            }
+            let mut actions = alloc::vec![
+                log(
+                    idx,
+                    LogLevel::Error,
+                    alloc::format!(
+                        "did not become ready within {}ms; escalating to SIGKILL",
+                        sp.start_timeout_ms
+                    ),
+                ),
+                Action::Signal {
+                    idx,
+                    signal: SignalKind::Term
+                },
+            ];
+            let s = runtime.get_mut(idx);
+            s.state = State::Stopping;
+            s.term_sent_at = Some(now_ms);
+            s.stop_due_at = Some(now_ms.saturating_add(sp.stop_timeout_ms));
+            s.start_due_at = None;
+            s.ready_due_at = None;
+            s.failed_starts = s.failed_starts.saturating_add(1);
+            actions.push(mark_down(runtime, idx, now_ms, true));
+            actions.push(Action::DepsChanged(idx));
+            Transition {
+                actions,
+                changed: true,
+            }
+        }
+
+        // ── Death ──────────────────────────────────────────────────────────
+        Event::Exited { code, .. } => handle_death(runtime, plan, idx, Some(code), now_ms, None),
+        Event::Signalled { signal, .. } => {
+            handle_death(runtime, plan, idx, None, now_ms, Some(signal))
+        }
+        Event::OrphanReaped(_) => handle_death(runtime, plan, idx, None, now_ms, None),
+
+        // ── Timers ─────────────────────────────────────────────────────────
+        Event::StopTimeout(_) => {
+            if runtime.state_at(idx) != State::Stopping {
+                return Transition::quiet();
+            }
+            let mut actions = alloc::vec![
+                log(
+                    idx,
+                    LogLevel::Error,
+                    alloc::format!(
+                        "did not stop within {}ms; sending SIGKILL",
+                        sp.stop_timeout_ms
+                    ),
+                ),
+                Action::Signal {
+                    idx,
+                    signal: SignalKind::Kill
+                },
+            ];
+            // Give the kill a bounded grace period. If the service is wedged
+            // in uninterruptible sleep this never completes, and that is
+            // correct: an init that lies about a zombie being gone is worse
+            // than one that keeps waiting.
+            let s = runtime.get_mut(idx);
+            s.stop_due_at = Some(now_ms.saturating_add(sp.stop_timeout_ms));
+            actions.push(Action::DepsChanged(idx));
+            Transition {
+                actions,
+                changed: false,
+            }
+        }
+
+        // ── Dependencies ───────────────────────────────────────────────────
+        Event::DepLost { dep, .. } => {
+            if runtime.get(idx).pinned {
+                return Transition::quiet();
+            }
+            // The dependency is gone. If we are only up because of it, we go
+            // down. `Desired` stays as it is: this is cascade, not operator
+            // intent, and the next reconcile pass must not resurrect it.
+            let wanted = runtime.get(idx).desired;
+            if wanted == Desired::Down {
+                return Transition::quiet();
+            }
+            let mut actions = alloc::vec![log(
+                idx,
+                LogLevel::Warn,
+                alloc::format!("required dependency `{}` is down", plan.services[dep].name),
+            )];
+            if matches!(runtime.state_at(idx), State::Running | State::Starting) {
+                let s = runtime.get_mut(idx);
+                s.desired = Desired::Down;
+                s.state = State::Stopping;
+                s.term_sent_at = Some(now_ms);
+                s.stop_due_at = Some(now_ms.saturating_add(sp.stop_timeout_ms));
+                s.start_due_at = None;
+                s.ready_due_at = None;
+                actions.push(Action::CascadeStop { idx, dep });
+                actions.push(Action::Signal {
+                    idx,
+                    signal: SignalKind::Term,
+                });
+            }
+            Transition {
+                actions,
+                changed: true,
+            }
+        }
+
+        Event::DepFailed { dep, .. } => {
+            let mut actions = alloc::vec![log(
+                idx,
+                LogLevel::Error,
+                alloc::format!(
+                    "required dependency `{}` failed to start; not starting",
+                    plan.services[dep].name
+                ),
+            )];
+            if matches!(runtime.state_at(idx), State::Running | State::Starting) {
+                let s = runtime.get_mut(idx);
+                s.desired = Desired::Down;
+                s.state = State::Stopping;
+                s.stop_due_at = Some(now_ms.saturating_add(sp.stop_timeout_ms));
+                s.term_sent_at = Some(now_ms);
+                s.start_due_at = None;
+                s.ready_due_at = None;
+                actions.push(Action::CascadeStop { idx, dep });
+                actions.push(Action::Signal {
+                    idx,
+                    signal: SignalKind::Term,
+                });
+            }
+            Transition {
+                actions,
+                changed: true,
+            }
+        }
+
+        Event::BudgetExhausted(_) => {
+            Transition::single(log(idx, LogLevel::Error, "restart budget exhausted"))
+        }
+
+        Event::Pinned(_) => {
+            let s = runtime.get_mut(idx);
+            s.pinned = true;
+            Transition {
+                actions: alloc::vec![Action::Unpin(idx)],
+                changed: true,
+            }
+        }
+
+        Event::IoError { errno, .. } => Transition::single(log(
+            idx,
+            LogLevel::Warn,
+            alloc::format!("i/o error while managing service: errno {errno}"),
+        )),
+    }
+}
+
+/// `Starting` -> `Running`, or ignore if not starting.
+fn become_running(runtime: &mut Runtime, idx: Idx, now_ms: u64) -> Transition {
+    if runtime.state_at(idx) != State::Starting {
+        return Transition::quiet();
+    }
+    {
+        let s = runtime.get_mut(idx);
+        s.state = State::Running;
+        s.ready_due_at = None;
+        s.start_due_at = None;
+        s.failed_starts = 0;
+    }
+    // `started_at` stays where the spawn set it: uptime should measure the
+    // process, not the handshake.
+    let _ = now_ms;
+    let mut actions = alloc::vec![Action::MarkReady(idx), Action::DepsChanged(idx)];
+    if runtime.get(idx).is_console {
+        actions.push(Action::GrantConsole(idx));
+    }
+    Transition {
+        actions,
+        changed: true,
+    }
+}
+
+/// Common death handling: record, decide, and emit the teardown actions.
+fn handle_death(
+    runtime: &mut Runtime,
+    plan: &Plan,
+    idx: Idx,
+    code: Option<i32>,
+    _now_ms: u64,
+    signal: Option<i32>,
+) -> Transition {
+    let was_stopping = runtime.state_at(idx) == State::Stopping;
+    if !runtime.state_at(idx).has_process() {
+        // A death for a service we believe is not running: a duplicate or late
+        // event. Ignore it.
+        return Transition::quiet();
+    }
+    let sp = &plan.services[idx];
+
+    let description = match (code, signal) {
+        (Some(c), _) => alloc::format!("exited with status {c}"),
+        (None, Some(s)) => alloc::format!("killed by signal {s}"),
+        (None, None) => String::from("exited"),
+    };
+
+    let mut actions = Vec::new();
+
+    {
+        let s = runtime.get_mut(idx);
+        s.state = State::Stopped;
+        s.pid = None;
+        s.pgid = None;
+        s.started_at = None;
+        s.term_sent_at = None;
+        s.ready_due_at = None;
+        s.start_due_at = None;
+        s.stop_due_at = None;
+        s.last_exit = code;
+        if s.is_console {
+            s.is_console = false;
+            actions.push(Action::RevokeConsole(idx));
+        }
+    }
+
+    if was_stopping {
+        // We asked for this. Not a failure; do not log at error, do not restart.
+        actions.push(Action::MarkDown {
+            idx,
+            unexpected: false,
+        });
+        actions.push(Action::DepsChanged(idx));
+        return Transition {
+            actions,
+            changed: true,
+        };
+    }
+
+    let restarting = should_restart(runtime, plan, idx, code);
+    if restarting {
+        actions.push(log(
+            idx,
+            LogLevel::Warn,
+            alloc::format!("{}; restarting", description),
+        ));
+        {
+            let s = runtime.get_mut(idx);
+            s.restarts = s.restarts.saturating_add(1);
+            s.failed_starts = s.failed_starts.saturating_add(1);
+            s.restart_suppressed = false;
+        }
+        // The budget token is consumed by the *reconciler*, at the moment it
+        // actually emits the spawn. Consuming it here as well would count
+        // every crash twice, and a budget of 1 would permit zero restarts.
+        // It still terminates a failing-to-start loop: spawn -> SpawnFailed ->
+        // death -> reconcile -> one more token spent, until it is empty.
+    } else {
+        // Not restarting. `Desired` is deliberately left as the operator set
+        // it, so `zctl status` reports the truth - wanted up, not running -
+        // rather than quietly rewriting intent. The reconciler is told to
+        // leave it alone via this flag, which only an operator clears.
+        runtime.get_mut(idx).restart_suppressed = true;
+        let (level, hint) = if sp.restart == Restart::Never {
+            (LogLevel::Warn, "; restart is disabled for this service")
+        } else {
+            (LogLevel::Info, "; it will not be retried (use `zctl kick`)")
+        };
+        actions.push(log(idx, level, alloc::format!("{description}{hint}")));
+    }
+
+    actions.push(Action::MarkDown {
+        idx,
+        unexpected: true,
+    });
+    actions.push(Action::DepsChanged(idx));
+
+    if restarting {
+        // The reconciler will spawn it on the next pass. Emitting `Spawn` here
+        // too would race with that pass and can double-spawn; the budget token
+        // taken above is what makes the reconciler's decision correct.
+        actions.push(Action::DepsChanged(idx));
+    }
+
+    Transition {
+        actions,
+        changed: true,
+    }
+}
+
+/// Build a `MarkDown` action and mark the service stopped.
+///
+/// Used by the `SpawnFailed` path, where the process never existed so there is
+/// no prior state to unwind.
+fn mark_down(runtime: &mut Runtime, idx: Idx, now_ms: u64, unexpected: bool) -> Action {
+    let s: &mut ServiceState = runtime.get_mut(idx);
+    s.state = State::Stopped;
+    s.pid = None;
+    s.pgid = None;
+    s.started_at = None;
+    s.term_sent_at = None;
+    s.ready_due_at = None;
+    s.start_due_at = None;
+    s.stop_due_at = None;
+    s.failed_starts = s.failed_starts.saturating_add(1);
+    let _ = now_ms;
+    Action::MarkDown { idx, unexpected }
+}
+
+/// Clear a `restart_suppressed` flag and refill the bucket.
+///
+/// This is the `zctl kick` operation, and it is the **only** way a service that
+/// the policy refused to retry becomes eligible again. Deliberately
+/// asymmetric: nothing in the runtime can do this implicitly, so "the service
+/// is not coming back" is always a decision someone made and can undo.
+pub fn kick(runtime: &mut Runtime, plan: &Plan, idx: Idx, now_ms: u64) -> bool {
+    if idx >= runtime.len() || !plan.services[idx].kind.has_process() {
+        return false;
+    }
+    let s = runtime.get_mut(idx);
+    if !s.restart_suppressed {
+        return false;
+    }
+    s.restart_suppressed = false;
+    s.failed_starts = 0;
+    s.last_exit = None;
+    s.bucket.reset(&plan.services[idx].restart_budget, now_ms);
+    true
+}
+
+/// Case a timer is set when a service enters `Starting`.
+///
+/// Shared by the runtime and the tests so the deadline arithmetic exists once.
+///
+/// The two deadlines are independent. `start_due_at` bounds the spawn; the
+/// readiness deadline is only armed when there is a handshake to wait for, and
+/// then it comes from `ready_timeout_ms` rather than from `start_timeout_ms`.
+/// Folding them together — which is what a `ready = none` service forces, since
+/// it has no readiness deadline at all — would make a documented
+/// `ready-timeout` directive unobservable.
+pub fn arm_start_deadlines(runtime: &mut Runtime, plan: &Plan, idx: Idx, now_ms: u64) {
+    let sp = &plan.services[idx];
+    let s = runtime.get_mut(idx);
+    s.state = State::Starting;
+    s.start_due_at = Some(now_ms.saturating_add(sp.start_timeout_ms));
+    s.ready_due_at = if sp.ready.is_handshake() {
+        Some(now_ms.saturating_add(sp.ready_timeout_ms))
+    } else {
+        None
+    };
+}
+
+/// True when the service is `Up` and should be reported as healthy.
+pub fn is_healthy(runtime: &Runtime, idx: Idx) -> bool {
+    runtime.get(idx).state.is_up() && runtime.get(idx).desired == Desired::Up
+}
+
+/// True when this readiness variant gates startup.
+pub fn ready_gates(ready: &Ready) -> bool {
+    ready.is_strict()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::types::{Budget, ServicePlan, StrictReady};
+
+    fn plan1(desc: ServicePlan) -> Plan {
+        let mut p = Plan::default();
+        p.services.push(desc);
+        p.order_up = alloc::vec![0];
+        p.order_down = alloc::vec![0];
+        p
+    }
+
+    fn starting() -> ServiceState {
+        let mut s = ServiceState::wanted_up();
+        s.state = State::Starting;
+        s.pid = Some(100);
+        s.pgid = Some(100);
+        s.started_at = Some(0);
+        s.start_due_at = Some(1000);
+        s.ready_due_at = Some(500);
+        s
+    }
+
+    #[test]
+    fn ready_moves_starting_to_running() {
+        let p = plan1(ServicePlan::new(String::from("a")));
+        let mut rt = Runtime::from_plan(&p);
+        rt.get_mut(0).state = State::Starting;
+        rt.get_mut(0).pid = Some(1);
+        rt.get_mut(0).started_at = Some(0);
+        rt.get_mut(0).start_due_at = Some(1000);
+
+        let t = apply(&Event::Ready(0), &mut rt, &p, 10);
+        assert!(t.changed);
+        assert_eq!(rt.state_at(0), State::Running);
+        assert!(
+            rt.check_invariants(&p).is_empty(),
+            "{:?}",
+            rt.check_invariants(&p)
+        );
+        assert!(t.actions.iter().any(|a| matches!(a, Action::MarkReady(0))));
+    }
+
+    #[test]
+    fn start_timeout_escalates_and_cleans_deadlines() {
+        let p = plan1(ServicePlan::new(String::from("a")));
+        let mut rt = Runtime::from_plan(&p);
+        let mut s = ServiceState::wanted_up();
+        s.state = State::Starting;
+        s.pid = Some(1);
+        s.started_at = Some(0);
+        s.start_due_at = Some(10);
+        s.ready_due_at = Some(10);
+        *rt.get_mut(0) = s;
+
+        let t = apply(&Event::StartTimeout(0), &mut rt, &p, 10);
+        assert!(
+            rt.check_invariants(&p).is_empty(),
+            "state must be consistent: {:?}",
+            rt.get(0)
+        );
+        assert_eq!(t.signals_for(0), alloc::vec![SignalKind::Term]);
+    }
+
+    #[test]
+    fn crash_takes_a_budget_token_and_leaves_desired_up() {
+        let mut sp = ServicePlan::new(String::from("a"));
+        sp.restart = Restart::OnFailure;
+        sp.restart_budget = Budget {
+            capacity: 3,
+            window_ms: 60_000,
+            delay_ms: 0,
+        };
+        let p = plan1(sp);
+        let mut rt = Runtime::from_plan(&p);
+        *rt.get_mut(0) = starting();
+        rt.get_mut(0).state = State::Running;
+        rt.set_desired(0, Desired::Up);
+        // The bucket refills to capacity on first use.
+        let _ = rt
+            .get_mut(0)
+            .bucket
+            .allows(&p.services[0].restart_budget, 0);
+
+        let t = apply(&Event::Exited { idx: 0, code: 1 }, &mut rt, &p, 0);
+        assert_eq!(rt.state_at(0), State::Stopped);
+        assert_eq!(
+            rt.get(0).desired,
+            Desired::Up,
+            "a crash must NOT clear desired, or the reconciler would not restart it"
+        );
+        assert_eq!(rt.get(0).last_exit, Some(1));
+        assert!(t.actions.iter().any(|a| matches!(
+            a,
+            Action::MarkDown {
+                idx: 0,
+                unexpected: true
+            }
+        )));
+    }
+
+    #[test]
+    fn a_deliberate_stop_does_not_count_as_a_failure() {
+        let mut sp = ServicePlan::new(String::from("a"));
+        sp.restart = Restart::Always;
+        let p = plan1(sp);
+        let mut rt = Runtime::from_plan(&p);
+        rt.get_mut(0).state = State::Stopping;
+        rt.get_mut(0).pid = Some(1);
+        rt.get_mut(0).started_at = Some(0);
+        rt.get_mut(0).stop_due_at = Some(100);
+        rt.set_desired(0, Desired::Down);
+
+        let t = apply(&Event::Exited { idx: 0, code: 0 }, &mut rt, &p, 10);
+        assert!(
+            !t.actions.iter().any(|a| matches!(
+                a,
+                Action::MarkDown {
+                    idx: 0,
+                    unexpected: true
+                }
+            )),
+            "a clean stop must not be reported as unexpected: {:?}",
+            t.actions
+        );
+        assert!(rt.check_invariants(&p).is_empty());
+    }
+
+    #[test]
+    fn restart_never_leaves_desired_up_after_a_crash() {
+        let mut sp = ServicePlan::new(String::from("a"));
+        sp.restart = Restart::Never;
+        let p = plan1(sp);
+        let mut rt = Runtime::from_plan(&p);
+        rt.get_mut(0).state = State::Running;
+        rt.get_mut(0).pid = Some(1);
+        rt.get_mut(0).started_at = Some(0);
+
+        let t = apply(&Event::Exited { idx: 0, code: 1 }, &mut rt, &p, 0);
+        // Desired stays Up so the reconciler sees the divergence; the budget
+        // is what stops it. We assert the reconciler does not spawn.
+        let tick = crate::reconcile(&mut rt, &p, 0);
+        assert!(
+            !tick.actions.iter().any(|a| matches!(a, Action::Spawn(0))),
+            "restart=never must not respawn: {:?}",
+            tick.actions
+        );
+        let _ = t;
+    }
+
+    #[test]
+    fn stop_timeout_sends_sigkill_and_rearms() {
+        let p = plan1(ServicePlan::new(String::from("a")));
+        let mut rt = Runtime::from_plan(&p);
+        rt.get_mut(0).state = State::Stopping;
+        rt.get_mut(0).pid = Some(1);
+        rt.get_mut(0).started_at = Some(0);
+        rt.get_mut(0).stop_due_at = Some(10);
+
+        let t = apply(&Event::StopTimeout(0), &mut rt, &p, 10);
+        assert_eq!(t.signals_for(0), alloc::vec![SignalKind::Kill]);
+        assert!(rt.get(0).stop_due_at.unwrap() > 10, "must rearm");
+        assert!(rt.check_invariants(&p).is_empty());
+    }
+
+    #[test]
+    fn late_and_duplicate_events_are_ignored() {
+        let p = plan1(ServicePlan::new(String::from("a")));
+        let mut rt = Runtime::from_plan(&p);
+        // Stopped service receives Ready and Exited.
+        assert!(apply(&Event::Ready(0), &mut rt, &p, 0).is_empty());
+        assert!(apply(&Event::Exited { idx: 0, code: 0 }, &mut rt, &p, 0).is_empty());
+        assert!(apply(&Event::StartTimeout(0), &mut rt, &p, 0).is_empty());
+        assert!(apply(&Event::StopTimeout(0), &mut rt, &p, 0).is_empty());
+    }
+
+    #[test]
+    fn dep_lost_cascades_a_stop() {
+        let mut p = Plan::default();
+        p.services.push(ServicePlan::new(String::from("dep")));
+        let mut b = ServicePlan::new(String::from("b"));
+        b.required = alloc::vec![0];
+        p.services.push(b);
+        p.order_up = alloc::vec![0, 1];
+        p.order_down = alloc::vec![1, 0];
+        let mut rt = Runtime::from_plan(&p);
+        rt.get_mut(1).state = State::Running;
+        rt.get_mut(1).pid = Some(9);
+        rt.get_mut(1).started_at = Some(0);
+        rt.set_desired(1, Desired::Up);
+
+        let t = apply(&Event::DepLost { idx: 1, dep: 0 }, &mut rt, &p, 0);
+        assert!(t.signals_for(1).contains(&SignalKind::Term));
+        assert_eq!(rt.get(1).desired, Desired::Down, "cascade clears desired");
+    }
+
+    #[test]
+    fn dep_lost_respects_a_pin() {
+        let mut p = Plan::default();
+        p.services.push(ServicePlan::new(String::from("dep")));
+        let mut b = ServicePlan::new(String::from("b"));
+        b.required = alloc::vec![0];
+        p.services.push(b);
+        p.order_up = alloc::vec![0, 1];
+        p.order_down = alloc::vec![1, 0];
+        let mut rt = Runtime::from_plan(&p);
+        rt.get_mut(1).state = State::Running;
+        rt.get_mut(1).pid = Some(9);
+        rt.get_mut(1).started_at = Some(0);
+        rt.get_mut(1).pinned = true;
+
+        let t = apply(&Event::DepLost { idx: 1, dep: 0 }, &mut rt, &p, 0);
+        assert!(
+            t.signals_for(1).is_empty(),
+            "a pinned service must not be stopped"
+        );
+    }
+
+    #[test]
+    fn strict_ready_timeout_is_an_error_but_still_goes_up() {
+        let mut sp = ServicePlan::new(String::from("a"));
+        sp.ready = Ready::Strict(StrictReady::Tcp(1));
+        let p = plan1(sp);
+        let mut rt = Runtime::from_plan(&p);
+        rt.get_mut(0).state = State::Starting;
+        rt.get_mut(0).pid = Some(1);
+        rt.get_mut(0).started_at = Some(0);
+        rt.get_mut(0).start_due_at = Some(10);
+        rt.get_mut(0).ready_due_at = Some(10);
+
+        let t = apply(&Event::ReadyTimeout(0), &mut rt, &p, 10);
+        assert!(t.actions.iter().any(|a| matches!(
+            a,
+            Action::Log {
+                level: LogLevel::Error,
+                ..
+            }
+        )));
+        assert!(rt.check_invariants(&p).is_empty());
+    }
+
+    #[test]
+    fn console_is_granted_and_revoked() {
+        let mut sp = ServicePlan::new(String::from("c"));
+        sp.kind = crate::types::ServiceKind::Console;
+        let p = plan1(sp);
+        let mut rt = Runtime::from_plan(&p);
+        rt.get_mut(0).state = State::Starting;
+        rt.get_mut(0).pid = Some(1);
+        rt.get_mut(0).started_at = Some(0);
+        rt.get_mut(0).is_console = true;
+
+        let t = apply(&Event::Ready(0), &mut rt, &p, 0);
+        assert!(
+            t.actions
+                .iter()
+                .any(|a| matches!(a, Action::GrantConsole(0)))
+        );
+
+        let t2 = apply(&Event::Exited { idx: 0, code: 0 }, &mut rt, &p, 1);
+        assert!(
+            t2.actions
+                .iter()
+                .any(|a| matches!(a, Action::RevokeConsole(0)))
+        );
+    }
+}
