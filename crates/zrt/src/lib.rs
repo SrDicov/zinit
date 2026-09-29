@@ -2,7 +2,7 @@
 //!
 //! # What this crate is for
 //!
-//! [`zcore`] is the reason zinit is worth writing: a pure state machine that
+//! `zcore` is the reason zinit is worth writing: a pure state machine that
 //! takes `now_ms` and a list of events and returns a list of actions. It is
 //! exhaustively testable precisely because it cannot touch the outside world.
 //!
@@ -119,6 +119,7 @@ pub mod capdetect;
 pub mod childproc;
 pub mod clock;
 pub mod reactor;
+pub mod report;
 pub mod signals;
 pub mod sys;
 

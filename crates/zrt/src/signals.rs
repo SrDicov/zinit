@@ -21,7 +21,7 @@
 //!
 //! * **Linux**: `signalfd(2)`. The *kernel* queues the signal and turns it
 //!   into a readable descriptor. There is no user-space window, no handler, no
-//!   drop, no race. The signal arrives through the same [`reactor`] as a log
+//!   drop, no race. The signal arrives through the same [`crate::reactor`] as a log
 //!   write or a child death, in the same `wait` call, in the order the kernel
 //!   decided.
 //! * **BSD**: `EVFILT_SIGNAL` on a kqueue. Same property, different spelling:
@@ -384,7 +384,7 @@ impl SignalSourceKind {
     }
 }
 
-/// A source of signals that can be plugged into a [`reactor::Reactor`].
+/// A source of signals that can be plugged into a [`crate::reactor::Reactor`].
 ///
 /// The contract is the point: a signal source is *just another descriptor*.
 /// The supervisor registers [`SignalSource::fds`] in the same reactor it uses
@@ -394,7 +394,7 @@ impl SignalSourceKind {
 /// still delivers through the same `wait`.
 pub trait SignalSource {
     /// Descriptors to hand to the reactor. Register them
-    /// [`reactor::Interest::Read`].
+    /// [`crate::reactor::Interest::Read`].
     fn fds(&self) -> &[RawFd];
 
     /// Consume everything pending. Returns nothing if there is nothing, which
@@ -416,7 +416,9 @@ pub fn new_signal_source(watch: SignalSet) -> io::Result<Box<dyn SignalSource>> 
     {
         match SignalfdSource::new(watch) {
             Ok(s) => return Ok(Box::new(s)),
-            Err(e) => eprintln!("zinit: signalfd unavailable ({e}); degrading to self-pipe"),
+            Err(e) => crate::report::announce_degradation(&format!(
+                "signalfd unavailable ({e}); degrading to self-pipe"
+            )),
         }
     }
     #[cfg(any(
@@ -433,9 +435,9 @@ pub fn new_signal_source(watch: SignalSet) -> io::Result<Box<dyn SignalSource>> 
     {
         match KqueueSignalSource::new(watch) {
             Ok(s) => return Ok(Box::new(s)),
-            Err(e) => {
-                eprintln!("zinit: kqueue EVFILT_SIGNAL unavailable ({e}); degrading to self-pipe")
-            }
+            Err(e) => crate::report::announce_degradation(&format!(
+                "kqueue EVFILT_SIGNAL unavailable ({e}); degrading to self-pipe"
+            )),
         }
     }
     let s = SelfPipeSource::new(watch)?;
@@ -457,7 +459,7 @@ pub fn new_signal_source(watch: SignalSet) -> io::Result<Box<dyn SignalSource>> 
 /// * signals are reported *coalesced* per pending signal number, exactly as
 ///   the kernel would deliver them, so a burst of `SIGWINCH` is one read and
 ///   not a thousand;
-/// * the fd is pollable, so the signal goes through [`reactor::Reactor`]
+/// * the fd is pollable, so the signal goes through [`crate::reactor::Reactor`]
 ///   with no special case anywhere in the loop.
 ///
 /// The signals in the set **must already be blocked** in the thread that

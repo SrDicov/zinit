@@ -20,11 +20,11 @@
 //! one-line mistake with a two-day outage. The price is that level-triggered
 //! fds must be non-blocking, because "read until EAGAIN" cannot work on a
 //! blocking descriptor. Every descriptor registered here must therefore have
-//! [`sys::set_nonblocking`] applied; the backends cannot enforce it, so it is
+//! [`crate::sys::set_nonblocking`] applied; the backends cannot enforce it, so it is
 //! a documented precondition rather than a checked one.
 //!
 //! (`EV_CLEAR` is still used, but only where it is *required* rather than
-//! optional — see [`KqueueReactor`].)
+//! optional — see `KqueueReactor`.)
 //!
 //! **2. A hangup is a read.**
 //!
@@ -163,11 +163,15 @@ pub fn new_reactor() -> io::Result<Box<dyn Reactor>> {
     match native_reactor() {
         Ok(r) => Ok(Box::new(r)),
         Err(e) if cfg!(any(target_os = "linux", target_os = "android")) => {
-            eprintln!("zinit: epoll unavailable ({e}); degrading to poll(2)");
+            crate::report::announce_degradation(&format!(
+                "epoll unavailable ({e}); degrading to poll(2)"
+            ));
             Ok(Box::new(PollReactor::new()?))
         }
         Err(e) if kqueue_supported() => {
-            eprintln!("zinit: kqueue unavailable ({e}); degrading to poll(2)");
+            crate::report::announce_degradation(&format!(
+                "kqueue unavailable ({e}); degrading to poll(2)"
+            ));
             Ok(Box::new(PollReactor::new()?))
         }
         Err(e) => Err(e),

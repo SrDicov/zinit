@@ -14,7 +14,7 @@
 //! That is why there is no `std::time::Instant` anywhere in this crate: an
 //! `Instant` cannot be constructed from a raw value, so every test would have
 //! to be a slow, flaky, wall-clock test. The kernel's `CLOCK_MONOTONIC` is read
-//! directly through [`sys::clock_gettime`](crate::sys::clock_gettime) instead,
+//! directly through [`sys::try_clock_gettime_ms`](crate::sys::try_clock_gettime_ms) instead,
 //! and [`ManualClock`] provides the injectable half.
 //!
 //! # Monotonic is not realtime
@@ -171,7 +171,7 @@ pub fn duration_ms_u64(d: Duration) -> u64 {
 /// Milliseconds remaining until an absolute monotonic `deadline`, floored at 0.
 ///
 /// Used to convert an absolute deadline into the relative timeout the
-/// reactor wants, which is the only thing [`reactor::Reactor::wait`] accepts.
+/// reactor wants, which is the only thing [`crate::reactor::Reactor::wait`] accepts.
 pub fn remaining_ms(deadline: u64) -> u64 {
     deadline.saturating_sub(now_ms())
 }
@@ -187,8 +187,13 @@ pub fn sleep_ms(ms: u64) -> io::Result<()> {
     // whatever `timespec::tv_sec` is declared as on the target being built.
     // `tv_sec` is at least 32 bits on every platform in scope and 64 bits on
     // every 64-bit one, so this cannot truncate a value that matters.
-    let secs = (ms / 1000) as _;
-    let nsecs = ((ms % 1000) * 1_000_000) as i64;
+    let secs = (ms / 1000) as libc::time_t;
+    // `tv_nsec` is `c_long`: 64 bits on every 64-bit target, 32 bits on
+    // 32-bit ones. An unadorned `as i64` compiles on x86_64 and breaks on
+    // i686 — this exact failure is what the CI's 32-bit jobs exist to catch.
+    // The value is bounded by construction (sub-second nanos), so the
+    // narrowing coercion cannot truncate.
+    let nsecs = ((ms % 1000) * 1_000_000) as libc::c_long;
     let req = libc::timespec {
         tv_sec: secs,
         tv_nsec: nsecs,
@@ -243,10 +248,11 @@ pub fn clock_source() -> ClockSource {
             Err(_) => {
                 // Deliberately not a logging call: `zrt` owns no log sink, and
                 // an init must not lose the one line that explains why its
-                // timing behaves differently. Stderr of PID 1 is the log.
-                eprintln!(
-                    "zinit: CLOCK_MONOTONIC unavailable; falling back to CLOCK_REALTIME. \
-                     Deadlines inherit wall-clock discontinuities."
+                // timing behaves differently. Stderr of PID 1 is the log, and
+                // `report` is the single module allowed to write to it.
+                crate::report::announce_degradation(
+                    "CLOCK_MONOTONIC unavailable; falling back to CLOCK_REALTIME. \
+                     Deadlines inherit wall-clock discontinuities.",
                 );
                 ClockSource::RealtimeFallback
             }

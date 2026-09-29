@@ -382,13 +382,33 @@ pub fn pipe2(cloexec: bool) -> io::Result<(RawFd, RawFd)> {
 /// *level* readiness (see [`crate::reactor`]), and a blocking descriptor in a
 /// level-triggered loop is a deadlock.
 pub fn set_nonblocking(fd: RawFd, on: bool) -> io::Result<()> {
-    // SAFETY: `F_SETFL` takes an int argument, passed as such.
-    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, if on { libc::O_NONBLOCK } else { 0 }) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+    // Read the current flags and write them back with only `O_NONBLOCK`
+    // changed.
+    //
+    // `F_SETFL` *replaces* the whole word, so passing a bare
+    // `O_NONBLOCK` silently clears every other descriptor flag — including
+    // `O_CLOEXEC`, which is the one that matters most. A descriptor marked
+    // non-blocking and then made inheritable leaks into every `exec` the
+    // process ever does, which is exactly the bug the exec-error pipe depends
+    // on closing.
+    //
+    // SAFETY: `F_GETFL` returns the flag word in the int `out` points at; it
+    // takes no descriptor state by reference. The pointer is a live local.
+    let mut current: libc::c_int = 0;
+    if unsafe { libc::fcntl(fd, libc::F_GETFL, &raw mut current) } == -1 {
+        return Err(io::Error::last_os_error());
     }
+    let updated = if on {
+        current | libc::O_NONBLOCK
+    } else {
+        current & !libc::O_NONBLOCK
+    };
+    // SAFETY: `F_SETFL` takes the flag word as an int argument, passed as
+    // such. `current` was populated by the `F_GETFL` above.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, updated) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// `socketpair(2)`, both ends `O_CLOEXEC` and `SOCK_NONBLOCK`.
@@ -663,7 +683,7 @@ pub fn write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
 // Clocks
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Which clock a [`clock_gettime`] call reads.
+/// Which clock a [`try_clock_gettime_ms`] call reads.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ClockId {
     /// `CLOCK_MONOTONIC`: boot-relative, never jumps. Deadlines only.
@@ -697,7 +717,7 @@ pub fn clock_gettime_ms(id: ClockId) -> u64 {
             // A failing clock is catastrophic but not a reason to abort PID 1.
             // Returning 0 keeps the supervisor running with a visibly broken
             // clock; the probe that produced this path already logged why.
-            eprintln!("zinit: clock_gettime failed: {e}");
+            crate::report::announce_degradation(&format!("clock_gettime failed: {e}"));
             0
         }
     }

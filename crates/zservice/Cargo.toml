@@ -1,0 +1,36 @@
+[package]
+name = "zservice"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "zinit service lifecycle: spawn, readiness, logging, identity, supervision"
+
+[dependencies]
+zcore = { path = "../zcore" }
+zconfig = { path = "../zconfig" }
+zrt = { path = "../zrt" }
+
+# Exactly these four, and nothing else. `zcore` is the policy, `zconfig` is the
+# description format, `zrt` is the syscall layer, and `libc` is the narrow FFI
+# this crate needs for the calls `zrt::sys` deliberately does not wrap
+# (identity lookup, rlimits, `poll`, sockets). Anything else — an async
+# runtime, a logging framework, a CLI parser — would put a scheduler or a
+# second opinion about log routing inside the supervision path.
+libc = "0.2"
+
+[lints.rust]
+# The workspace forbids `unsafe_code` because the core is pure. This crate is
+# the impure half beside `zrt`: the post-fork child path is raw syscalls by
+# construction (DESIGN.md §9.1), so `unsafe` is the whole point here. The
+# discipline moves from the attribute to `#![deny(unsafe_op_in_unsafe_fn)]` in
+# `lib.rs` plus a `// SAFETY:` comment on every `unsafe` block, exactly as in
+# `zrt`. (A full local table rather than `workspace = true`, mirroring `zrt`:
+# cargo forbids overriding an inherited lint set.)
+unsafe_code = "allow"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

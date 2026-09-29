@@ -15,7 +15,7 @@
 //!
 //! | Error | Why it must be fatal |
 //! |---|---|
-//! | [`GraphError::InvalidName`] | a name is a key everywhere: service names, log file paths, cgroup names. `/`, `..`, spaces and a leading `.`/`@` all let a description address something outside its own directory. This is the dinit `validate_service_name` `return true` bug. The *rules* live in [`desc::validate_service_name`]; this module only decides that they are applied, and to which strings. |
+//! | [`GraphError::InvalidName`] | a name is a key everywhere: service names, log file paths, cgroup names. `/`, `..`, spaces and a leading `.`/`@` all let a description address something outside its own directory. This is the dinit `validate_service_name` `return true` bug. The *rules* live in [`crate::desc::validate_service_name`]; this module only decides that they are applied, and to which strings. |
 //! | [`GraphError::InvalidDependencyName`] | the same rule, applied to the *other* end of an edge. `depends = ../../../etc/shadow` is the identical attack with a different entry point, and validating only the service's own name would leave it open. |
 //! | [`GraphError::DuplicateName`] | two definitions, one key. Picking "the last one wins" hides a typo'd file. |
 //! | [`GraphError::UnknownDependency`] | a required dependency that resolves to nothing means the machine silently boots without a service. |
@@ -29,7 +29,7 @@
 //! There is exactly one severity enum in this crate — [`crate::Severity`], in
 //! `diagnostic.rs` — and it is the one that decides whether a run fails. A
 //! *finding* here is a [`Diagnostic`] with a non-fatal severity, and
-//! [`finding`] carries a `debug_assert` that says so: this module's promise is
+//! `finding` carries a `debug_assert` that says so: this module's promise is
 //! that nothing it notices about a *survivable* problem can stop a boot, and an
 //! assertion is the only way that promise survives a refactor.
 //!

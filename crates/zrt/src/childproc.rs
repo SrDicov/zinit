@@ -15,7 +15,7 @@
 //! | | Mechanism | Recycle-safe |
 //! |---|---|---|
 //! | [`PidfdTracker`] | `pidfd_open` + epoll (Linux 5.3+) | yes — the fd names a process, not a number |
-//! | [`KqueueProcTracker`] | `EVFILT_PROC`/`NOTE_EXIT` (BSD) | no — but the kernel only reports it once |
+//! | `KqueueProcTracker` | `EVFILT_PROC`/`NOTE_EXIT` (BSD) | no — but the kernel only reports it once |
 //! | [`WaitpidTracker`] | `waitpid(WNOHANG)` (universal) | no |
 //!
 //! All three implement the same trait, expose their readiness through
@@ -172,9 +172,9 @@ pub fn new_child_tracker() -> io::Result<Box<dyn ChildTracker>> {
     {
         match PidfdTracker::new() {
             Ok(t) => return Ok(Box::new(t)),
-            Err(e) => eprintln!(
-                "zinit: pidfd_open unavailable ({e}); degrading to waitpid(WNOHANG) child tracking"
-            ),
+            Err(e) => crate::report::announce_degradation(&format!(
+                "pidfd_open unavailable ({e}); degrading to waitpid(WNOHANG) child tracking"
+            )),
         }
     }
     #[cfg(any(
@@ -191,9 +191,9 @@ pub fn new_child_tracker() -> io::Result<Box<dyn ChildTracker>> {
     {
         match KqueueProcTracker::new() {
             Ok(t) => return Ok(Box::new(t)),
-            Err(e) => eprintln!(
-                "zinit: EVFILT_PROC unavailable ({e}); degrading to waitpid(WNOHANG) child tracking"
-            ),
+            Err(e) => crate::report::announce_degradation(&format!(
+                "EVFILT_PROC unavailable ({e}); degrading to waitpid(WNOHANG) child tracking"
+            )),
         }
     }
     let t = WaitpidTracker::new()?;

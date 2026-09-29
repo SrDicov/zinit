@@ -1,6 +1,6 @@
 //! The transition function: `(Event) -> (new state, Vec<Action>)`.
 //!
-//! Where [`reconcile`](crate::reconcile) answers "what should happen given the
+//! Where [`reconcile`](crate::reconcile()) answers "what should happen given the
 //! desired state", this answers "what happened, and what follows immediately
 //! from it". They are different questions and they run at different times:
 //! the reconciler is a periodic sweep over *desired*, this is an immediate

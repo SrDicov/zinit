@@ -21,7 +21,7 @@ pub struct ServiceState {
     /// Pid of the main child, once known. `None` when no process exists.
     ///
     /// The core never validates this. It exists so the runtime can report it
-    /// and so [`crate::reconcile`] can avoid re-spawning a service it believes
+    /// and so [`crate::reconcile()`] can avoid re-spawning a service it believes
     /// is already running.
     pub pid: Option<i32>,
     /// Process group id, which is what actually gets signalled.

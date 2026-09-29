@@ -25,9 +25,9 @@
 //!
 //! # What is deliberately *not* here
 //!
-//! * **No budget numbers.** [`value::default_budget`] is the single answer to
+//! * **No budget numbers.** [`crate::value::default_budget`] is the single answer to
 //!   "what is a restart budget when nobody said", and
-//!   [`value::RestartSpec::default`] spends it. An absent `restart` line and an
+//!   [`crate::value::RestartSpec::default`] spends it. An absent `restart` line and an
 //!   explicit `restart = on-failure` therefore cannot drift apart, because
 //!   neither one re-states a number that `value.rs` already owns.
 //! * **No notes.** A warning is a [`crate::diagnostic::Diagnostic`] and travels
@@ -374,13 +374,13 @@ impl Default for ServiceDesc {
     /// A plausible process service that has declared nothing.
     ///
     /// Every default is a call into the module that owns it —
-    /// [`value::RestartSpec::default`] for the restart policy and budget,
-    /// [`value::LogSpec::default`] for the sink. No number is re-typed here,
+    /// [`crate::value::RestartSpec::default`] for the restart policy and budget,
+    /// [`crate::value::LogSpec::default`] for the sink. No number is re-typed here,
     /// because a number written in two places is a number that will be wrong in
     /// one of them.
     ///
     /// The one default that is *not* delegated is [`ready`](Self::ready), which
-    /// is `notify` and not [`value::ReadySpec::default`]'s `none`. DESIGN.md §5
+    /// is `notify` and not [`crate::value::ReadySpec::default`]'s `none`. DESIGN.md §5
     /// specifies `notify` as the format's default, and `ReadySpec::default` is
     /// the type's zero value rather than the format's promise; the two are
     /// different questions and only one of them is this struct's to answer.

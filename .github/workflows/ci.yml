@@ -142,7 +142,7 @@ jobs:
         run: cargo fmt --all --check
 
   # ══════════════════════════════════════════════════════════════════════════
-  # 2. Cross-build the rest of the tier-2 sweep. Build is the evidence; running
+  # 2. Cross-build the tier-2 glibc sweep. Build is the evidence; running
   #    is covered by the native job and by the BSD VMs.
   # ══════════════════════════════════════════════════════════════════════════
   linux-cross:
@@ -154,10 +154,7 @@ jobs:
       matrix:
         include:
           - { target: armv7-unknown-linux-gnueabihf, linker: arm-linux-gnueabihf-gcc }
-          - { target: armv7-unknown-linux-musleabihf, linker: arm-linux-musleabihf-gcc }
-          - { target: aarch64-unknown-linux-musl, linker: aarch64-linux-gnu-gcc }
           - { target: riscv64gc-unknown-linux-gnu, linker: riscv64-linux-gnu-gcc }
-          - { target: riscv64gc-unknown-linux-musl, linker: riscv64-linux-gnu-gcc }
           - { target: x86_64-unknown-linux-gnux32, linker: gcc, note: "x32 ABI: 64-bit registers, 32-bit pointers" }
           - { target: powerpc64le-unknown-linux-gnu, linker: powerpc64le-linux-gnu-gcc }
 
@@ -171,8 +168,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            gcc-arm-linux-gnueabihf gcc-arm-linux-musleabihf \
-            gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu \
+            gcc-arm-linux-gnueabihf \
+            gcc-riscv64-linux-gnu \
             gcc-powerpc64le-linux-gnu gcc-multilib
           echo "CARGO_TARGET_$(echo ${{ matrix.target }} | tr a-z- A-Z_)_LINKER=${{ matrix.linker }}" >> "$GITHUB_ENV"
 
@@ -183,6 +180,63 @@ jobs:
         # `cargo test --no-run` compiles the test harnesses, which is where a
         # target-specific mistake in test code shows up. Running them needs
         # the ISA, and that is the native job's job.
+        run: cargo test --workspace --target ${{ matrix.target }} --no-run
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 2b. Cross-build the musl sweep with real musl toolchains.
+  #
+  # Ubuntu ships no musl cross compilers (there is no
+  # `gcc-arm-linux-musleabihf` package), and linking a musl target with a
+  # glibc linker is lying about what was tested. musl.cc provides static,
+  # self-contained cross toolchains; they are fetched once and cached.
+  # ══════════════════════════════════════════════════════════════════════════
+  linux-musl-cross:
+    name: musl ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: armv7-unknown-linux-musleabihf, triplet: arm-linux-musleabihf }
+          - { target: aarch64-unknown-linux-musl, triplet: aarch64-linux-musl }
+          - { target: riscv64gc-unknown-linux-musl, triplet: riscv64-linux-musl }
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache musl.cc toolchain
+        id: musl-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/musl-cross/${{ matrix.triplet }}
+          key: musl-cc-${{ matrix.triplet }}-v12
+
+      - name: Install musl cross toolchain
+        if: steps.musl-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/musl-cross
+          curl -sSfL "https://musl.cc/${{ matrix.triplet }}-cross.tgz" \
+            -o /tmp/musl-cross/toolchain.tgz
+          tar -xzf /tmp/musl-cross/toolchain.tgz -C /tmp/musl-cross
+          rm /tmp/musl-cross/toolchain.tgz
+
+      - name: Build
+        run: |
+          linker="/tmp/musl-cross/${{ matrix.triplet }}-cross/bin/${{ matrix.triplet }}-gcc"
+          test -x "$linker" || { echo "::error::musl linker missing: $linker"; exit 1; }
+          # GITHUB_ENV only takes effect in *later* steps, so export for this
+          # shell too; the file write covers the test-compile step below.
+          var="CARGO_TARGET_$(echo ${{ matrix.target }} | tr a-z- A-Z_)_LINKER"
+          export "$var=$linker"
+          echo "$var=$linker" >> "$GITHUB_ENV"
+          cargo build --workspace --target ${{ matrix.target }}
+
+      - name: Test compile only
         run: cargo test --workspace --target ${{ matrix.target }} --no-run
 
   # ══════════════════════════════════════════════════════════════════════════
@@ -256,6 +310,11 @@ jobs:
           clang --version | head -1
 
       - name: Configure
+        # NOTE: no embedded quotes in RUSTFLAGS. Cargo splits RUSTFLAGS on
+        # whitespace itself; literal `"` characters become part of the
+        # argument and rustc reports "multiple input filenames". None of the
+        # paths here contain spaces, so quotes are unnecessary as well as
+        # harmful.
         run: |
           set -euo pipefail
           case "${{ matrix.linker }}" in
@@ -264,7 +323,9 @@ jobs:
             rust-lld) ln -sf "$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld" \
                               "$RUNNER_TEMP/xlinker" ;;
           esac
-          echo "RUSTFLAGS=\"-C linker=$RUNNER_TEMP/xlinker -C link-arg=-fuse-ld=${{ matrix.ld || 'bfd' }} ${{ matrix.pie == false && '-C relocation-model=static -C link-arg=-no-pie' || '' }}\"" >> "$GITHUB_ENV"
+          {
+            echo "RUSTFLAGS=-C linker=$RUNNER_TEMP/xlinker -C link-arg=-fuse-ld=${{ matrix.ld || 'bfd' }} ${{ matrix.pie == false && '-C relocation-model=static -C link-arg=-no-pie' || '' }}"
+          } >> "$GITHUB_ENV"
           echo "CC=${{ matrix.cc }}" >> "$GITHUB_ENV"
 
       - run: cargo build --workspace --all-targets
@@ -422,15 +483,24 @@ jobs:
         # PID 1 has nowhere to print to: stdout is the console the service is
         # trying to hand over. Anything that writes to it in the init path is
         # a bug that only shows up as a blank screen.
+        #
+        # The one exception is `zrt::report`, the single sanctioned announcer
+        # for backend degradations (DESIGN.md §8.1 demands they be announced).
+        # Raw print macros are banned everywhere else — including test code,
+        # which can fail with a message instead — so a stray print fails the
+        # build instead of shipping. Doc comments (`//`) are prose, not code.
         run: |
           set -euo pipefail
-          if grep -rn --include=*.rs -E '\b(println!|eprintln!|dbg!)\s*\(' \
-               crates/zrt/src crates/zcore/src crates/zconfig/src \
-             | grep -v '#\[cfg(test)\]' | grep -qv 'tests'; then
-            echo "::error::a println! leaked into a non-test path"
+          hits=$(grep -rn --include='*.rs' -E '\b(println!|eprintln!|dbg!)\s*\(' crates/ \
+            | grep -v 'crates/zrt/src/report.rs' \
+            | grep -vE ':[0-9]+:\s*//' \
+            || true)
+          if [ -n "$hits" ]; then
+            echo "::error::a print macro leaked outside zrt::report:"
+            echo "$hits"
             exit 1
           fi
-          echo "clean"
+          echo "clean: the only announcer is zrt::report"
 
   # ══════════════════════════════════════════════════════════════════════════
   # 7. Licence. GPL-3 is a promise about what happens to derivatives; it has
@@ -443,6 +513,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Every manifest agrees
         run: |
@@ -465,11 +536,18 @@ jobs:
       - name: The one dependency is GPL-compatible
         # `libc` is MIT-or-Apache-2.0, which is one-way compatible with
         # GPL-3. If that ever changes, this job is what notices.
+        #
+        # Checked against the vendored registry copy, not the crates.io API:
+        # the API rate-limits anonymous CI traffic (HTTP 403) and the answer
+        # we need is already on disk after `cargo fetch`.
         run: |
           set -euo pipefail
-          curl -sSfL https://crates.io/api/v1/crates/libc \
-            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(sorted({v["license"] for v in d["versions"][:20]})))' \
-            | tee /dev/stderr | grep -qE 'MIT|Apache'
+          cargo fetch
+          reg="${CARGO_HOME:-$HOME/.cargo}/registry/src"
+          lic=$(grep -rh '^license' "$reg"/*/libc-*/Cargo.toml | head -1)
+          echo "libc declares: $lic"
+          echo "$lic" | grep -qE 'MIT|Apache-2\.0' \
+            || { echo "::error::libc license changed: $lic"; exit 1; }
           echo "libc is compatible with GPL-3"
 
   # ══════════════════════════════════════════════════════════════════════════
@@ -580,6 +658,6 @@ jobs:
       - uses: actions/checkout@v5
       - run: |
           rustup toolchain install nightly --component miri
-          cargo miri setup
+          cargo +nightly miri setup
       - name: Run
         run: cargo +nightly miri test -p zcore --lib

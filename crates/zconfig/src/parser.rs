@@ -404,7 +404,7 @@ impl ParseError {
     /// The severity is always [`crate::diagnostic::Severity::Error`], because
     /// this type only ever describes a rejected description; the warnings live
     /// in the [`DiagnosticBag`] returned by
-    /// [`parse_service_with_diagnostics`](crate::parser::parse_service_with_diagnostics)
+    /// [`parse_service_with_diagnostics`]
     /// and are never fatal.
     pub fn into_diagnostic(self) -> Diagnostic {
         Diagnostic::error(Some(self.span), self.code, self.message, Some(self.help))

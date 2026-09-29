@@ -31,8 +31,8 @@ pub enum Event {
 
     /// `ready-timeout` expired.
     ///
-    /// For a non-strict [`Ready`], the runtime emits `Ready` instead. This
-    /// event only reaches the core for [`Ready::Strict`], where expiry is a
+    /// For a non-strict [`Ready`](crate::Ready), the runtime emits `Ready` instead. This
+    /// event only reaches the core for [`Ready::Strict`](crate::Ready::Strict), where expiry is a
     /// genuine failure.
     ReadyTimeout(Idx),
 
