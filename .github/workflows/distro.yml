@@ -2,14 +2,19 @@ name: distro
 
 # x86_64 distro matrix: Void (glibc+musl), Alpine, Chimera, Arch, eweOS,
 # Gentoo. There is no shippable binary yet (workspace is lib-only until
-# Phase 3), so "testing zinit" here means the full test suite — above all
-# the real fork+exec spawn path and the reactor — on each distro's own
+# the binary cut), so "testing zinit" here means the full test suite — above
+# all the real fork+exec spawn path and the reactor — on each distro's own
 # libc, coreutils and /bin layout. That is exactly the surface that bit us
 # on macOS (`/bin/true`, `nobody`, `/proc`): this job exists so the next
 # such assumption fails here first, on x86_64, in seconds.
 #
-# No clippy/fmt here (covered by `ci.yml`); build + test only, to keep
-# minutes sane across 7 containers.
+# Shape: checkout on the host, then one `docker run -v` per leg. Job-level
+# `container:` cannot work here: node-based actions (checkout, cache) exec
+# node *inside* the container, and minimal images (void bare, chimera 7.6 MB)
+# lack the loader/libs it expects (`exec /__e/node24/bin/node: no such file
+# or directory`). Only build/test runs in-container; zero action steps do.
+# No cache either: a shared `target/` across libc variants is poison.
+# No clippy/fmt here (covered by `ci.yml`); build + test only.
 on:
   push:
     branches: [main]
@@ -30,8 +35,6 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    container:
-      image: ${{ matrix.image }}
     strategy:
       fail-fast: false
       matrix:
@@ -46,50 +49,38 @@ jobs:
             image: alpine:latest
             prep: apk add --no-cache curl gcc musl-dev
           - name: chimera
-            image: ghcr.io/chimera-linux/chimera:latest
+            image: chimeralinux/chimera:latest
             prep: apk add curl gcc musl-dev
           - name: arch
             image: archlinux:latest
             prep: pacman -Syu --noconfirm curl gcc
           - name: eweos
-            image: eweos/eweos:latest
-            prep: apk add --no-cache curl gcc musl-dev
+            # eweOS is Arch-derived, so pacman, not apk. `eweos/eweos` never
+            # existed on any registry; the official build is `eweos/docker`.
+            image: ghcr.io/eweos/docker:latest
+            prep: pacman -Syu --noconfirm curl gcc
           - name: gentoo
             image: gentoo/stage3:latest
-            prep: echo "stage3 ships gcc+curl; nothing to install"
+            prep: true
 
     steps:
-      - name: Install toolchain (container-scoped)
-        # Same root/HOME mismatch as alpine-e2e: pin everything to /root.
-        run: |
-          export HOME=/root RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo
-          echo "HOME=/root" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=/root/.rustup" >> "$GITHUB_ENV"
-          echo "CARGO_HOME=/root/.cargo" >> "$GITHUB_ENV"
-          echo "/root/.cargo/bin" >> "$GITHUB_PATH"
-          ${{ matrix.prep }}
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain stable --profile minimal
       - uses: actions/checkout@v5
-      - uses: actions/cache@v4
-        with:
-          path: |
-            /root/.cargo/registry
-            target
-          key: distro-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: distro-${{ matrix.name }}-
-      - name: Distro prologue (libc, shell, true)
-        env:
-          PATH: /root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-        run: |
-          (ldd --version 2>&1 || true) | head -1
-          ls -l /bin/sh /bin/true /usr/bin/true 2>&1 || true
-          id nobody 2>&1 || true
-      - name: Build
-        env:
-          PATH: /root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-        run: cargo build --workspace --all-targets
-      - name: Test
-        env:
-          PATH: /root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-        run: cargo test --workspace
+      - name: Build + test inside ${{ matrix.name }}
+        # SETUID/SETGID: confined container roots get EPERM on the id-changing
+        # syscalls otherwise, which fails `dropping_to_nobody_as_root` — an
+        # environment gap, not a code bug, so the caps live here, not in a
+        # test skip.
+        run: >
+          docker run --rm
+          --cap-add=SETUID --cap-add=SETGID --cap-add=CHOWN
+          -v ${{ github.workspace }}:/work -w /work
+          ${{ matrix.image }}
+          sh -c '${{ matrix.prep }}
+          && (ldd --version 2>&1 || true) | head -1
+          && ls -l /bin/sh /bin/true /usr/bin/true 2>&1 || true
+          && id nobody 2>&1 || true
+          && curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs
+          | sh -s -- -y --default-toolchain stable --profile minimal
+          && export PATH="$HOME/.cargo/bin:$PATH"
+          && cargo build --workspace --all-targets
+          && cargo test --workspace'
