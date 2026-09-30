@@ -378,6 +378,15 @@ pub fn drop_privileges(uid: u32, gid: u32) -> io::Result<()> {
         if e.raw_os_error() != Some(libc::EINVAL) {
             return Err(e);
         }
+        // EINVAL means "more groups than the one slot", so there are groups
+        // to shed — but only a privileged caller can finish the drop
+        // afterwards. An unprivileged attempt would shed the supplementary
+        // groups and then fail at setgid anyway (mutate-then-fail, which the
+        // fail-cleanly test forbids), so bail out untouched instead.
+        // SAFETY: getter, no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return Err(e);
+        }
         true
     } else {
         ngroups > 0

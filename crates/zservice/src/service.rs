@@ -888,9 +888,7 @@ mod tests {
             // misreport as "notify never arrived". Fail fast with the status;
             // a live child keeps waiting, which is the only case where
             // waiting can still succeed.
-            if let Some(waited) =
-                zrt::sys::waitpid_nohang(svc.pid().expect("pid")).expect("wait")
-            {
+            if let Some(waited) = zrt::sys::waitpid_nohang(svc.pid().expect("pid")).expect("wait") {
                 panic!("child died before notifying: {:?}", waited.status);
             }
             assert!(zrt::clock::now_ms() < deadline, "notify never arrived");
