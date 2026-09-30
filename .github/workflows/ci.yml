@@ -141,6 +141,29 @@ jobs:
         if: matrix.components != ''
         run: cargo fmt --all --check
 
+  # macOS aarch64: native runner, proves the kqueue backend compiles and the
+  # workspace tests pass outside Linux. One job, not a matrix.
+  macos:
+    name: macos-aarch64
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-macos-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-macos-
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo fmt --all --check
+
   # ══════════════════════════════════════════════════════════════════════════
   # 2. Cross-build the tier-2 glibc sweep. Build is the evidence; running
   #    is covered by the native job and by the BSD VMs.
