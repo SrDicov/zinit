@@ -478,11 +478,7 @@ mod tests {
         let want = 4294967294;
         #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
         let want = 32767;
-        #[cfg(not(any(
-            target_vendor = "apple",
-            target_os = "openbsd",
-            target_os = "netbsd"
-        )))]
+        #[cfg(not(any(target_vendor = "apple", target_os = "openbsd", target_os = "netbsd")))]
         let want = 65534;
         let (uid, gid) = resolve_user("nobody").expect("nobody must exist");
         assert_eq!(uid, want, "nobody must resolve to the platform convention");
