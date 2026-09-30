@@ -983,6 +983,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn signalfd_delivers_through_the_reactor() {
         // The whole point of the module, end to end: block a signal, raise it
         // on this thread, and have it come out of `wait` like any other event.
@@ -1012,6 +1013,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn a_burst_of_signals_is_coalesced_not_lost() {
         // Three `SIGUSR1` in a row must produce at least one delivery, and
         // the loop must not spin. This is the property the self-pipe can only

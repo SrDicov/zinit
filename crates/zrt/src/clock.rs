@@ -182,11 +182,12 @@ pub fn remaining_ms(deadline: u64) -> u64 {
 /// constantly — and propagating that would make every sleep in the system a
 /// lie. Retrying is the only correct behaviour here.
 pub fn sleep_ms(ms: u64) -> io::Result<()> {
-    // `libc::time_t` is deprecated on musl because its width is changing with
-    // the C library, so the seconds are computed as an `i64` and coerced to
-    // whatever `timespec::tv_sec` is declared as on the target being built.
-    // `tv_sec` is at least 32 bits on every platform in scope and 64 bits on
-    // every 64-bit one, so this cannot truncate a value that matters.
+    // `libc::time_t` is deprecated upstream (libc#1848: width changing with
+    // musl 1.2.0). The seconds are still computed through it and coerced to
+    // whatever `timespec::tv_sec` is declared as; `tv_sec` is at least 32 bits
+    // on every platform in scope and 64 bits on every 64-bit one, so this
+    // cannot truncate a value that matters.
+    #[allow(deprecated)]
     let secs = (ms / 1000) as libc::time_t;
     // `tv_nsec` is `c_long`: 64 bits on every 64-bit target, 32 bits on
     // 32-bit ones. An unadorned `as i64` compiles on x86_64 and breaks on
