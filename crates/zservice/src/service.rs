@@ -882,6 +882,17 @@ mod tests {
             if let Some(e) = svc.poll_ready(zrt::clock::now_ms()).expect("poll") {
                 break e;
             }
+            // A dead child can never notify: EOF on the notify pipe reads as
+            // "not yet" forever, so any early child death (failed exec,
+            // signal, OOM) would otherwise burn the whole deadline and
+            // misreport as "notify never arrived". Fail fast with the status;
+            // a live child keeps waiting, which is the only case where
+            // waiting can still succeed.
+            if let Some(waited) =
+                zrt::sys::waitpid_nohang(svc.pid().expect("pid")).expect("wait")
+            {
+                panic!("child died before notifying: {:?}", waited.status);
+            }
             assert!(zrt::clock::now_ms() < deadline, "notify never arrived");
             zrt::clock::sleep_ms(5).expect("sleep");
         };
