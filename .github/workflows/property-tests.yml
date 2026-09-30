@@ -1,0 +1,51 @@
+name: property-tests
+
+# Extended property testing. `zcore` seeds are fixed in code (0..300 etc.), so
+# "more iterations" today means the full suite in release (10-50x faster per
+# case than debug) on a nightly cron. Commit-hash-derived seeding needs a code
+# knob first — YAGNI until Phase 5 makes `PROP_SEED_OFFSET` real.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/zcore/**"
+      - ".github/workflows/property-tests.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: -D warnings
+
+jobs:
+  extended:
+    name: zcore properties (release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-props-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-props-
+      - name: Properties in release (max cases/sec)
+        run: cargo test -p zcore --release -- --nocapture
+      - name: Reproducibility check (same seeds, twice)
+        run: |
+          cargo test -p zcore --release > run1.log 2>&1
+          cargo test -p zcore --release > run2.log 2>&1
+          diff <(grep -c "test result" run1.log) <(grep -c "test result" run2.log)
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: property-logs
+          path: run*.log

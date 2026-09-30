@@ -1,0 +1,43 @@
+name: alpine-e2e
+
+# Final acceptance in a minimal Alpine (musl/busybox). No PID-1 binary exists
+# yet, so privileged boot with sshd/nginx/postgres is Phase 3+. Today this
+# proves the load-bearing half instead: the real fork+exec path (`spawn`,
+# `setsid` fallback, reactor) inside musl libc with busybox `/bin/true`,
+# `/bin/sleep`, `/bin/sh` — including the new
+# `group_leader_parent_still_spawns_with_own_group` regression test.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  alpine-musl:
+    name: spawn+reactor on alpine (musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: alpine:latest
+    steps:
+      - name: Install toolchain (container-scoped)
+        run: |
+          apk add --no-cache curl gcc musl-dev
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v5
+      - name: Prove busybox prologue exists
+        run: ls -l /bin/true /bin/sleep /bin/sh
+      - name: Fork path incl. setsid regression
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test -p zservice --release spawn
+      - name: Reactor on musl
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test -p zrt --release reactor

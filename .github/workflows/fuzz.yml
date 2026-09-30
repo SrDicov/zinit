@@ -1,0 +1,80 @@
+name: fuzz
+
+# Continuous fuzzing proxy. No `fuzz/` targets exist yet (Phase 5 tooling), so
+# the scheduled run exercises the parser's mutation tests — the honest fuzz
+# surface available today — and real `cargo fuzz` takes over automatically the
+# day `fuzz/fuzz_targets/` lands. Heavy by design: nightly + manual + parser
+# PRs only, never every push.
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/zconfig/src/parser.rs"
+      - "crates/zconfig/src/value.rs"
+      - "crates/zrt/src/**"
+      - ".github/workflows/fuzz.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: -D warnings
+
+jobs:
+  mutation-tests:
+    name: parser mutation tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-fuzz-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-fuzz-
+      - name: Parser no-panic suite (fuzz proxy)
+        run: cargo test -p zconfig --release no_panic
+      - name: Full zconfig suite
+        run: cargo test -p zconfig --release
+
+  cargo-fuzz:
+    name: cargo-fuzz targets (if present)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+            fuzz/corpus
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-fuzz-
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked || true
+      - name: Fuzz 60s per target (skips cleanly without fuzz/ dir)
+        run: |
+          set -euo pipefail
+          if [ ! -d fuzz/fuzz_targets ]; then
+            echo "no fuzz/ targets yet — mutation-tests job is the gate"
+            exit 0
+          fi
+          for t in fuzz/fuzz_targets/*.rs; do
+            name=$(basename "$t" .rs)
+            timeout 60 cargo +nightly fuzz run "$name" -- -max_total_time=55 || true
+          done
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts/

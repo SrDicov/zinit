@@ -1,0 +1,70 @@
+name: security-audit
+
+# CVE + license + unsafe-scope gates. `cargo deny` runs only once `deny.toml`
+# exists (Phase 4 tooling); until then the `ci.yml` license job plus `cargo
+# audit` cover the same ground without a config nobody maintains.
+on:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "crates/*/Cargo.toml"
+      - ".github/workflows/security-audit.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: advisories + unsafe scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/advisory-dbs
+            target
+          key: ${{ runner.os }}-audit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-audit-
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked || true
+      - name: CVE audit
+        run: cargo audit
+      - name: cargo-deny (if configured)
+        run: |
+          if [ -f deny.toml ]; then
+            cargo install cargo-deny --locked || true
+            cargo deny check
+          else
+            echo "no deny.toml yet — license gate lives in ci.yml (license job)"
+          fi
+      - name: unsafe scope — nothing outside zrt/zservice
+        run: |
+          set -euo pipefail
+          hits=$(grep -rn --include='*.rs' -E '^\s*unsafe(\s|\{)' crates/zcore/src crates/zconfig/src || true)
+          if [ -n "$hits" ]; then
+            echo "::error::unsafe leaked into the pure crates:"
+            echo "$hits"
+            exit 1
+          fi
+          echo "unsafe confined to zrt/zservice (each needs // SAFETY: per AGENTS.md)"
+      - name: geiger (advisory, non-blocking pre-Phase 5)
+        continue-on-error: true
+        run: |
+          cargo install cargo-geiger --locked || true
+          cargo geiger --forbid-only 2>&1 | tee geiger.log || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: geiger-log
+          path: geiger.log
