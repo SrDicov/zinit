@@ -51,10 +51,11 @@ jobs:
           - name: chimera
             image: chimeralinux/chimera:latest
             # Empty apk index on the minimal image: update first. Chimera is a
-            # clang+musl distro: no `gcc` package, headers are `musl-devel`
-            # (not Alpine's `musl-dev`), rustup picks the musl toolchain whose
-            # cargo needs `libgcc_s.so.1`, and nothing provides `cc`, so link it.
-            prep: apk update && apk add curl clang lld musl-devel libgcc && (test -e /usr/bin/cc || ln -s clang /usr/bin/cc)
+            # clang+musl distro with no gcc at all (hence no libgcc_s for
+            # rustup's musl cargo): take the distro `cargo` instead and skip
+            # rustup when a cargo already exists. Headers are `musl-devel`,
+            # and nothing provides `cc`, so link it to clang.
+            prep: apk update && apk add curl clang lld musl-devel cargo && (test -e /usr/bin/cc || ln -s clang /usr/bin/cc)
           - name: arch
             image: archlinux:latest
             prep: pacman -Syu --noconfirm curl gcc
@@ -65,7 +66,7 @@ jobs:
             image: ghcr.io/eweos/docker:master
             # eweOS's gcc ships no `cc` link; cargo's default linker needs it.
             # The listing is the diagnosis if `gcc` itself lives elsewhere.
-            prep: pacman -Syu --noconfirm curl gcc && ls /usr/bin | grep -E '^(cc|gcc)' ; (test -e /usr/bin/cc || ln -s "$(command -v gcc)" /usr/bin/cc)
+            prep: pacman -Syu --noconfirm curl gcc && ls /usr/bin | grep -E "^(cc|gcc)" ; (test -e /usr/bin/cc || ln -s "$(command -v gcc)" /usr/bin/cc)
           - name: gentoo
             image: gentoo/stage3:latest
             prep: true
@@ -86,8 +87,8 @@ jobs:
           && (ldd --version 2>&1 || true) | head -1
           && ls -l /bin/sh /bin/true /usr/bin/true 2>&1 || true
           && id nobody 2>&1 || true
-          && curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs
-          | sh -s -- -y --default-toolchain stable --profile minimal
+          && (command -v cargo || curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs
+          | sh -s -- -y --default-toolchain stable --profile minimal)
           && export PATH="$HOME/.cargo/bin:$PATH"
           && cargo build --workspace --all-targets
           && cargo test --workspace'
