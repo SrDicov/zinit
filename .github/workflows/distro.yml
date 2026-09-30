@@ -64,9 +64,9 @@ jobs:
             # existed on any registry; upstream publishes `eweos/docker` with
             # metadata-action tags (`master`, no `latest`).
             image: ghcr.io/eweos/docker:master
-            # eweOS's gcc ships no `cc` link; cargo's default linker needs it.
-            # The listing is the diagnosis if `gcc` itself lives elsewhere.
-            prep: pacman -Syu --noconfirm curl gcc && ls /usr/bin | grep -E "^(cc|gcc)" ; (test -e /usr/bin/cc || ln -s "$(command -v gcc)" /usr/bin/cc)
+            # No `gcc` package in eweOS repos: take the Arch-convention
+            # `base-devel` group instead. `cc` link as above.
+            prep: pacman -Syu --noconfirm base-devel curl && (test -e /usr/bin/cc || ln -s "$(command -v gcc || command -v clang)" /usr/bin/cc)
           - name: gentoo
             image: gentoo/stage3:latest
             prep: true
