@@ -51,9 +51,10 @@ jobs:
           - name: chimera
             image: chimeralinux/chimera:latest
             # Empty apk index on the minimal image: update first. Chimera is a
-            # clang distro: no `gcc` package, headers are `musl-devel` (not
-            # Alpine's `musl-dev`), and nothing provides `cc`, so link it.
-            prep: apk update && apk add curl clang musl-devel && (test -e /usr/bin/cc || ln -s clang /usr/bin/cc)
+            # clang+musl distro: no `gcc` package, headers are `musl-devel`
+            # (not Alpine's `musl-dev`), rustup picks the musl toolchain whose
+            # cargo needs `libgcc_s.so.1`, and nothing provides `cc`, so link it.
+            prep: apk update && apk add curl clang lld musl-devel libgcc && (test -e /usr/bin/cc || ln -s clang /usr/bin/cc)
           - name: arch
             image: archlinux:latest
             prep: pacman -Syu --noconfirm curl gcc
@@ -63,7 +64,8 @@ jobs:
             # metadata-action tags (`master`, no `latest`).
             image: ghcr.io/eweos/docker:master
             # eweOS's gcc ships no `cc` link; cargo's default linker needs it.
-            prep: pacman -Syu --noconfirm curl gcc && (test -e /usr/bin/cc || ln -s gcc /usr/bin/cc)
+            # The listing is the diagnosis if `gcc` itself lives elsewhere.
+            prep: pacman -Syu --noconfirm curl gcc && ls /usr/bin | grep -E '^(cc|gcc)' ; (test -e /usr/bin/cc || ln -s "$(command -v gcc)" /usr/bin/cc)
           - name: gentoo
             image: gentoo/stage3:latest
             prep: true

@@ -368,13 +368,21 @@ pub fn drop_privileges(uid: u32, gid: u32) -> io::Result<()> {
     // the self-drop testable without root. `getgroups` itself needs no
     // privilege.
     let mut groups = [0 as libc::gid_t; 1];
-    // SAFETY: one-slot buffer with size 1; the return is the count (or -1).
-    // Only the count is read — the slot is never trusted when it is 0.
+    // SAFETY: one-slot buffer with size 1. A size-1 query reports EINVAL —
+    // not a count — when the process carries more than one supplementary
+    // group (container roots often do), which still means "groups exist".
+    // Anything else failing here is a real error.
     let ngroups = unsafe { libc::getgroups(1, groups.as_mut_ptr()) };
-    if ngroups < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if ngroups > 0 {
+    let has_groups = if ngroups < 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINVAL) {
+            return Err(e);
+        }
+        true
+    } else {
+        ngroups > 0
+    };
+    if has_groups {
         // SAFETY: `setgroups(0, NULL)` is the documented empty-set form; the
         // kernel checks the count and never dereferences the pointer.
         if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
