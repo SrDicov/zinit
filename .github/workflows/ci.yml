@@ -208,18 +208,16 @@ jobs:
   # ══════════════════════════════════════════════════════════════════════════
   # 2b. Cross-build the musl sweep.
   #
-  #    No musl toolchain is fetched, and none is needed. `rustup target add
-  #    <t>-unknown-linux-musl` ships that target's own `crt1.o`, `Scrt1.o`,
-  #    `crti.o`, `crtn.o` and `libc.a` under
-  #    `lib/rustlib/<t>/lib/self-contained/`, musl targets are `crt-static` by
-  #    default, and so rustc links them itself with its bundled `rust-lld`.
-  #    That is musl, statically - not a glibc linker in disguise, which is the
-  #    only thing this axis is claiming.
-  #
-  #    It used to download musl.cc cross toolchains, and musl.cc times out from
-  #    GitHub's runners: "curl: (28) Failed to connect to musl.cc port 443"
-  #    after 134 seconds. That was 79MB of a toolchain we already had, and the
-  #    cache never once got warm because the download never once succeeded.
+  #    The CRT comes from rustup (`lib/rustlib/<t>/lib/self-contained/`, musl
+  #    targets are `crt-static` by default), but the *link driver* must
+  #    understand the target: the runner's x86_64 `/usr/bin/ld` chokes on
+  #    ARM erratum flags (`--fix-cortex-a53-843419`) and rejects foreign
+  #    objects outright. Each leg therefore installs its matching gnu cross
+  #    gcc (a driver, not a libc — nothing glibc links in: `-nostartfiles
+  #    -nodefaultlibs` with the self-contained sysroot) and points
+  #    `CARGO_TARGET_*_LINKER` at it, the same per-leg pattern as `linux-cross`.
+  #    (musl.cc cross toolchains were tried first and time out from GitHub's
+  #    runners: "curl: (28) Failed to connect to musl.cc port 443".)
   # ══════════════════════════════════════════════════════════════════════════
   linux-musl-cross:
     name: musl ${{ matrix.target }}
@@ -228,16 +226,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - armv7-unknown-linux-musleabihf
-          - aarch64-unknown-linux-musl
-          - riscv64gc-unknown-linux-musl
+        include:
+          - { target: armv7-unknown-linux-musleabihf, apt: gcc-arm-linux-gnueabihf, linker: arm-linux-gnueabihf-gcc }
+          - { target: aarch64-unknown-linux-musl, apt: gcc-aarch64-linux-gnu, linker: aarch64-linux-gnu-gcc }
+          - { target: riscv64gc-unknown-linux-musl, apt: gcc-riscv64-linux-gnu, linker: riscv64-linux-gnu-gcc }
 
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install target-aware link driver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+          echo "CARGO_TARGET_$(echo ${{ matrix.target }} | tr a-z- A-Z_)_LINKER=${{ matrix.linker }}" >> "$GITHUB_ENV"
 
       - name: Build
         run: cargo build --workspace --target ${{ matrix.target }}
@@ -458,12 +462,19 @@ jobs:
       - name: Check
         # Same RUSTFLAGS neutralization as linux-tier3: `-D warnings` must not
         # leak into the hand-built std.
+        #
+        # `-Z build-std-features=panic_immediate_abort` is deliberately absent.
+        # It used to be a no-op cfg passed down to the hand-built core; nightly
+        # has since promoted it to a real panic strategy, so asking for it here
+        # makes `core` itself refuse to compile ("panic_immediate_abort is now
+        # a real panic strategy!") before zrt is ever reached. The workspace
+        # already selects `panic = "abort"` per profile, which is the supported
+        # way to get the same result.
         env:
           RUSTFLAGS: ""
         run: |
           cargo +nightly check --workspace --target ${{ matrix.target }} \
-            -Z build-std=std,core,alloc,panic_unwind \
-            -Z build-std-features=panic_immediate_abort
+            -Z build-std=std,core,alloc,panic_unwind
 
   # ══════════════════════════════════════════════════════════════════════════
   # 6. The purity claims, asserted against the source rather than inferred
