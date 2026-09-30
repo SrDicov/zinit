@@ -317,10 +317,10 @@ pub fn ensure_cgroup(service: &str, cgroup: &str) -> io::Result<PathBuf> {
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let _ = cgroup;
-        return Err(SpawnError::CgroupUnsupported {
+        Err(SpawnError::CgroupUnsupported {
             name: service.to_string(),
         }
-        .into());
+        .into())
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {

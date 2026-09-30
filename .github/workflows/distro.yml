@@ -1,0 +1,95 @@
+name: distro
+
+# x86_64 distro matrix: Void (glibc+musl), Alpine, Chimera, Arch, eweOS,
+# Gentoo. There is no shippable binary yet (workspace is lib-only until
+# Phase 3), so "testing zinit" here means the full test suite — above all
+# the real fork+exec spawn path and the reactor — on each distro's own
+# libc, coreutils and /bin layout. That is exactly the surface that bit us
+# on macOS (`/bin/true`, `nobody`, `/proc`): this job exists so the next
+# such assumption fails here first, on x86_64, in seconds.
+#
+# No clippy/fmt here (covered by `ci.yml`); build + test only, to keep
+# minutes sane across 7 containers.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: -D warnings
+
+jobs:
+  distro:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: void-glibc
+            image: ghcr.io/void-linux/void-glibc:latest
+            prep: xbps-install -Syu curl gcc
+          - name: void-musl
+            image: ghcr.io/void-linux/void-musl:latest
+            prep: xbps-install -Syu curl gcc
+          - name: alpine
+            image: alpine:latest
+            prep: apk add --no-cache curl gcc musl-dev
+          - name: chimera
+            image: ghcr.io/chimera-linux/chimera:latest
+            prep: apk add curl gcc musl-dev
+          - name: arch
+            image: archlinux:latest
+            prep: pacman -Syu --noconfirm curl gcc
+          - name: eweos
+            image: eweos/eweos:latest
+            prep: apk add --no-cache curl gcc musl-dev
+          - name: gentoo
+            image: gentoo/stage3:latest
+            prep: echo "stage3 ships gcc+curl; nothing to install"
+
+    steps:
+      - name: Install toolchain (container-scoped)
+        # Same root/HOME mismatch as alpine-e2e: pin everything to /root.
+        run: |
+          export HOME=/root RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo
+          echo "HOME=/root" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=/root/.rustup" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=/root/.cargo" >> "$GITHUB_ENV"
+          echo "/root/.cargo/bin" >> "$GITHUB_PATH"
+          ${{ matrix.prep }}
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v4
+        with:
+          path: |
+            /root/.cargo/registry
+            target
+          key: distro-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: distro-${{ matrix.name }}-
+      - name: Distro prologue (libc, shell, true)
+        env:
+          PATH: /root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        run: |
+          (ldd --version 2>&1 || true) | head -1
+          ls -l /bin/sh /bin/true /usr/bin/true 2>&1 || true
+          id nobody 2>&1 || true
+      - name: Build
+        env:
+          PATH: /root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        run: cargo build --workspace --all-targets
+      - name: Test
+        env:
+          PATH: /root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        run: cargo test --workspace
