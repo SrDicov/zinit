@@ -176,10 +176,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: armv7-unknown-linux-gnueabihf, linker: arm-linux-gnueabihf-gcc }
-          - { target: riscv64gc-unknown-linux-gnu, linker: riscv64-linux-gnu-gcc }
-          - { target: x86_64-unknown-linux-gnux32, linker: gcc, note: "x32 ABI: 64-bit registers, 32-bit pointers" }
-          - { target: powerpc64le-unknown-linux-gnu, linker: powerpc64le-linux-gnu-gcc }
+          - { target: armv7-unknown-linux-gnueabihf, linker: arm-linux-gnueabihf-gcc, apt: gcc-arm-linux-gnueabihf }
+          - { target: riscv64gc-unknown-linux-gnu, linker: riscv64-linux-gnu-gcc, apt: gcc-riscv64-linux-gnu }
+          - { target: x86_64-unknown-linux-gnux32, linker: gcc, apt: gcc-multilib libc6-dev-i386, note: "x32 ABI: 64-bit registers, 32-bit pointers" }
+          - { target: powerpc64le-unknown-linux-gnu, linker: powerpc64le-linux-gnu-gcc, apt: gcc-powerpc64le-linux-gnu }
 
     steps:
       - uses: actions/checkout@v5
@@ -188,12 +188,12 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross toolchain
+        # One package per leg. Ubuntu's cross gcc packages all declare
+        # `Conflicts: gcc-multilib`, so installing the whole set at once is
+        # unsatisfiable; only the x32 leg needs multilib (32-bit crt + libc).
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            gcc-arm-linux-gnueabihf \
-            gcc-riscv64-linux-gnu \
-            gcc-powerpc64le-linux-gnu gcc-multilib
+          sudo apt-get install -y ${{ matrix.apt }}
           echo "CARGO_TARGET_$(echo ${{ matrix.target }} | tr a-z- A-Z_)_LINKER=${{ matrix.linker }}" >> "$GITHUB_ENV"
 
       - name: Build
@@ -206,12 +206,20 @@ jobs:
         run: cargo test --workspace --target ${{ matrix.target }} --no-run
 
   # ══════════════════════════════════════════════════════════════════════════
-  # 2b. Cross-build the musl sweep with real musl toolchains.
+  # 2b. Cross-build the musl sweep.
   #
-  # Ubuntu ships no musl cross compilers (there is no
-  # `gcc-arm-linux-musleabihf` package), and linking a musl target with a
-  # glibc linker is lying about what was tested. musl.cc provides static,
-  # self-contained cross toolchains; they are fetched once and cached.
+  #    No musl toolchain is fetched, and none is needed. `rustup target add
+  #    <t>-unknown-linux-musl` ships that target's own `crt1.o`, `Scrt1.o`,
+  #    `crti.o`, `crtn.o` and `libc.a` under
+  #    `lib/rustlib/<t>/lib/self-contained/`, musl targets are `crt-static` by
+  #    default, and so rustc links them itself with its bundled `rust-lld`.
+  #    That is musl, statically - not a glibc linker in disguise, which is the
+  #    only thing this axis is claiming.
+  #
+  #    It used to download musl.cc cross toolchains, and musl.cc times out from
+  #    GitHub's runners: "curl: (28) Failed to connect to musl.cc port 443"
+  #    after 134 seconds. That was 79MB of a toolchain we already had, and the
+  #    cache never once got warm because the download never once succeeded.
   # ══════════════════════════════════════════════════════════════════════════
   linux-musl-cross:
     name: musl ${{ matrix.target }}
@@ -220,10 +228,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { target: armv7-unknown-linux-musleabihf, triplet: arm-linux-musleabihf }
-          - { target: aarch64-unknown-linux-musl, triplet: aarch64-linux-musl }
-          - { target: riscv64gc-unknown-linux-musl, triplet: riscv64-linux-musl }
+        target:
+          - armv7-unknown-linux-musleabihf
+          - aarch64-unknown-linux-musl
+          - riscv64gc-unknown-linux-musl
 
     steps:
       - uses: actions/checkout@v5
@@ -231,33 +239,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache musl.cc toolchain
-        id: musl-cache
-        uses: actions/cache@v4
-        with:
-          path: /tmp/musl-cross/${{ matrix.triplet }}
-          key: musl-cc-${{ matrix.triplet }}-v12
-
-      - name: Install musl cross toolchain
-        if: steps.musl-cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/musl-cross
-          curl -sSfL "https://musl.cc/${{ matrix.triplet }}-cross.tgz" \
-            -o /tmp/musl-cross/toolchain.tgz
-          tar -xzf /tmp/musl-cross/toolchain.tgz -C /tmp/musl-cross
-          rm /tmp/musl-cross/toolchain.tgz
-
       - name: Build
-        run: |
-          linker="/tmp/musl-cross/${{ matrix.triplet }}-cross/bin/${{ matrix.triplet }}-gcc"
-          test -x "$linker" || { echo "::error::musl linker missing: $linker"; exit 1; }
-          # GITHUB_ENV only takes effect in *later* steps, so export for this
-          # shell too; the file write covers the test-compile step below.
-          var="CARGO_TARGET_$(echo ${{ matrix.target }} | tr a-z- A-Z_)_LINKER"
-          export "$var=$linker"
-          echo "$var=$linker" >> "$GITHUB_ENV"
-          cargo build --workspace --target ${{ matrix.target }}
+        run: cargo build --workspace --target ${{ matrix.target }}
 
       - name: Test compile only
         run: cargo test --workspace --target ${{ matrix.target }} --no-run
@@ -287,8 +270,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
+        # `targets:` is deliberately absent. `-Z build-std` compiles std from
+        # `rust-src`, so the prebuilt `rust-std` for the target is never used
+        # — and for a tier-3 target there is not one, so asking rustup for it
+        # failed the whole step with "component 'rust-std' ... unavailable for
+        # download". `rust-src` is the only component build-std needs.
         with:
-          targets: ${{ matrix.target }}
+          components: rust-src
 
       - name: Check with a hand-built std
         # NOTE: RUSTFLAGS is neutralized for this step on purpose. `-D warnings`
@@ -305,6 +293,15 @@ jobs:
 
   # ══════════════════════════════════════════════════════════════════════════
   # 4. The toolchain axis: gcc / clang / lld as the link driver.
+  #
+  #    LLD is covered twice on purpose: once through the clang driver
+  #    (`ld: lld`) and once as rust-lld itself. A bare rust-lld cannot be a
+  #    link *driver* for this target, though: rustc picks the linker's flavour
+  #    from the file name, so rust-lld must be invoked as `rust-lld -flavor
+  #    gnu`, and the glibc target ships no CRT objects for it to start with -
+  #    `rust-std` has `x86_64-unknown-linux-gnu/lib/self-contained/` empty.
+  #    A cc driver in front of lld is not a workaround, it is the design: the
+  #    CRT objects come from the distribution that owns them.
   # ══════════════════════════════════════════════════════════════════════════
   linkers:
     name: driver ${{ matrix.linker }}
@@ -317,8 +314,7 @@ jobs:
           - { linker: cc, cc: gcc, desc: "GNU ld, the distribution default" }
           - { linker: clang, cc: clang, desc: "GNU ld via the clang driver" }
           - { linker: clang, cc: clang, ld: lld, desc: "LLD via clang" }
-          - { linker: rust-lld, cc: clang, desc: "rust-lld, no system linker at all" }
-          - { linker: clang, cc: clang, pie: false, desc: "non-PIE, for kernels built without relocation support" }
+          - { linker: clang, cc: clang, nonpie: true, desc: "non-PIE, for kernels built without relocation support" }
 
     steps:
       - uses: actions/checkout@v5
@@ -338,21 +334,35 @@ jobs:
         # argument and rustc reports "multiple input filenames". None of the
         # paths here contain spaces, so quotes are unnecessary as well as
         # harmful.
+        #
+        # NOTE: `nonpie` is a flag, never `pie: false`. GitHub casts a missing
+        # matrix key to 0 and `false` to 0, so `matrix.pie == false` is TRUE for
+        # every leg that merely omits the key. All four legs were therefore
+        # built `-C relocation-model=static` and then linked PIE, which is the
+        # one combination rust-lld refuses.
         run: |
           set -euo pipefail
           case "${{ matrix.linker }}" in
-            cc)       ln -sf "$(command -v gcc)"   "$RUNNER_TEMP/xlinker" ;;
-            clang)    ln -sf "$(command -v clang)" "$RUNNER_TEMP/xlinker" ;;
-            rust-lld) ln -sf "$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld" \
-                              "$RUNNER_TEMP/xlinker" ;;
+            cc)    ln -sf "$(command -v gcc)"   "$RUNNER_TEMP/xlinker" ;;
+            clang) ln -sf "$(command -v clang)" "$RUNNER_TEMP/xlinker" ;;
           esac
           {
-            echo "RUSTFLAGS=-C linker=$RUNNER_TEMP/xlinker -C link-arg=-fuse-ld=${{ matrix.ld || 'bfd' }} ${{ matrix.pie == false && '-C relocation-model=static -C link-arg=-no-pie' || '' }}"
+            echo "RUSTFLAGS=-C linker=$RUNNER_TEMP/xlinker -C link-arg=-fuse-ld=${{ matrix.ld || 'bfd' }} ${{ matrix.nonpie && '-C relocation-model=static -C link-arg=-no-pie' || '' }}"
+            # rustdoc drives its own link and reads RUSTDOCFLAGS, not
+            # RUSTFLAGS, so without this the doctests are linked by whatever
+            # the runner defaults to - the one thing this job is here to test.
+            echo "RUSTDOCFLAGS=-C linker=$RUNNER_TEMP/xlinker -C link-arg=-fuse-ld=${{ matrix.ld || 'bfd' }}"
           } >> "$GITHUB_ENV"
           echo "CC=${{ matrix.cc }}" >> "$GITHUB_ENV"
 
       - run: cargo build --workspace --all-targets
-      - run: cargo test --workspace
+      - name: Test
+        # The non-PIE leg skips doctests, and only there. rustdoc links them
+        # itself without the `-C link-arg=-no-pie` above, so it would assemble
+        # a PIE out of the deliberately non-PIC rlibs: guaranteed
+        # `R_X86_64_32 ... recompile with -fPIC`. Every binary and every test
+        # binary this leg is about still links non-PIE.
+        run: ${{ matrix.nonpie && 'cargo test --workspace --lib --tests' || 'cargo test --workspace' }}
 
   # ══════════════════════════════════════════════════════════════════════════
   # 5. FreeBSD, OpenBSD, NetBSD.
@@ -438,8 +448,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
+        # `targets:` is deliberately absent. `-Z build-std` compiles std from
+        # `rust-src`, so the prebuilt `rust-std` for the target is never used
+        # — and for a tier-3 target there is not one, so asking rustup for it
+        # failed the whole step with "component 'rust-std' ... unavailable for
+        # download". `rust-src` is the only component build-std needs.
         with:
-          targets: ${{ matrix.target }}
+          components: rust-src
       - name: Check
         # Same RUSTFLAGS neutralization as linux-tier3: `-D warnings` must not
         # leak into the hand-built std.

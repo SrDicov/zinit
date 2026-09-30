@@ -468,9 +468,9 @@ fn probe_tcp_connect(fd: RawFd, port: u16) -> io::Result<bool> {
         sin_addr: libc::in_addr { s_addr: ip.to_be() },
         sin_zero: [0; 8],
     };
-    /// BSD-derived kernels carry the struct length in its first byte; Linux
-    /// has no such field. The length is the size of the whole struct, which
-    /// is also what `connect` is handed below.
+    // BSD-derived kernels carry the struct length in its first byte; Linux
+    // has no such field. The length is the size of the whole struct, which
+    // is also what `connect` is handed below.
     #[cfg(any(
         target_vendor = "apple",
         target_os = "freebsd",
