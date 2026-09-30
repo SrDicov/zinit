@@ -50,14 +50,17 @@ jobs:
             prep: apk add --no-cache curl gcc musl-dev
           - name: chimera
             image: chimeralinux/chimera:latest
-            prep: apk add curl gcc musl-dev
+            # Empty apk index on the minimal image: update first. Headers are
+            # `musl-devel` here, not Alpine's `musl-dev`.
+            prep: apk update && apk add curl gcc musl-devel
           - name: arch
             image: archlinux:latest
             prep: pacman -Syu --noconfirm curl gcc
           - name: eweos
             # eweOS is Arch-derived, so pacman, not apk. `eweos/eweos` never
-            # existed on any registry; the official build is `eweos/docker`.
-            image: ghcr.io/eweos/docker:latest
+            # existed on any registry; upstream publishes `eweos/docker` with
+            # metadata-action tags (`master`, no `latest`).
+            image: ghcr.io/eweos/docker:master
             prep: pacman -Syu --noconfirm curl gcc
           - name: gentoo
             image: gentoo/stage3:latest
