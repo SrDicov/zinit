@@ -661,8 +661,9 @@ fn child_step_rlimits(p: ChildPlan) -> bool {
             rlim_max: r.max as libc::rlim_t,
         };
         // SAFETY: `setrlimit` reads one `rlimit` through the pointer and
-        // retains nothing.
-        if unsafe { libc::setrlimit(r.resource, &raw const lim) } != 0 {
+        // retains nothing. `r.resource as _` resolves against the callee's
+        // (private since libc 0.2.189) resource type.
+        if unsafe { libc::setrlimit(r.resource as _, &raw const lim) } != 0 {
             return false;
         }
     }

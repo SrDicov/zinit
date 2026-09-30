@@ -407,6 +407,22 @@ fn poll_readable(fd: RawFd, timeout_ms: u64) -> io::Result<bool> {
 /// writable socket after a nonblocking connect means "finished", not
 /// "succeeded".
 pub fn probe_tcp(port: u16) -> io::Result<bool> {
+    let fd = new_probe_socket()?;
+    let ok = probe_tcp_connect(fd, port);
+    // SAFETY: `fd` is ours, opened two lines up.
+    unsafe {
+        libc::close(fd);
+    }
+    ok
+}
+
+/// A nonblocking, close-on-exec loopback probe socket.
+///
+/// Linux takes `SOCK_CLOEXEC | SOCK_NONBLOCK` atomically; Apple/BSD targets
+/// have neither flag, so the plain socket is flagged afterwards with the same
+/// `zrt::sys` setters the spawn path uses — same guarantees, two syscalls.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn new_probe_socket() -> io::Result<RawFd> {
     // SAFETY: `socket` takes three ints; `SOCK_STREAM | SOCK_CLOEXEC |
     // SOCK_NONBLOCK` on `AF_INET` is the canonical loopback-probe form.
     let fd = unsafe {
@@ -419,12 +435,22 @@ pub fn probe_tcp(port: u16) -> io::Result<bool> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    let ok = probe_tcp_connect(fd, port);
-    // SAFETY: `fd` is ours, opened two lines up.
-    unsafe {
-        libc::close(fd);
+    Ok(fd)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn new_probe_socket() -> io::Result<RawFd> {
+    // SAFETY: `socket` takes three ints; no flags exist here, so the fd is
+    // flagged below before it can leak anywhere.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
     }
-    ok
+    if let Err(e) = zrt::sys::set_cloexec(fd, true).and(zrt::sys::set_nonblocking(fd, true)) {
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    Ok(fd)
 }
 
 fn probe_tcp_connect(fd: RawFd, port: u16) -> io::Result<bool> {

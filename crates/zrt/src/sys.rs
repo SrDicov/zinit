@@ -1488,8 +1488,10 @@ pub fn sethostname(name: &str) -> io::Result<()> {
 // missing are declared here from the platform's own headers, and the ones
 // that `libc` does export are used directly.
 #[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(clippy::unnecessary_cast)] // same-type on 32-bit, load-bearing elsewhere
 const TIOCGSID_REQ: u32 = libc::TIOCGSID as u32;
 #[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "openbsd",))]
+#[allow(clippy::unnecessary_cast)] // same-type on 32-bit, load-bearing elsewhere
 const TIOCGSID_REQ: u32 = libc::TIOCGSID as u32;
 // `_IOR('t', 124, int)`: IOC_OUT | (sizeof(int) << 16) | ('t' << 8) | 124.
 #[cfg(target_os = "netbsd")]

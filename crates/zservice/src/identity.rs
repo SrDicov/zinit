@@ -49,8 +49,11 @@ use crate::SpawnError;
 /// hard limit is never moved.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ChildRlimit {
-    /// Kernel resource constant, e.g. `libc::RLIMIT_NOFILE`.
-    pub resource: libc::__rlimit_resource_t,
+    /// Kernel resource constant value (`RLIMIT_NOFILE`, …) as a plain `u32`.
+    /// `libc::setrlimit`/`getrlimit` take the now-private `__rlimit_resource_t`
+    /// (libc 0.2.189), so the constant is stored by value and cast back with
+    /// `as _` at the call, resolved against whatever the callee declares.
+    pub resource: u32,
     /// New soft limit to install.
     pub cur: u64,
     /// Hard limit, carried over untouched.
@@ -250,10 +253,10 @@ pub fn resolve_user_group(spec: &str) -> io::Result<(u32, u32)> {
 pub fn prepare_rlimits(rlimits: &[(String, u64)]) -> io::Result<Vec<ChildRlimit>> {
     let mut out = Vec::with_capacity(rlimits.len());
     for (name, value) in rlimits {
-        let resource: libc::__rlimit_resource_t = match name.as_str() {
-            "nofile" => libc::RLIMIT_NOFILE,
-            "nproc" => libc::RLIMIT_NPROC,
-            "as" => libc::RLIMIT_AS,
+        let resource: u32 = match name.as_str() {
+            "nofile" => libc::RLIMIT_NOFILE as u32,
+            "nproc" => libc::RLIMIT_NPROC as u32,
+            "as" => libc::RLIMIT_AS as u32,
             other => {
                 return Err(SpawnError::UnknownRlimit {
                     key: other.to_string(),
@@ -263,8 +266,9 @@ pub fn prepare_rlimits(rlimits: &[(String, u64)]) -> io::Result<Vec<ChildRlimit>
         };
         let mut current: libc::rlimit = unsafe { core::mem::zeroed() };
         // SAFETY: `current` is a live, aligned `rlimit`; `getrlimit` writes
-        // exactly one and retains nothing.
-        if unsafe { libc::getrlimit(resource, &raw mut current) } != 0 {
+        // exactly one and retains nothing. `resource as _` resolves against
+        // the callee's (private) resource type.
+        if unsafe { libc::getrlimit(resource as _, &raw mut current) } != 0 {
             return Err(io::Error::last_os_error());
         }
         out.push(ChildRlimit {
