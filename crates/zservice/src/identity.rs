@@ -648,15 +648,20 @@ mod tests {
         match unsafe { libc::fork() } {
             -1 => panic!("fork failed"),
             0 => {
-                // uid 0 without CAP_SETUID/CAP_SETGID (confined containers:
-                // alpine/arch/gentoo CI legs) gets EPERM on the id-changing
-                // syscalls. That is environmental, so exit 2 means SKIP. A
-                // real regression on a capable host fails verification (which
-                // carries no errno), never EPERM — and still exits 1.
+                // uid 0 without CAP_SETUID/CAP_SETGID (confined containers)
+                // fails the id-changing syscalls. The exit code carries the
+                // diagnosis: 2 is the environmental EPERM skip, printed by
+                // the parent assert below; anything else is a real failure (a
+                // regression on a capable host fails verification, which
+                // carries no errno, so it can never hide as a skip).
                 let code = match drop_privileges(65534, 65534) {
                     Ok(()) if current_ids().0 == 65534 => 0,
-                    Err(e) if e.raw_os_error() == Some(libc::EPERM) => 2,
-                    _ => 1,
+                    Ok(()) => 10,
+                    Err(e) => match e.raw_os_error() {
+                        Some(libc::EPERM) => 2,
+                        Some(n) => 100 + n.min(27),
+                        None => 3,
+                    },
                 };
                 // SAFETY: `_exit` never returns.
                 unsafe { libc::_exit(code) };
@@ -665,13 +670,11 @@ mod tests {
                 let mut status = 0;
                 // SAFETY: blocking wait on our own child.
                 assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid);
+                let exit = libc::WEXITSTATUS(status);
                 assert!(
-                    libc::WIFEXITED(status) && matches!(libc::WEXITSTATUS(status), 0 | 2),
-                    "root must be able to drop to nobody"
+                    libc::WIFEXITED(status) && matches!(exit, 0 | 2),
+                    "root must be able to drop to nobody (child exit {exit})"
                 );
-                if libc::WEXITSTATUS(status) == 2 {
-                    eprintln!("SKIP: container root lacks CAP_SETUID; drop untested");
-                }
             }
         }
     }
