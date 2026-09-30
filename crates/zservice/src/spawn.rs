@@ -675,13 +675,13 @@ fn child_step_nice(p: ChildPlan) -> bool {
     if !p.have_nice {
         return true;
     }
-    // SAFETY: `nice` takes an int. It returns -1 both on error and legally,
-    // so errno is cleared first and only a set errno means failure.
-    unsafe {
-        *libc::__errno_location() = 0;
-        libc::nice(p.nice as libc::c_int);
-        *libc::__errno_location() == 0
-    }
+    // SAFETY: `setpriority` is one syscall on three ints. It returns -1 only
+    // on error — a nice value is never negative — so no errno read is needed
+    // (and none is possible portably: the errno accessor is `__errno_location`
+    // on Linux/DragonFly, `__error` on Darwin/FreeBSD, `__errno` on
+    // OpenBSD/NetBSD/Android). `PRIO_PROCESS` with `who = 0` means "this
+    // process", setting the documented value absolutely.
+    unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, p.nice as libc::c_int) == 0 }
 }
 
 /// Write our own pid to `cgroup.procs`, while still privileged.

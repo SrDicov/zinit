@@ -506,6 +506,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn detection_on_this_linux_machine_is_correct() {
         let caps = detect();
 
@@ -529,6 +530,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn linux_capabilities_are_all_detected() {
         let caps = detect();
         // These are facts about the *kernel and the libc*, and every Linux of

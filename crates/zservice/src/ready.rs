@@ -455,7 +455,31 @@ fn new_probe_socket() -> io::Result<RawFd> {
 
 fn probe_tcp_connect(fd: RawFd, port: u16) -> io::Result<bool> {
     let ip: u32 = u32::from_be_bytes([127, 0, 0, 1]);
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )))]
     let addr = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: port.to_be(),
+        sin_addr: libc::in_addr { s_addr: ip.to_be() },
+        sin_zero: [0; 8],
+    };
+    /// BSD-derived kernels carry the struct length in its first byte; Linux
+    /// has no such field. The length is the size of the whole struct, which
+    /// is also what `connect` is handed below.
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    let addr = libc::sockaddr_in {
+        sin_len: core::mem::size_of::<libc::sockaddr_in>() as u8,
         sin_family: libc::AF_INET as libc::sa_family_t,
         sin_port: port.to_be(),
         sin_addr: libc::in_addr { s_addr: ip.to_be() },

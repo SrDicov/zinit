@@ -253,6 +253,11 @@ pub fn resolve_user_group(spec: &str) -> io::Result<(u32, u32)> {
 pub fn prepare_rlimits(rlimits: &[(String, u64)]) -> io::Result<Vec<ChildRlimit>> {
     let mut out = Vec::with_capacity(rlimits.len());
     for (name, value) in rlimits {
+        // `RLIMIT_*` is `u32` on glibc and `c_int` on musl/BSD, so this cast
+        // is a no-op on the targets that deny warnings and load-bearing on
+        // the others. Kept, with the lint silenced by reason, rather than
+        // bent to whichever target happens to be the host.
+        #[allow(clippy::unnecessary_cast)]
         let resource: u32 = match name.as_str() {
             "nofile" => libc::RLIMIT_NOFILE as u32,
             "nproc" => libc::RLIMIT_NPROC as u32,
