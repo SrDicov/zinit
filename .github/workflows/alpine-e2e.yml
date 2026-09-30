@@ -25,19 +25,25 @@ jobs:
       image: alpine:latest
     steps:
       - name: Install toolchain (container-scoped)
+        # The container runs as root but $HOME is /github/home: rustup refuses
+        # when $HOME disagrees with the euid home, so pin everything to /root.
         run: |
+          export HOME=/root RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo
+          echo "HOME=/root" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=/root/.rustup" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=/root/.cargo" >> "$GITHUB_ENV"
+          echo "/root/.cargo/bin" >> "$GITHUB_PATH"
           apk add --no-cache curl gcc musl-dev
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain stable --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v5
       - name: Prove busybox prologue exists
         run: ls -l /bin/true /bin/sleep /bin/sh
       - name: Fork path incl. setsid regression
-        run: |
-          export PATH="$HOME/.cargo/bin:$PATH"
-          cargo test -p zservice --release spawn
+        env:
+          PATH: /root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        run: cargo test -p zservice --release spawn
       - name: Reactor on musl
-        run: |
-          export PATH="$HOME/.cargo/bin:$PATH"
-          cargo test -p zrt --release reactor
+        env:
+          PATH: /root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        run: cargo test -p zrt --release reactor

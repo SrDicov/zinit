@@ -60,3 +60,4 @@ jobs:
         with:
           name: musl-bins
           path: target/x86_64-unknown-linux-musl/release/z*
+          if-no-files-found: warn
