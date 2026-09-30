@@ -1112,6 +1112,22 @@ mod tests {
     }
 
     #[test]
+    fn group_leader_parent_still_spawns_with_own_group() {
+        // Regression for the intermittent `setsid` EPERM boot failure: a fresh
+        // fork *is* a process-group leader whenever the supervisor itself was
+        // launched by a group-leading shell (always, under `cargo test`), so
+        // `setsid` fails and only the `setpgid(0, 0)` fallback in
+        // `child_step_session` saves the spawn. This runs in that exact
+        // condition, so `pgid == pid` here proves the fallback path works.
+        let plan = process_plan("grp");
+        let log = LogSink::None;
+        let c = ctx("/bin/true", &[], &log);
+        let s = spawn(&plan, 0, &c).expect("spawn under group-leading parent");
+        assert_eq!(s.pgid, s.pid, "fallback must still own its group");
+        assert_eq!(reap(&s), zrt::sys::ExitStatus::Exited(0));
+    }
+
+    #[test]
     fn exit_code_is_preserved() {
         // Through the shell: quoting belongs to `script`, because `process`
         // splits on whitespace without quote processing (documented on

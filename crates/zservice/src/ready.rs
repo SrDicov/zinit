@@ -29,7 +29,7 @@ use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::RawFd;
 
-use zcore::{Idx, Ready, StrictReady};
+use zcore::{Ready, StrictReady};
 
 /// Re-run `ping` commands and retry `tcp` connects this often.
 ///
@@ -197,12 +197,6 @@ impl ReadyWait {
             ReadyWait::Ping { .. } => "ping",
             ReadyWait::Tcp { .. } => "tcp",
         }
-    }
-
-    /// The service this waiter was built for. Stored by the caller; this
-    /// accessor exists so call sites read uniformly.
-    pub fn for_service(idx: Idx) -> Idx {
-        idx
     }
 }
 
@@ -516,7 +510,6 @@ mod tests {
         assert!(w.check(0).expect("none is ready"));
         assert!(w.poll_need(0).is_idle());
         assert_eq!(w.name(), "none");
-        assert_eq!(ReadyWait::for_service(7), 7);
     }
 
     #[test]
