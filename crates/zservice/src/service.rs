@@ -467,7 +467,7 @@ mod tests {
 
     fn true_ctx(name: &'static str, log: &'static LogSink) -> SpawnCtx<'static> {
         SpawnCtx {
-            command: "/bin/true",
+            command: crate::testutil::true_bin(),
             env: &[],
             run_as: None,
             rlimits: &[],
@@ -489,30 +489,6 @@ mod tests {
     /// Mirrors [`ManagedService::group_is_signallable`] on purpose. The tests
     /// that go through this helper are testing the supervisor's signalling
     /// contract, and that contract is "never send a signal that cannot land".
-    /// Wait until `pid` has a child, i.e. it is past the point where a shell
-    /// has installed its traps and entered its loop.
-    ///
-    /// Reading `/proc/<pid>/task/<pid>/children` is Linux-only, and this is a
-    /// test helper on a machine that happens to be Linux, so that is fine — but
-    /// the timeout is what makes it safe to assert on: if the child never
-    /// shows up the helper returns and the following assertion fails with a
-    /// message about the mechanism rather than hanging.
-    fn wait_for_grandchild(pid: i32, timeout_ms: u64) {
-        let path = format!("/proc/{pid}/task/{pid}/children");
-        let deadline = zrt::clock::now_ms().saturating_add(timeout_ms);
-        loop {
-            if let Ok(text) = std::fs::read_to_string(&path)
-                && !text.trim().is_empty()
-            {
-                return;
-            }
-            if zrt::clock::now_ms() >= deadline {
-                panic!("{pid} never forked a child; the service is not running yet");
-            }
-            zrt::clock::sleep_ms(5).expect("sleep");
-        }
-    }
-
     fn kill_group(svc: &ManagedService, sig: zrt::signals::Signal) {
         let pid = svc.pid().expect("a spawned service has a pid");
         if svc.group_is_signallable() {
@@ -792,9 +768,17 @@ mod tests {
         // refuses SIGTERM: the shell traps it, and `wait` is interrupted by a
         // trapped signal rather than by a dying child, so the loop only ends
         // when the shell itself is killed.
+        //
+        // The `: > flag` write is the loop-running signal: it runs after the
+        // `trap` line and before the loop, so the file existing means the
+        // traps are installed. A fixed sleep races that (comment above); the
+        // file measures the mechanism instead of the scheduler — portably, via
+        // the filesystem every platform under test has, instead of `/proc`.
+        let flag = crate::testutil::scratch("stubborn").join("looping");
         let ctx = SpawnCtx {
-            command: Box::leak(Box::new(String::from(
-                "trap '' TERM INT HUP; while :; do sleep 1 & wait $!; done",
+            command: Box::leak(Box::new(format!(
+                "trap '' TERM INT HUP; : > '{}'; while :; do sleep 1 & wait $!; done",
+                flag.display()
             ))),
             env: &[],
             run_as: None,
@@ -830,10 +814,15 @@ mod tests {
         // before a TERM can be ignored. A fixed sleep races that: the signal
         // can arrive first, hit the default disposition, and the service dies
         // at the TERM - which is exactly what the next assertion says must not
-        // happen. Waiting for the shell to have a child of its own is a
-        // observable "the loop is running" signal, so the test measures the
-        // mechanism instead of the scheduler.
-        wait_for_grandchild(svc.pid().expect("pid"), 2000);
+        // happen. The flag file written past the `trap` line is the observable
+        // "the loop is running" signal.
+        let deadline = zrt::clock::now_ms().saturating_add(2000);
+        while !flag.exists() {
+            if zrt::clock::now_ms() >= deadline {
+                panic!("shell never reached its loop; traps may not be installed");
+            }
+            zrt::clock::sleep_ms(5).expect("sleep");
+        }
         kill_group(&svc, zrt::signals::Signal::Term);
         zrt::clock::sleep_ms(50).expect("sleep");
         // Still alive: TERM was trapped. No escalation before the deadline.

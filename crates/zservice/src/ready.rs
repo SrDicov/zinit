@@ -554,6 +554,19 @@ mod tests {
         port
     }
 
+    /// A port that is genuinely closed *right now*: bind-and-drop hands back a
+    /// port the OS may immediately reassign (ephemeral collision on a busy
+    /// shared runner), so keep the ones the probe itself confirms dark.
+    fn confirmed_closed_port() -> u16 {
+        for _ in 0..20 {
+            let port = tcp_closed_port();
+            if !probe_tcp(port).expect("probe runs") {
+                return port;
+            }
+        }
+        panic!("no genuinely closed port in 20 tries; the runner is out of ports");
+    }
+
     #[test]
     fn none_is_ready_at_once_and_needs_nothing() {
         let mut w = ReadyWait::None;
@@ -638,7 +651,7 @@ mod tests {
 
     #[test]
     fn tcp_probe_reports_a_closed_port_as_not_ready() {
-        let port = tcp_closed_port();
+        let port = confirmed_closed_port();
         assert!(!probe_tcp(port).expect("probe runs"));
         let mut w = ReadyWait::Tcp {
             port,
@@ -649,8 +662,8 @@ mod tests {
 
     #[test]
     fn ping_true_is_ready_and_false_is_not() {
-        assert!(run_check("/bin/true", 5_000).expect("probe runs"));
-        assert!(!run_check("/bin/false", 5_000).expect("probe runs"));
+        assert!(run_check(crate::testutil::true_bin(), 5_000).expect("probe runs"));
+        assert!(!run_check(crate::testutil::false_bin(), 5_000).expect("probe runs"));
         assert!(!run_check("exit 3", 5_000).expect("nonzero is not ready"));
     }
 

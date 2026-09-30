@@ -1097,7 +1097,7 @@ mod tests {
     fn unknown_service_index_is_refused() {
         let plan = process_plan("a");
         let log = LogSink::None;
-        let c = ctx("/bin/true", &[], &log);
+        let c = ctx(crate::testutil::true_bin(), &[], &log);
         let e = spawn(&plan, 9, &c).expect_err("bad index");
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
     }
@@ -1106,7 +1106,7 @@ mod tests {
     fn true_exits_zero() {
         let plan = process_plan("t");
         let log = LogSink::None;
-        let c = ctx("/bin/true", &[], &log);
+        let c = ctx(crate::testutil::true_bin(), &[], &log);
         let s = spawn(&plan, 0, &c).expect("spawn");
         assert_eq!(s.pgid, s.pid, "setsid makes the child its own group");
         assert_eq!(reap(&s), zrt::sys::ExitStatus::Exited(0));
@@ -1122,7 +1122,7 @@ mod tests {
         // condition, so `pgid == pid` here proves the fallback path works.
         let plan = process_plan("grp");
         let log = LogSink::None;
-        let c = ctx("/bin/true", &[], &log);
+        let c = ctx(crate::testutil::true_bin(), &[], &log);
         let s = spawn(&plan, 0, &c).expect("spawn under group-leading parent");
         assert_eq!(s.pgid, s.pid, "fallback must still own its group");
         assert_eq!(reap(&s), zrt::sys::ExitStatus::Exited(0));
@@ -1235,7 +1235,7 @@ mod tests {
         let rl = [(String::from("bogus"), 1u64)];
         let c = SpawnCtx {
             rlimits: &rl,
-            ..ctx("/bin/true", &[], &log)
+            ..ctx(crate::testutil::true_bin(), &[], &log)
         };
         assert!(spawn(&plan, 0, &c).is_err());
     }
@@ -1248,7 +1248,7 @@ mod tests {
         sp.log = LogSink::None;
         let plan = plan_with(sp);
         let log = LogSink::None;
-        let c = ctx("/bin/true", &[], &log);
+        let c = ctx(crate::testutil::true_bin(), &[], &log);
         let s = spawn(&plan, 0, &c).expect("spawn");
         assert_eq!(reap(&s), zrt::sys::ExitStatus::Exited(0));
     }

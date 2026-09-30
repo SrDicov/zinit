@@ -470,9 +470,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolves_nobody_to_65534() {
+    fn resolves_nobody_to_the_platform_convention() {
+        // `nobody` is 65534 on Linux/FreeBSD, -2 (4294967294) on macOS and
+        // 32767 on OpenBSD/NetBSD: the convention is the platform's, and the
+        // test pins whichever one it is running on.
+        #[cfg(target_vendor = "apple")]
+        let want = 4294967294;
+        #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+        let want = 32767;
+        #[cfg(not(any(
+            target_vendor = "apple",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        )))]
+        let want = 65534;
         let (uid, gid) = resolve_user("nobody").expect("nobody must exist");
-        assert_eq!(uid, 65534, "nobody is uid 65534 by convention");
+        assert_eq!(uid, want, "nobody must resolve to the platform convention");
         let _ = gid;
         // Deterministic: resolving twice gives the same answer.
         assert_eq!(resolve_user("nobody").expect("again"), (uid, gid));
@@ -506,9 +519,8 @@ mod tests {
 
     #[test]
     fn named_specs_resolve_each_side() {
-        // `nobody` exists with primary gid 65534 on this machine; where it
-        // does not, `resolve_user` already failed above and this would too —
-        // both answers come from the same source, which is the point.
+        // `nobody` resolves wherever the platform keeps it; both answers come
+        // from the same source, which is the point (exact uid pinned above).
         let (uid, gid) = resolve_user("nobody").expect("nobody");
         assert_eq!(resolve_user_group("nobody").expect("bare name"), (uid, gid));
     }
