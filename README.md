@@ -3,17 +3,39 @@
 > Un init con **un solo concepto** — *estado deseado* — y un reconciliador que lo cumple.
 > Sin shell para la lógica, sin grafos mutables en runtime, sin acuses que falten.
 
-**Estado**: fase 0 y la capa de runtime cerradas. **358 tests, 0 warnings.**
+**Estado**: núcleo, configuración y servicio cerrados. **423 tests, 0 warnings de clippy,
+`cargo doc` limpio.**
 
 | Crate | Qué es | Estado | Tests |
 |---|---|---|---|
 | `zcore` | Máquina de estados pura. `no_std`, sin E/S, **cero dependencias**. | ✅ | 49 |
 | `zconfig` | Parser de descripciones, grafo, plan congelado. | ✅ | 272 |
 | `zrt` | `libc`: reactor ×3, señales, seguimiento de hijos, detección de capacidades. | ✅ | 37 |
-| `zservice` | Ciclo de vida de un servicio, readiness, rlimits | ⏳ fase 1 | |
+| `zservice` | Ciclo de vida, readiness, identidad, rotación de logs. | ✅ | 65 |
 | `zinit` | Binario: `--init` (PID 1) y `--sup` (supervisor) | ⏳ fase 1 | |
 | `zctl` | CLI | ⏳ fase 3 | |
 | `zcheck` | `zinit check` — valida sin arrancar | ⏳ fase 3 | |
+
+Falta el pegamento: el reactor de `zrt` ya existe, pero aún no hay un `main()` que lo
+conecte con el reconciliador de `zcore` y ejecute los `Action`. Esa es la fase 1.
+
+## Bugs de producción que la integración destapó
+
+Cuatro de ellos eran invisibles sin los tests de integración, y los cuatro eran reales:
+
+- **`set_nonblocking` borraba `O_CLOEXEC`.** `F_SETFL` *reemplaza* la palabra de flags, así que
+  pasar un `O_NONBLOCK` desnudo limpiaba todo lo demás. Todo descriptor marcado no-bloqueante
+  quedaba heredable y se filtraba a cada `exec` posterior.
+- **`setsid` con `EPERM` mataba el arranque.** Un `fork` recién hecho *es* líder de grupo cuando
+  el supervisor arrancó desde una shell que se hizo líder — siempre, bajo `cargo test`. El hijo
+  hacía `_exit(127)` y el servicio no arrancaba, intermitentemente, por una razón que ningún log
+  explicaría. Ahora cae a `setpgid(0, 0)`.
+- **Expansión `$VAR` en el padre para `type = script`.** Un script que usaba su propio bloque
+  `env` tenía las variables consumidas por el supervisor, donde no están definidas, antes de que
+  `/bin/sh` las viera. Los scripts ahora entregan la orden al shell tal cual.
+- **`pgid` predicho reportado como hecho.** Entre el `fork` y el `setsid` del hijo el grupo no
+  existe, así que un `kill(-pgid)` inmediato era un no-op silencioso: un servicio que se colgara
+  ahí sobreviviría al `stop-timeout` y a cada `SIGKILL` posterior.
 
 El diseño completo está en [`DESIGN.md`](DESIGN.md). Este README es el estado y el índice.
 
