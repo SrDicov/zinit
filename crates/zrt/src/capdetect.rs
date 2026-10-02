@@ -454,7 +454,10 @@ fn probe_procfs() -> bool {
             Err(_) => return false,
         };
     let _ = crate::sys::close(dir);
-    crate::sys::stat_dev_ino(Path::new("/proc/self")).is_ok()
+    // `stat`/`lstat` on the mount point, via `std`: the probe asks "does this
+    // directory have a usable st_dev/st_ino", and std hands both back without
+    // a `mem::zeroed` struct this crate has to keep in sync with libc's.
+    std::fs::metadata("/proc/self").is_ok()
 }
 
 fn probe_reboot_style() -> Option<RebootStyle> {
