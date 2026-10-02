@@ -11,7 +11,7 @@ cargo test -p zcore <filter>  # single test
 cargo clippy --all-targets    # must be 0 warnings (CI sets RUSTFLAGS=-D warnings)
 cargo fmt --check
 ```
-CI workflows in `.github/workflows/`: `ci.yml` (portability matrix + purity + license + size + msrv/docs/nightly/miri) plus `fuzz.yml`, `property-tests.yml`, `security-audit.yml`, `bench.yml`, `size.yml`, `release.yml`, `alpine-e2e.yml`. Toolchain `stable` + `clippy,rustfmt` per `rust-toolchain.toml`.
+CI workflows in `.github/workflows/`: `ci.yml` (portability matrix + purity + license + msrv/docs/nightly/miri) plus `fuzz.yml` (parser mutation tests), `property-tests.yml`, `security-advisories.yml` (`cargo audit`), `distro.yml` (x86_64 distro matrix), `alpine-e2e.yml`. Toolchain `stable` + `clippy,rustfmt` per `rust-toolchain.toml`. No local toolchain by design — every build/test/lint verdict comes from CI.
 
 ## Dependency boundaries (do not add deps)
 - `zcore`: zero deps, `#![no_std]` + `#![forbid(unsafe_code)]`. Takes `now_ms: u64`, returns `Vec<Action>`. Needs I/O? Return an `Action`, never add a dep.

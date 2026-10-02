@@ -600,61 +600,12 @@ jobs:
           echo "libc is compatible with GPL-3"
 
   # ══════════════════════════════════════════════════════════════════════════
-  # 8. The size budget.
+  # 8. The size-budget gate used to live here. It measured three binaries that
+  #    do not exist (`zinit`/`zctl`/`zcheck` are lib-only crates: no `[[bin]]`,
+  #    no `main.rs` anywhere), so `total` was always 0 and `0 > 1024` never
+  #    fired — a green job measuring nothing. It comes back in the commit that
+  #    adds the first `main.rs`, resuming with the 1 MiB budget it enforced.
   #
-  # "Extremely lightweight" is a measurable claim, and a claim nobody measures
-  # is a claim that quietly stops being true. This job fails the build when
-  # the binary grows past the budget, which turns "keep it small" from a
-  # sentiment into a constraint the compiler enforces.
-  # ══════════════════════════════════════════════════════════════════════════
-  size:
-    name: size budget
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Build fully optimised and stripped
-        run: cargo build --release --workspace
-
-      - name: Measure
-        id: size
-        run: |
-          set -euo pipefail
-          total=0
-          {
-            for bin in target/release/zinit target/release/zctl target/release/zcheck; do
-              [ -f "$bin" ] || continue
-              bytes=$(stat -c%s "$bin")
-              kib=$(( bytes / 1024 ))
-              total=$(( total + kib ))
-              printf '| `%s` | %s KiB |\n' "$(basename "$bin")" "$kib"
-            done
-          } | tee size-table.md
-          echo "total=$total" >> "$GITHUB_OUTPUT"
-          echo "TOTAL_KIB=$total" >> "$GITHUB_ENV"
-
-      - name: Enforce the budget
-        # A PID 1 has to be resident and hot constantly. 1 MiB across all
-        # binaries is generous for a design this small and tight enough to
-        # catch a dependency that should not have been added.
-        run: |
-          set -euo pipefail
-          BUDGET_KIB=1024
-          if [ "$TOTAL_KIB" -gt "$BUDGET_KIB" ]; then
-            echo "::error::total release size is ${TOTAL_KIB} KiB, budget is ${BUDGET_KIB} KiB"
-            cat size-table.md
-            exit 1
-          fi
-          echo "total ${TOTAL_KIB} KiB of ${BUDGET_KIB} KiB budget"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: size-table
-          path: size-table.md
-
-  # ══════════════════════════════════════════════════════════════════════════
   # 9. MSRV, docs, and a nightly smoke build.
   # ══════════════════════════════════════════════════════════════════════════
   msrv:
