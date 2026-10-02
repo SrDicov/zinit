@@ -1574,7 +1574,7 @@ mod tests {
     fn duration_is_plain_integer_milliseconds() {
         // The representation is a `u64`, so two spellings of the same length
         // compare as the numbers they are and nothing else.
-        assert_eq!(parse_duration("1s").unwrap() > parse_duration("999ms").unwrap());
+        assert!(parse_duration("1s").unwrap() > parse_duration("999ms").unwrap());
         assert_eq!(parse_duration("1m").unwrap(), 60_000);
         assert_eq!(
             parse_duration("1m").unwrap(),

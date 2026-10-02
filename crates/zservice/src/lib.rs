@@ -14,7 +14,7 @@
 //!   per line, no buffering that a `SIGKILL` could eat.
 //! * [`identity`] — `user = name` resolution in the parent, plus the ordered
 //!   privilege drop (`setgroups`, `setresgid`, `setresuid`, verify-or-die)
-//!   the child applies through [`spawn`].
+//!   the child applies through [`spawn()`].
 //! * [`service::ManagedService`] — ties the
 //!   four above to a [`zcore::Runtime`] slot: deadlines armed, waitpid status
 //!   translated to [`zcore::Event`], stop escalation `TERM`-then-`KILL`.
