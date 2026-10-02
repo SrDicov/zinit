@@ -14,10 +14,6 @@ use crate::types::Idx;
 /// Something that happened to a service.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Event {
-    /// `fork` succeeded. The child exists but has not yet been confirmed alive.
-    /// A weak signal on its own - see [`Event::Exited`] for why.
-    Forked(Idx),
-
     /// `execve` succeeded in the child. The process image is now the service.
     /// This is the first point at which we can consider the process real.
     ExecOk(Idx),
@@ -80,8 +76,7 @@ impl Event {
     /// The service this event concerns.
     pub const fn idx(&self) -> Idx {
         match *self {
-            Event::Forked(i)
-            | Event::ExecOk(i)
+            Event::ExecOk(i)
             | Event::Ready(i)
             | Event::ReadyTimeout(i)
             | Event::StartTimeout(i)
@@ -101,7 +96,6 @@ impl Event {
     /// A short stable name, for logs and for test failure messages.
     pub const fn name(&self) -> &'static str {
         match *self {
-            Event::Forked(_) => "forked",
             Event::ExecOk(_) => "exec-ok",
             Event::SpawnFailed { .. } => "spawn-failed",
             Event::Ready(_) => "ready",
@@ -156,7 +150,6 @@ mod tests {
     #[test]
     fn idx_is_readable_on_every_variant() {
         let events = [
-            Event::Forked(3),
             Event::ExecOk(3),
             Event::SpawnFailed { idx: 3, errno: 2 },
             Event::Ready(3),
@@ -176,7 +169,7 @@ mod tests {
             assert_eq!(e.idx(), 3, "{e} reported the wrong index");
             assert!(!e.name().is_empty());
         }
-        assert_eq!(events.len(), 15, "a variant was added without a test case");
+        assert_eq!(events.len(), 14, "a variant was added without a test case");
     }
 
     #[test]

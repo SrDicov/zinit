@@ -9,7 +9,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::types::{Bucket, Budget, Desired, Idx, MAX_SERVICES, Plan, State};
+use crate::types::{Bucket, Desired, Idx, Plan, State};
 
 /// Per-service mutable state.
 #[derive(Clone, Debug)]
@@ -94,14 +94,6 @@ impl ServiceState {
         }
     }
 
-    /// Monotonic uptime in ms, or `None` if not running.
-    pub fn uptime_ms(&self, now_ms: u64) -> Option<u64> {
-        match (self.state, self.started_at) {
-            (State::Running, Some(t)) => Some(now_ms.saturating_sub(t)),
-            _ => None,
-        }
-    }
-
     /// True when the state/timer bookkeeping is self-consistent.
     ///
     /// Checked after every transition; a violation is always a core bug and
@@ -153,16 +145,16 @@ impl Default for ServiceState {
 
 /// The whole supervisor's mutable state, indexed by [`Idx`].
 ///
-/// Sized from [`MAX_SERVICES`] at construction, never reallocated. An init
-/// that can be forced to grow a `Vec` by a malformed config is an init that
-/// can be made to fail.
+/// Sized from the plan at construction, never reallocated: an init that can be
+/// forced to grow a `Vec` by a malformed config is an init that can be made to
+/// fail.
 #[derive(Clone, Debug)]
 pub struct Runtime {
     services: Vec<ServiceState>,
 }
 
 impl Runtime {
-    /// An empty runtime. Services are added with [`Runtime::add_service`].
+    /// An empty runtime, as a basis for [`Runtime::from_plan`].
     pub fn new() -> Runtime {
         Runtime {
             services: Vec::new(),
@@ -179,18 +171,6 @@ impl Runtime {
             rt.services.push(ServiceState::new());
         }
         rt
-    }
-
-    /// Append a service. Fails once [`MAX_SERVICES`] is reached.
-    pub fn add_service(&mut self) -> core::result::Result<Idx, crate::Error> {
-        if self.services.len() >= MAX_SERVICES {
-            return Err(crate::Error::PlanMismatch {
-                what: "too many services",
-                idx: 0,
-            });
-        }
-        self.services.push(ServiceState::new());
-        Ok(self.services.len() - 1)
     }
 
     pub fn len(&self) -> usize {
@@ -213,16 +193,6 @@ impl Runtime {
         &self.services[idx]
     }
 
-    /// The states, in index order.
-    ///
-    /// Returns an owned `Vec` because the core is `no_std` and has no thread
-    /// locals. The reconciler calls this once per tick and consumes the
-    /// result immediately, so the cost is one allocation per tick, not one
-    /// per service.
-    pub fn states(&self) -> Vec<State> {
-        self.services.iter().map(|s| s.state).collect()
-    }
-
     /// A single state, by index. The common case in the reconciler's inner
     /// loop, and allocation-free.
     #[inline]
@@ -242,27 +212,6 @@ impl Runtime {
     /// Convenience: set the desired state of a service.
     pub fn set_desired(&mut self, idx: Idx, desired: Desired) {
         self.services[idx].desired = desired;
-    }
-
-    /// Convenience: the names, for status output. Allocates; not a hot path.
-    pub fn describe(&self, plan: &Plan, now_ms: u64) -> Vec<crate::action::StatusLine> {
-        plan.services
-            .iter()
-            .enumerate()
-            .map(|(idx, sp)| {
-                let s = &self.services[idx];
-                crate::action::StatusLine {
-                    idx,
-                    name: String::from(&sp.name),
-                    state: s.state,
-                    desired: s.desired,
-                    pid: s.pid,
-                    restarts_used: s.restarts,
-                    restarts_available: s.bucket.tokens(),
-                    uptime_ms: s.uptime_ms(now_ms).unwrap_or(0),
-                }
-            })
-            .collect()
     }
 
     /// Check every service's internal invariants. Returns the offenders.
@@ -299,12 +248,6 @@ impl Runtime {
             ));
         }
         out
-    }
-
-    /// Whether the restart policy and budget for `idx` currently permit a spawn.
-    pub fn restart_permitted(&mut self, idx: Idx, plan: &Plan, now_ms: u64) -> bool {
-        let budget: Budget = plan.services[idx].restart_budget;
-        self.services[idx].bucket.allows(&budget, now_ms)
     }
 }
 
@@ -372,24 +315,6 @@ mod tests {
         assert_eq!(rt.len(), 5);
         assert_eq!(rt.count_running(), 0);
         assert!(rt.check_invariants(&p).is_empty());
-    }
-
-    #[test]
-    fn add_service_respects_the_cap() {
-        let mut rt = Runtime::new();
-        for _ in 0..MAX_SERVICES {
-            assert!(rt.add_service().is_ok());
-        }
-        assert!(rt.add_service().is_err(), "the cap must be enforced");
-    }
-
-    #[test]
-    fn states_reflects_mutation() {
-        let p = plan_of(3);
-        let mut rt = Runtime::from_plan(&p);
-        rt.get_mut(1).state = State::Running;
-        let st = rt.states();
-        assert_eq!(st, &[State::Stopped, State::Running, State::Stopped]);
     }
 
     #[test]

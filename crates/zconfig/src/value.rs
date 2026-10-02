@@ -29,13 +29,9 @@
 //! ## Shape of the public API
 //!
 //! Four value types, each a validated struct with a `parse` that takes `&str`
-//! and returns `Result<Self, XxxError<'_>>`, an `into_*` that produces the
-//! `zcore` type the runtime wants, and a `Display` that prints the canonical
-//! spelling back — so a description can go in, be checked, and come out in a
-//! form `zctl show` can print and `zcheck` would accept again.
-//!
-//! [`Duration`] is the exception: it *is* its own `u64` milliseconds, so it has
-//! no `into_*`, only [`Duration::as_millis`].
+//! and returns `Result<Self, XxxError<'_>>` and an `into_*` that produces the
+//! `zcore` type the runtime wants. A duration is the exception: it is just
+//! milliseconds, so [`parse_duration`] goes straight to a `u64`.
 //!
 //! The defaults an absent directive falls back to are the constants at the top
 //! of this file, assembled by [`default_budget`]. Nothing else in the crate is
@@ -44,12 +40,11 @@
 //! ## Error shape
 //!
 //! Every error carries the offending text, so the message can quote it, and
-//! every error converts to a [`Diagnostic`] with `.to_diagnostic(span)` at a
-//! position the caller already has — on the specific error type and on the
-//! [`ValueError`] umbrella alike. Errors are *always* errors: nothing in this
-//! module emits a warning, because a value that did not parse cannot be
-//! guessed at. The one judgement call — `0 restarts per 1s` — is documented on
-//! [`RestartError::ZeroCapacity`].
+//! every error converts to a [`Diagnostic`] with
+//! [`ValueError::to_diagnostic`] at a position the caller already has. Errors
+//! are *always* errors: nothing in this module emits a warning, because a value
+//! that did not parse cannot be guessed at. The one judgement call —
+//! `0 restarts per 1s` — is documented on [`RestartError::ZeroCapacity`].
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -119,29 +114,12 @@ pub const NEVER_BUDGET: Budget = Budget::never();
 ///
 /// Effectively "the budget stops being the thing that stops the loop": four
 /// billion restarts a minute. The operator named a policy in full and did not
-/// name a budget, so imposing one would be inventing a requirement. It is
-/// also the marker [`RestartSpec::describe`] uses to tell "this came from
-/// `restart = always`" apart from "this came from `5 restarts per 60s`",
-/// which is why the two must stay equal: if a bare policy ever got a finite
-/// capacity, a re-printed description would claim a limit the file never
-/// mentioned.
+/// name a budget, so imposing one would be inventing a requirement.
 pub const UNLIMITED_CAPACITY: u32 = u32::MAX;
 
-/// A number of milliseconds.
-///
-/// Milliseconds everywhere, because that is the resolution `zcore`'s budget
-/// arithmetic uses and the only one that survives a clock that is not
-/// perfectly stable. Conversion happens exactly once, here, at the edge.
-///
-/// The unit constants live here rather than in the parser so that
-/// [`fmt::Display`] and [`Duration::parse`] cannot disagree about how long a
-/// minute is. There is exactly one definition of each, and both directions go
-/// through it.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Hash)]
-pub struct Duration {
-    /// Milliseconds. The only representation that exists.
-    pub ms: u64,
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// Duration
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Milliseconds in one second.
 const MS_PER_SECOND: u64 = 1_000;
@@ -152,180 +130,92 @@ const MS_PER_HOUR: u64 = 60 * MS_PER_MINUTE;
 /// Milliseconds in one day.
 const MS_PER_DAY: u64 = 24 * MS_PER_HOUR;
 
-impl Duration {
-    /// Build from milliseconds. Never fails; overflow is the caller's problem
-    /// and this is not a place to hide it.
-    pub const fn from_millis(ms: u64) -> Duration {
-        Duration { ms }
+/// Parse a duration into milliseconds.
+///
+/// Milliseconds everywhere, because that is the resolution `zcore`'s budget
+/// arithmetic uses and the only one that survives a clock that is not perfectly
+/// stable.
+///
+/// # Accepted
+///
+/// | input     | value      |
+/// |-----------|------------|
+/// | `10s`     | 10 000 ms  |
+/// | `500ms`   | 500 ms     |
+/// | `2m`      | 120 000 ms |
+/// | `1h`      | 3 600 000 ms |
+/// | `1d`      | 86 400 000 ms |
+/// | `250`     | **250 000 ms** |
+///
+/// **A number with no unit is SECONDS, not milliseconds.** This is the one
+/// place in the whole format where a bare number means something, and it is
+/// the classic trap: `stop-timeout = 10` is ten seconds, not ten
+/// milliseconds, because a number in a config file is written the way a human
+/// says it out loud. `250` is 250 *seconds* — four minutes — not 250 ms. The
+/// `help` text of [`DurationError::UnknownUnit`] repeats the rule back,
+/// precisely so the mistake is caught the first time it is made.
+///
+/// # Rejected
+///
+/// The empty string; `0x10`; `1.5s`; `+10`; `-5`; `10s5`; `10m30s`; `10 s`
+/// (the space is a syntax error, not a unit separator); `10sec`; `10S`
+/// (units are lowercase, exactly as `zcore` spells them); anything that
+/// overflows `u64`; and any non-ASCII digit, because the file is bytes and the
+/// operator's editor wrote ASCII.
+///
+/// Whitespace is *not* trimmed and the value is *not* case-folded: the
+/// directive's own lexing has already removed the space around `=`, and a
+/// value with spaces in it is a mistake worth reporting, not a value worth
+/// salvaging.
+pub fn parse_duration(input: &str) -> Result<u64, DurationError<'_>> {
+    if input.is_empty() {
+        return Err(DurationError::Empty);
+    }
+    // The leading run of ASCII digits; `str::parse` would take a sign, a
+    // decimal point or a radix prefix, none of which are a duration.
+    let digits = input
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(input.len());
+    if digits == 0 {
+        // `-5`, `+10`, `1.5s`, `abc`: nothing here starts a number. A
+        // leading sign must never be mistaken for a unit separator.
+        return Err(DurationError::InvalidNumber { value: input });
+    }
+    let (number, rest) = input.split_at(digits);
+    let value = parse_u64(number)?;
+
+    if rest.is_empty() {
+        // Bare number: SECONDS. `stop-timeout = 10` is ten seconds, not
+        // ten milliseconds. Saturating, because a bare `18446744073709551615`
+        // is a number the operator wrote, not a reason to abort the checker.
+        return Ok(value.saturating_mul(MS_PER_SECOND));
     }
 
-    /// Build from seconds. Saturates rather than panicking: a config file
-    /// should not be able to abort the parser.
-    pub fn from_secs(secs: u64) -> Duration {
-        Duration {
-            ms: secs.saturating_mul(MS_PER_SECOND),
-        }
-    }
+    let Some(scale) = unit_scale(rest) else {
+        // A tail that still contains digits, a decimal point or a sign was
+        // never a unit: the operator wrote one malformed number, and saying
+        // "unknown unit `x10`" for `0x10` would send them looking for a list
+        // of units instead of at their own typo.
+        let malformed_number = rest
+            .as_bytes()
+            .iter()
+            .any(|b| b.is_ascii_digit() || matches!(b, b'.' | b'+' | b'-'));
+        return Err(if malformed_number {
+            DurationError::InvalidNumber { value: input }
+        } else {
+            DurationError::UnknownUnit {
+                value: input,
+                unit: rest,
+            }
+        });
+    };
 
-    /// The value in milliseconds.
-    ///
-    /// Named `as_millis` rather than `as_ms` to match `core::time::Duration`,
-    /// which every Rust programmer already has the reflex for, and because the
-    /// unit is the whole content of the value — getting it wrong here is a
-    /// thousand-fold error, not a cosmetic one.
-    pub const fn as_millis(self) -> u64 {
-        self.ms
-    }
-
-    /// The value in whole seconds, **rounding down**.
-    ///
-    /// Only for reporting (`"took ~3s"`). Anything that gates behaviour wants
-    /// [`Duration::as_millis`]: 1500 ms is 1 s here, and a stop timeout that
-    /// silently lost half its length would be a very hard bug to find.
-    pub const fn as_secs(self) -> u64 {
-        self.ms / MS_PER_SECOND
-    }
-
-    /// True for a zero duration, which is legal but usually a mistake.
-    pub const fn is_zero(self) -> bool {
-        self.ms == 0
-    }
-
-    /// Parse a duration.
-    ///
-    /// # Accepted
-    ///
-    /// | input     | value      |
-    /// |-----------|------------|
-    /// | `10s`     | 10 000 ms  |
-    /// | `500ms`   | 500 ms     |
-    /// | `2m`      | 120 000 ms |
-    /// | `1h`      | 3 600 000 ms |
-    /// | `1d`      | 86 400 000 ms |
-    /// | `250`     | **250 000 ms** |
-    ///
-    /// **A number with no unit is SECONDS, not milliseconds.** This is the one
-    /// place in the whole format where a bare number means something, and it is
-    /// the classic trap: `stop-timeout = 10` is ten seconds, not ten
-    /// milliseconds, because a number in a config file is written the way a
-    /// human says it out loud. `250` is 250 *seconds* — four minutes — not
-    /// 250 ms. The `help` text of [`DurationError::UnknownUnit`] repeats the
-    /// rule back, precisely so the mistake is caught the first time it is made.
-    ///
-    /// # Rejected
-    ///
-    /// The empty string; `0x10`; `1.5s`; `+10`; `-5`; `10s5`; `10m30s`; `10 s`
-    /// (the space is a syntax error, not a unit separator); `10sec`; `10S`
-    /// (units are lowercase, exactly as `zcore` spells them); anything that
-    /// overflows `u64`; and any non-ASCII digit, because the file is bytes and
-    /// the operator's editor wrote ASCII.
-    ///
-    /// Whitespace is *not* trimmed and the value is *not* case-folded: the
-    /// directive's own lexing has already removed the space around `=`, and a
-    /// value with spaces in it is a mistake worth reporting, not a value worth
-    /// salvaging.
-    pub fn parse(input: &str) -> Result<Duration, DurationError<'_>> {
-        let bytes = input.as_bytes();
-        if bytes.is_empty() {
-            return Err(DurationError::Empty);
-        }
-
-        let digits = leading_digits(bytes);
-        if digits == 0 {
-            // `-5`, `+10`, `1.5s`, `abc`: nothing here starts a number. A
-            // leading sign must never be mistaken for a unit separator.
-            return Err(DurationError::InvalidNumber { value: input });
-        }
-        let (number, rest) = input.split_at(digits);
-        let value = parse_u64(number)?;
-
-        if rest.is_empty() {
-            // Bare number: SECONDS. `stop-timeout = 10` is ten seconds, not
-            // ten milliseconds. Saturating, because a bare `18446744073709551615`
-            // is a number the operator wrote, not a reason to abort the checker.
-            return Ok(Duration {
-                ms: value.saturating_mul(MS_PER_SECOND),
-            });
-        }
-
-        let Some(scale) = unit_scale(rest) else {
-            // A tail that still contains digits, a decimal point or a sign was
-            // never a unit: the operator wrote one malformed number, and saying
-            // "unknown unit `x10`" for `0x10` would send them looking for a list
-            // of units instead of at their own typo.
-            let malformed_number = rest
-                .as_bytes()
-                .iter()
-                .any(|b| b.is_ascii_digit() || matches!(b, b'.' | b'+' | b'-'));
-            return Err(if malformed_number {
-                DurationError::InvalidNumber { value: input }
-            } else {
-                DurationError::UnknownUnit {
-                    value: input,
-                    unit: rest,
-                }
-            });
-        };
-
-        let ms = value.checked_mul(scale).ok_or(DurationError::Overflow {
+    value
+        .checked_mul(scale)
+        .ok_or(DurationError::Overflow {
             value: input,
             unit: rest,
-        })?;
-        Ok(Duration { ms })
-    }
-}
-
-impl From<Duration> for u64 {
-    /// Milliseconds, the one representation `Duration` holds.
-    fn from(d: Duration) -> u64 {
-        d.ms
-    }
-}
-
-impl fmt::Display for Duration {
-    /// Renders the **canonical** spelling: the coarsest unit that divides the
-    /// value exactly, so `86_400_000` prints as `1d` and not `24h`, and
-    /// anything no coarser unit divides exactly prints in milliseconds.
-    ///
-    /// Canonical is the whole point. `zctl status` re-prints effective
-    /// configuration, and a stable rendering is what lets a human diff two
-    /// runs, a test snapshot a plan, and a bug report quote a value that means
-    /// the same thing on every machine. A rendering that picked a unit by
-    /// magnitude (`1500` → `2s`, silently losing the fraction) would satisfy
-    /// none of those.
-    ///
-    /// **The output always re-parses to the same value** —
-    /// `Duration::parse(&d.to_string()) == Ok(d)` for every `d`, which
-    /// `duration_display_round_trips` pins over a table. Note the one
-    /// asymmetry that survives it: `0` prints as `0`, and a bare `0` is read
-    /// as *zero seconds*, so the round trip holds by landing on the same
-    /// number rather than by preserving the spelling.
-    //
-    // `is_multiple_of` is the lint-preferred spelling but landed in 1.87, and
-    // this workspace promises 1.85. The remainder is the same arithmetic.
-    #[allow(clippy::manual_is_multiple_of)]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let ms = self.ms;
-        if ms == 0 {
-            return f.write_str("0");
-        }
-        // Coarsest unit first. Each test is exact by construction - the modulo
-        // is the check - so a value that is not a whole number of days falls
-        // through to the next unit instead of being truncated into one.
-        if ms % MS_PER_DAY == 0 {
-            return write!(f, "{}d", ms / MS_PER_DAY);
-        }
-        if ms % MS_PER_HOUR == 0 {
-            return write!(f, "{}h", ms / MS_PER_HOUR);
-        }
-        if ms % MS_PER_MINUTE == 0 {
-            return write!(f, "{}m", ms / MS_PER_MINUTE);
-        }
-        if ms % 1_000 == 0 {
-            return write!(f, "{}s", ms / 1_000);
-        }
-        write!(f, "{ms}ms")
-    }
+        })
 }
 
 /// Why a duration failed to parse.
@@ -389,18 +279,6 @@ impl fmt::Display for DurationError<'_> {
                  overflows milliseconds"
             ),
         }
-    }
-}
-
-impl DurationError<'_> {
-    /// The same failure as a positioned [`Diagnostic`].
-    ///
-    /// Exactly `ValueError::from(self).to_diagnostic(span)`, spelled as its own
-    /// method so a caller that only ever parses durations never has to name
-    /// the umbrella enum. Same code, same message, same severity — there is
-    /// one implementation, reached two ways.
-    pub fn to_diagnostic(self, span: Span) -> Diagnostic {
-        ValueError::from(self).to_diagnostic(span)
     }
 }
 
@@ -697,16 +575,6 @@ impl fmt::Display for ReadyError<'_> {
     }
 }
 
-impl ReadyError<'_> {
-    /// The same failure as a positioned [`Diagnostic`].
-    ///
-    /// Exactly `ValueError::from(self).to_diagnostic(span)`. See
-    /// [`DurationError::to_diagnostic`].
-    pub fn to_diagnostic(self, span: Span) -> Diagnostic {
-        ValueError::from(self).to_diagnostic(span)
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Restart
 // ─────────────────────────────────────────────────────────────────────────────
@@ -716,27 +584,22 @@ impl ReadyError<'_> {
 /// dinit splits this across `restart-delay` and "3 restarts in 10s"; DESIGN.md
 /// §4.3 keeps them as one number pair plus a separate delay, because a token
 /// bucket with its two constants written in two different directives is a
-/// bucket nobody can reason about. `delay_ms` here mirrors `budget.delay_ms`:
-/// two fields for one number is not elegant, but every caller wants the number
-/// directly, and the mirror is kept in step by `parse` and `with_delay` rather
-/// than by twenty call sites.
+/// bucket nobody can reason about.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RestartSpec {
     /// `never`, `on-failure` or `always`.
     pub policy: Restart,
     /// Token bucket the policy spends from.
     pub budget: Budget,
-    /// Mirror of `budget.delay_ms`, exposed because every caller wants it and
-    /// duplicating an expression at twenty call sites is worse.
-    pub delay_ms: u64,
 }
 
 impl Default for RestartSpec {
     /// **`on-failure` spending [`default_budget`].** Byte for byte what
-    /// `RestartSpec::parse("on-failure").unwrap()` produces, which is the point:
-    /// an absent `restart` line and an explicit `restart = on-failure` must not
-    /// be distinguishable to anything downstream, or `zctl show` would print
-    /// two different things for a service nobody changed.
+    /// `RestartSpec::parse("on-failure")` would produce if the bare policies
+    /// shared the default budget, and the point is that an absent `restart`
+    /// line and an explicit `restart = on-failure` must not be distinguishable
+    /// in the two numbers the runtime reads, or `zctl show` would print two
+    /// different things for a service nobody changed.
     ///
     /// Note that this is *not* what `RestartSpec::parse("on-failure")` returns:
     /// the parser gives a bare policy a capacity of `u32::MAX`, on the theory
@@ -749,7 +612,6 @@ impl Default for RestartSpec {
         RestartSpec {
             policy: Restart::OnFailure,
             budget: default_budget(),
-            delay_ms: DEFAULT_RESTART_DELAY_MS,
         }
     }
 }
@@ -793,7 +655,6 @@ impl RestartSpec {
                         window_ms: window,
                         delay_ms: DEFAULT_RESTART_DELAY_MS,
                     },
-                    delay_ms: DEFAULT_RESTART_DELAY_MS,
                 });
             }
         };
@@ -810,18 +671,7 @@ impl RestartSpec {
                 delay_ms: DEFAULT_RESTART_DELAY_MS,
             },
         };
-        Ok(RestartSpec {
-            policy,
-            delay_ms: budget.delay_ms,
-            budget,
-        })
-    }
-
-    /// Apply the `restart-delay` directive, keeping both mirrors in sync.
-    pub fn with_delay(mut self, delay: Duration) -> RestartSpec {
-        self.budget.delay_ms = delay.ms;
-        self.delay_ms = delay.ms;
-        self
+        Ok(RestartSpec { policy, budget })
     }
 
     /// The token bucket this spec spends from.
@@ -838,55 +688,6 @@ impl RestartSpec {
     /// The policy, without unpacking the budget.
     pub const fn policy(self) -> Restart {
         self.policy
-    }
-
-    /// Canonical spelling, for round-tripping a description back to text.
-    ///
-    /// A bare policy prints as itself (`never`, `on-failure`, `always`); a
-    /// budget prints as `<n> restarts per <duration>` with the window in
-    /// [`Duration`]'s canonical form.
-    ///
-    /// **One documented normalisation.** The bare-policy marker is the *whole
-    /// default budget* — capacity [`UNLIMITED_CAPACITY`] over
-    /// [`DEFAULT_RESTART_WINDOW_MS`] — because a capacity alone cannot carry
-    /// it: `4294967295 restarts per 60s` is a real, parseable line that asks
-    /// for four billion restarts a minute, and it is byte-identical to what
-    /// `restart = on-failure` produces. Re-printing it as `on-failure` is
-    /// truthful, not lossy: both mean "the budget does not stop you", and
-    /// `restart_describe_normalises_an_unwritable_budget` pins the behaviour so
-    /// nobody has to rediscover it.
-    ///
-    /// The `restart-delay` mirror is also not part of the spelling, because it
-    /// lives in its own directive.
-    pub fn describe(&self) -> String {
-        // Two markers have to be checked, not one. `never` leaves a capacity of
-        // 0, and printing *that* as a budget would emit `0 restarts per 0`,
-        // which `parse` rejects on purpose — so the spelling would not
-        // round-trip and `zctl show` would print a line `zcheck` refuses.
-        if self.budget.capacity == 0
-            || (self.budget.capacity == UNLIMITED_CAPACITY
-                && self.budget.window_ms == DEFAULT_RESTART_WINDOW_MS)
-        {
-            return match self.policy {
-                Restart::Never => "never".to_string(),
-                Restart::OnFailure => "on-failure".to_string(),
-                Restart::Always => "always".to_string(),
-            };
-        }
-        format!(
-            "{} restarts per {}",
-            self.budget.capacity,
-            Duration::from_millis(self.budget.window_ms)
-        )
-    }
-}
-
-impl fmt::Display for RestartSpec {
-    /// Writes [`RestartSpec::describe`], the same canonical spelling
-    /// [`ReadySpec`] and [`Duration`] use, so a re-printed description is
-    /// diffable line by line.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.describe())
     }
 }
 
@@ -969,16 +770,6 @@ impl fmt::Display for RestartError<'_> {
     }
 }
 
-impl RestartError<'_> {
-    /// The same failure as a positioned [`Diagnostic`].
-    ///
-    /// Exactly `ValueError::from(self).to_diagnostic(span)`. See
-    /// [`DurationError::to_diagnostic`].
-    pub fn to_diagnostic(self, span: Span) -> Diagnostic {
-        ValueError::from(self).to_diagnostic(span)
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // user
 // ─────────────────────────────────────────────────────────────────────────────
@@ -993,7 +784,7 @@ impl RestartError<'_> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RunAs {
     /// Numeric user id. `zconfig` never resolves a *name* to one — see
-    /// [`RunAs::parse`].
+    /// [`RunAs::try_parse`].
     pub uid: u32,
     /// Numeric group id. DESIGN.md §5 allows `uid:gid` with either side
     /// symbolic; zconfig takes the numeric sides and leaves the rest to zrt.
@@ -1001,23 +792,14 @@ pub struct RunAs {
 }
 
 impl RunAs {
-    /// Parse `uid`, `uid:gid`, `name` or `name:group`.
+    /// Parse `uid`, `uid:gid`, `name` or `name:group`, deferring names.
     ///
-    /// `name` and `name:group` are *well-formed but unresolvable here*, and
-    /// they fail with [`RunAsError::NameResolutionUnavailable`] rather than a
-    /// syntax error. That distinction matters: `user = www-data` is a perfectly
-    /// good description that a machine without the `www-data` account should
-    /// reject with "no such user", while `user = 1000 www-data` is a genuine
-    /// mistake. zconfig has no libc and must not grow one to tell them apart.
-    pub fn parse(input: &str) -> Result<RunAs, RunAsError<'_>> {
-        match RunAs::try_parse(input)? {
-            Some(run_as) => Ok(run_as),
-            None => Err(RunAsError::NameResolutionUnavailable { name: input }),
-        }
-    }
-
-    /// Like [`RunAs::parse`], but `Ok(None)` instead of an error when a name
-    /// needs resolving.
+    /// `name` and `name:group` are *well-formed but unresolvable here*, so they
+    /// come back as `Ok(None)` rather than as an error. That distinction
+    /// matters: `user = www-data` is a perfectly good description that `zrt`
+    /// resolves against `/etc/passwd`, while `user = 1000 www-data` is a
+    /// genuine mistake. zconfig has no libc and must not grow one to tell them
+    /// apart.
     ///
     /// This is the entry point `zrt` uses: it takes the spec, resolves the
     /// names against `/etc/passwd`, and turns a `None` into a real uid. Keeping
@@ -1096,11 +878,6 @@ pub enum RunAsError<'a> {
         /// The offending token.
         value: &'a str,
     },
-    /// The value is valid; this crate just cannot resolve names.
-    NameResolutionUnavailable {
-        /// The offending value.
-        name: &'a str,
-    },
 }
 
 impl fmt::Display for RunAsError<'_> {
@@ -1128,22 +905,7 @@ impl fmt::Display for RunAsError<'_> {
             RunAsError::GidTooLarge { value } => {
                 write!(f, "gid `{value}` does not fit in a u32")
             }
-            RunAsError::NameResolutionUnavailable { name } => write!(
-                f,
-                "cannot resolve `{name}` to a numeric id: user and group names \
-                 are resolved by the runtime, not by the parser"
-            ),
         }
-    }
-}
-
-impl RunAsError<'_> {
-    /// The same failure as a positioned [`Diagnostic`].
-    ///
-    /// Exactly `ValueError::from(self).to_diagnostic(span)`. See
-    /// [`DurationError::to_diagnostic`].
-    pub fn to_diagnostic(self, span: Span) -> Diagnostic {
-        ValueError::from(self).to_diagnostic(span)
     }
 }
 
@@ -1299,36 +1061,6 @@ impl LogSpec {
     pub const fn sink(&self) -> &LogSink {
         &self.sink
     }
-
-    /// Canonical spelling, for round-tripping a description back to text.
-    ///
-    /// `file` with an empty path prints as the bare word `file`, and a file
-    /// sink whose size and backups are both the documented defaults prints
-    /// without them, so a re-printed description is the one the operator would
-    /// have written rather than a fully-expanded one. Everything else is
-    /// printed in full.
-    pub fn describe(&self) -> String {
-        match &self.sink {
-            LogSink::None => "none".to_string(),
-            LogSink::Syslog => "syslog".to_string(),
-            LogSink::File {
-                path,
-                max_bytes,
-                backups,
-            } => {
-                if path.is_empty() {
-                    return "file".to_string();
-                }
-                if *max_bytes == DEFAULT_LOG_MAX_BYTES && *backups == DEFAULT_LOG_BACKUPS {
-                    return format!("file:{path}");
-                }
-                if *backups == DEFAULT_LOG_BACKUPS {
-                    return format!("file:{path}:{max_bytes}");
-                }
-                format!("file:{path}:{max_bytes}/{backups}")
-            }
-        }
-    }
 }
 
 impl Default for LogSpec {
@@ -1344,14 +1076,6 @@ impl Default for LogSpec {
                 backups: DEFAULT_LOG_BACKUPS,
             },
         }
-    }
-}
-
-impl fmt::Display for LogSpec {
-    /// Writes [`LogSpec::describe`], the same canonical spelling the other
-    /// three value types use.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.describe())
     }
 }
 
@@ -1435,16 +1159,6 @@ impl fmt::Display for LogError<'_> {
     }
 }
 
-impl LogError<'_> {
-    /// The same failure as a positioned [`Diagnostic`].
-    ///
-    /// Exactly `ValueError::from(self).to_diagnostic(span)`. See
-    /// [`DurationError::to_diagnostic`].
-    pub fn to_diagnostic(self, span: Span) -> Diagnostic {
-        ValueError::from(self).to_diagnostic(span)
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // ValueError
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1495,7 +1209,7 @@ impl<'a> ValueError<'a> {
     /// | `E300`-`E304` | a duration (`stop-timeout`, `start-timeout`, `ready-timeout`, `restart-delay`, a budget window) |
     /// | `E310`-`E316` | `ready`                            |
     /// | `E320`-`E323` | `restart` / `restart-budget`       |
-    /// | `E330`-`E335` | `user`                            |
+    /// | `E330`-`E334` | `user`                            |
     /// | `E340`-`E344` | `log`                              |
     ///
     /// `parser.rs` owns `E0xx` and `desc.rs` owns the `W0xx` warnings.
@@ -1531,7 +1245,6 @@ impl<'a> ValueError<'a> {
             ValueError::RunAs(RunAsError::GroupNotANumber { .. }) => "E332",
             ValueError::RunAs(RunAsError::UidTooLarge { .. }) => "E333",
             ValueError::RunAs(RunAsError::GidTooLarge { .. }) => "E334",
-            ValueError::RunAs(RunAsError::NameResolutionUnavailable { .. }) => "E335",
             ValueError::Log(LogError::UnknownSink { .. }) => "E340",
             ValueError::Log(LogError::UnexpectedArgument { .. }) => "E341",
             ValueError::Log(LogError::EmptyPath { .. }) => "E342",
@@ -1561,9 +1274,6 @@ impl<'a> ValueError<'a> {
             ValueError::Ready(ReadyError::PortTooLarge { .. }) => {
                 Some(String::from("a TCP port is 1-65535"))
             }
-            ValueError::RunAs(RunAsError::NameResolutionUnavailable { .. }) => Some(String::from(
-                "write the numeric ids if you want the config checked here; names are looked up in `/etc/passwd` at spawn time",
-            )),
             ValueError::Restart(RestartError::ZeroCapacity { .. }) => Some(String::from(
                 "if you meant `never`, use the `restart` directive: `restart = never`",
             )),
@@ -1615,59 +1325,37 @@ lift_into_value_error!(LogError => Log);
 // never be one of the separators we look for.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Index of the first byte that is not an ASCII digit.
-fn leading_digits(b: &[u8]) -> usize {
-    let mut i = 0;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    i
-}
-
 /// True when `s` is non-empty and every byte is an ASCII digit.
 ///
-/// This is the check that keeps a `str` hand-rolled parser honest: a Unicode
-/// digit such as `١٢` is *not* accepted, where `char::to_digit` would have
-/// quietly accepted it and `u64::from_str` would have refused it. Refusing is
-/// right, because the file is bytes and the operator's editor wrote ASCII.
+/// This is the check that keeps a `str` parser honest: a Unicode digit such as
+/// `١٢` is *not* accepted, where `char::to_digit` would have quietly accepted
+/// it and `str::parse` would have accepted `"+10"`. Refusing is right, because
+/// the file is bytes and the operator's editor wrote ASCII.
 fn all_digits(s: &str) -> bool {
     !s.is_empty() && s.as_bytes().iter().all(u8::is_ascii_digit)
 }
 
-/// Parse a run of ASCII digits. The caller has already checked [`all_digits`].
-fn parse_u64(s: &str) -> Result<u64, DurationError<'_>> {
+/// Parse a run of ASCII digits, reporting which of the two ways it failed.
+///
+/// The gate is [`all_digits`] and not `str::parse`'s own idea of a number, so
+/// the two callers that fold the answer into a narrower type reject exactly
+/// what they rejected before.
+pub(crate) fn parse_u64(s: &str) -> Result<u64, DurationError<'_>> {
     if !all_digits(s) {
         return Err(DurationError::InvalidNumber { value: s });
     }
-    let mut acc: u64 = 0;
-    for &b in s.as_bytes() {
-        acc = match acc
-            .checked_mul(10)
-            .and_then(|a| a.checked_add(u64::from(b - b'0')))
-        {
-            Some(v) => v,
-            None => return Err(DurationError::NumberTooLarge { value: s }),
-        };
-    }
-    Ok(acc)
+    s.parse::<u64>()
+        .map_err(|_| DurationError::NumberTooLarge { value: s })
 }
 
 /// Parse a run of ASCII digits that must fit in a `u32`.
 fn narrow_u32(s: &str) -> Option<u32> {
-    let n = parse_u64(s).ok()?;
-    if n > u64::from(u32::MAX) {
-        return None;
-    }
-    Some(n as u32)
+    u32::try_from(parse_u64(s).ok()?).ok()
 }
 
 /// Parse a run of ASCII digits that must fit in a `u8`.
 fn narrow_u8(s: &str) -> Option<u8> {
-    let n = parse_u64(s).ok()?;
-    if n > u64::from(u8::MAX) {
-        return None;
-    }
-    Some(n as u8)
+    u8::try_from(parse_u64(s).ok()?).ok()
 }
 
 /// One side of a `user` value, as far as this crate can tell.
@@ -1706,10 +1394,8 @@ fn classify(s: &str) -> Option<Token> {
 
 /// Milliseconds in one of the five units. `None` for anything else.
 ///
-/// Exactly the five units [`fmt::Display`] can produce, spelled from the same
-/// constants, so every value this returns is one `Display` can print back and
-/// vice versa. Adding a sixth unit here without a `Display` arm would break
-/// `duration_display_round_trips`, which is the point of sharing the numbers.
+/// The units, lowercase and closed, are the same five DESIGN.md §5 documents;
+/// adding a sixth here is a change to the format, not to this function.
 fn unit_scale(unit: &str) -> Option<u64> {
     Some(match unit.as_bytes() {
         b"ms" => 1,
@@ -1750,11 +1436,11 @@ fn parse_budget(input: &str) -> Result<(u32, u64), RestartError<'_>> {
         return Err(RestartError::ZeroCapacity { value: input });
     }
     let window =
-        Duration::parse(words[3]).map_err(|_| RestartError::BudgetFormat { value: input })?;
-    if window.ms == 0 {
+        parse_duration(words[3]).map_err(|_| RestartError::BudgetFormat { value: input })?;
+    if window == 0 {
         return Err(RestartError::ZeroWindow { value: input });
     }
-    Ok((capacity, window.ms))
+    Ok((capacity, window))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1764,7 +1450,6 @@ fn parse_budget(input: &str) -> Result<(u32, u64), RestartError<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diagnostic::Severity;
 
     /// One row of a rejection table: the input, and a predicate that says which
     /// *category* of failure it must produce. Asserting on the category and not
@@ -1772,7 +1457,7 @@ mod tests {
     /// problem sends the operator to fix the wrong thing.
     type Case<'a> = (&'a str, fn(&ValueError<'a>) -> bool);
 
-    /// Every spelling `Duration::parse` promises to accept, with its value.
+    /// Every spelling `parse_duration` promises to accept, with its value.
     const VALID_DURATIONS: &[(&str, u64)] = &[
         ("10s", 10_000),
         ("500ms", 500),
@@ -1789,19 +1474,18 @@ mod tests {
     #[test]
     fn duration_accepts_every_documented_spelling() {
         for &(text, ms) in VALID_DURATIONS {
-            let d = match Duration::parse(text) {
-                Ok(d) => d,
+            match parse_duration(text) {
+                Ok(got) => assert_eq!(got, ms, "{text:?}"),
                 Err(e) => panic!("{text:?} should parse, got: {e}"),
-            };
-            assert_eq!(d.ms, ms, "{text:?}");
+            }
         }
     }
 
     #[test]
     fn duration_bare_number_is_seconds() {
         // The classic trap: `250` is 250 *seconds*, not 250ms.
-        assert_eq!(Duration::parse("250").unwrap().ms, 250_000);
-        assert_ne!(Duration::parse("250").unwrap().ms, 250);
+        assert_eq!(parse_duration("250").unwrap(), 250_000);
+        assert_ne!(parse_duration("250").unwrap(), 250);
     }
 
     #[test]
@@ -1860,7 +1544,7 @@ mod tests {
             }),
         ];
         for &(text, matches) in cases {
-            let err = match Duration::parse(text) {
+            let err = match parse_duration(text) {
                 Ok(_) => panic!("{text:?} must be rejected"),
                 Err(e) => ValueError::from(e),
             };
@@ -1873,8 +1557,8 @@ mod tests {
     fn duration_never_trips_over_a_compound_spelling() {
         // `10m30s` must not silently parse as `10m`; the whole tail is the
         // unit, and it is not one.
-        assert!(Duration::parse("10m30s").is_err());
-        assert!(Duration::parse("1h30m").is_err());
+        assert!(parse_duration("10m30s").is_err());
+        assert!(parse_duration("1h30m").is_err());
     }
 
     #[test]
@@ -1882,21 +1566,20 @@ mod tests {
         // `18446744073709551615` as bare seconds cannot fit in ms. It must not
         // abort the parser: a config file must never be able to panic the
         // checker.
-        let d = Duration::parse("18446744073709551615").unwrap();
-        assert_eq!(d.ms, u64::MAX);
+        let d = parse_duration("18446744073709551615").unwrap();
+        assert_eq!(d, u64::MAX);
     }
 
     #[test]
-    fn duration_conversions_and_display() {
-        let d = Duration::parse("1m").unwrap();
-        assert_eq!(u64::from(d), 60_000);
-        assert_eq!(d, Duration::parse("60000ms").unwrap());
-        assert!(Duration::parse("1s").unwrap() > Duration::parse("999ms").unwrap());
-        assert!(Duration::from_secs(2) > Duration::from_secs(1));
-        assert_eq!(Duration::default().to_string(), "0");
-        assert_eq!(Duration::parse("500ms").unwrap().to_string(), "500ms");
-        assert_eq!(Duration::parse("1h").unwrap().to_string(), "1h");
-        assert!(!Duration::from_secs(u64::MAX).is_zero());
+    fn duration_is_plain_integer_milliseconds() {
+        // The representation is a `u64`, so two spellings of the same length
+        // compare as the numbers they are and nothing else.
+        assert_eq!(parse_duration("1s").unwrap() > parse_duration("999ms").unwrap());
+        assert_eq!(parse_duration("1m").unwrap(), 60_000);
+        assert_eq!(
+            parse_duration("1m").unwrap(),
+            parse_duration("60000ms").unwrap()
+        );
     }
 
     #[test]
@@ -2009,8 +1692,7 @@ mod tests {
         assert_eq!(b.policy, Restart::OnFailure);
         assert_eq!(b.budget.capacity, 5);
         assert_eq!(b.budget.window_ms, 60_000);
-        assert_eq!(b.delay_ms, DEFAULT_RESTART_DELAY_MS);
-        assert_eq!(b.budget.delay_ms, b.delay_ms);
+        assert_eq!(b.budget.delay_ms, DEFAULT_RESTART_DELAY_MS);
 
         // Flexible interior whitespace is a courtesy, not a rule. The window
         // obeys the same bare-number-means-seconds rule as every duration.
@@ -2024,15 +1706,6 @@ mod tests {
                 .window_ms,
             1_000
         );
-    }
-
-    #[test]
-    fn restart_delay_is_applied_to_both_mirrors() {
-        let s = RestartSpec::parse("always")
-            .unwrap()
-            .with_delay(Duration::parse("1s").unwrap());
-        assert_eq!(s.delay_ms, 1_000);
-        assert_eq!(s.budget.delay_ms, 1_000);
     }
 
     #[test]
@@ -2083,28 +1756,21 @@ mod tests {
 
     #[test]
     fn runas_parses_the_numeric_forms() {
-        assert_eq!(RunAs::parse("0").unwrap(), RunAs { uid: 0, gid: 0 });
         assert_eq!(
-            RunAs::parse("1000:1000").unwrap(),
-            RunAs {
+            RunAs::try_parse("0").unwrap(),
+            Some(RunAs { uid: 0, gid: 0 })
+        );
+        assert_eq!(
+            RunAs::try_parse("1000:1000").unwrap(),
+            Some(RunAs {
                 uid: 1000,
                 gid: 1000
-            }
+            })
         );
-        assert_eq!(RunAs::parse("4294967295").unwrap().uid, u32::MAX);
-    }
-
-    #[test]
-    fn runas_defers_names_to_the_runtime() {
-        for text in ["root", "www-data", "root:adm", "1000:users", "1000:wheel"] {
-            let err = RunAs::parse(text).unwrap_err();
-            assert_eq!(
-                err,
-                RunAsError::NameResolutionUnavailable { name: text },
-                "{text:?} must be deferred, not rejected on syntax"
-            );
-            assert!(matches!(RunAs::try_parse(text), Ok(None)));
-        }
+        assert_eq!(
+            RunAs::try_parse("4294967295").unwrap().map(|r| r.uid),
+            Some(u32::MAX)
+        );
     }
 
     #[test]
@@ -2139,10 +1805,9 @@ mod tests {
             }),
         ];
         for &(text, matches) in cases {
-            let err = RunAs::parse(text).map_err(ValueError::from);
-            let err = match err {
+            let err = match RunAs::try_parse(text) {
                 Ok(_) => panic!("{text:?} must be rejected"),
-                Err(e) => e,
+                Err(e) => ValueError::from(e),
             };
             assert!(matches(&err), "{text:?} produced the wrong category: {err}");
         }
@@ -2158,6 +1823,7 @@ mod tests {
             "a$b",
             "root:adm",
             "1000:users",
+            "1000:wheel",
         ] {
             assert!(matches!(RunAs::try_parse(text), Ok(None)), "{text:?}");
         }
@@ -2259,7 +1925,7 @@ mod tests {
     fn every_value_error_becomes_a_fatal_diagnostic_with_position() {
         let span = Span::range(7, 3, 8);
         let failures: Vec<ValueError<'_>> = alloc::vec![
-            Duration::parse("nope")
+            parse_duration("nope")
                 .map_err(ValueError::from)
                 .unwrap_err(),
             ReadySpec::parse("tcp:0")
@@ -2268,7 +1934,7 @@ mod tests {
             RestartSpec::parse("0 restarts per 1s")
                 .map_err(ValueError::from)
                 .unwrap_err(),
-            RunAs::parse("www-data")
+            RunAs::try_parse("1000 users")
                 .map_err(ValueError::from)
                 .unwrap_err(),
             LogSpec::parse("file:")
@@ -2292,13 +1958,13 @@ mod tests {
     #[test]
     fn value_error_codes_are_unique_per_kind() {
         let codes: Vec<&str> = alloc::vec![
-            ValueError::from(Duration::parse("").unwrap_err()).code(),
-            ValueError::from(Duration::parse("10q").unwrap_err()).code(),
-            ValueError::from(Duration::parse("1.5s").unwrap_err()).code(),
+            ValueError::from(parse_duration("").unwrap_err()).code(),
+            ValueError::from(parse_duration("10q").unwrap_err()).code(),
+            ValueError::from(parse_duration("1.5s").unwrap_err()).code(),
             ValueError::from(ReadySpec::parse("").unwrap_err()).code(),
             ValueError::from(ReadySpec::parse("nope").unwrap_err()).code(),
             ValueError::from(RestartSpec::parse("0 restarts per 1s").unwrap_err()).code(),
-            ValueError::from(RunAs::parse("root").unwrap_err()).code(),
+            ValueError::from(RunAs::try_parse("root:1000 users").unwrap_err()).code(),
             ValueError::from(LogSpec::parse("file:").unwrap_err()).code(),
         ];
         let mut sorted = codes.clone();
@@ -2330,13 +1996,13 @@ mod tests {
         // A message with no expectation in it is a message the operator cannot
         // act on; this table is the guard against that regressing.
         let messages: Vec<String> = alloc::vec![
-            Duration::parse("10w").unwrap_err().to_string(),
-            Duration::parse("0x10").unwrap_err().to_string(),
+            parse_duration("10w").unwrap_err().to_string(),
+            parse_duration("0x10").unwrap_err().to_string(),
             ReadySpec::parse("tcp:70000").unwrap_err().to_string(),
             RestartSpec::parse("5 restart per 1m")
                 .unwrap_err()
                 .to_string(),
-            RunAs::parse("1000 users").unwrap_err().to_string(),
+            RunAs::try_parse("1000 users").unwrap_err().to_string(),
             LogSpec::parse("stderr").unwrap_err().to_string(),
         ];
         for m in messages {
@@ -2344,201 +2010,47 @@ mod tests {
         }
     }
 
-    /// The promise `Duration`'s `Display` doc makes: whatever it prints parses
-    /// back to the same number. A table rather than a property test because the
-    /// interesting cases are exactly the unit boundaries and the odd
-    /// millisecond values between them.
+    /// A legal line whose budget is the one a bare `on-failure` gets: the
+    /// operator wrote a policy in full, so they did not also get a second limit
+    /// they did not ask for.
     #[test]
-    fn duration_display_round_trips() {
-        let values: Vec<u64> = alloc::vec![
-            0,
-            1,
-            2,
-            999,
-            1_000,
-            1_001,
-            1_500,
-            59_999,
-            MS_PER_SECOND,
-            MS_PER_SECOND + 1,
-            MS_PER_MINUTE,
-            MS_PER_HOUR,
-            MS_PER_DAY,
-            MS_PER_DAY - 1,
-            MS_PER_DAY + 1,
-            MS_PER_HOUR * 25,
-            3_600_000_000,
-        ];
-        for ms in values {
-            let d = Duration::from_millis(ms);
-            let printed = d.to_string();
-            let back = Duration::parse(&printed);
-            assert_eq!(
-                back.as_ref().map(|p| p.ms),
-                Ok(ms),
-                "{ms}ms printed as {printed:?} and did not come back"
-            );
-        }
-    }
-
-    /// The promise `RestartSpec::describe` makes: the spelling re-parses to the
-    /// same capacity and window. The one documented loss is the delay mirror,
-    /// which is not part of the spelling because it has its own directive.
-    #[test]
-    fn restart_describe_round_trips() {
-        for text in [
-            "never",
-            "on-failure",
-            "always",
-            "5 restarts per 60s",
-            "1 restarts per 1ms",
-            "3 restarts per 2m",
-            "10 restarts per 1h",
-            "7 restarts per 1d",
-        ] {
-            let spec = match RestartSpec::parse(text) {
-                Ok(s) => s,
-                Err(e) => panic!("{text:?} should parse: {e}"),
-            };
-            let printed = spec.describe();
-            let back = match RestartSpec::parse(&printed) {
-                Ok(s) => s,
-                Err(e) => panic!("{text:?} printed as {printed:?}, which does not parse: {e}"),
-            };
-            assert_eq!(back.policy, spec.policy, "{text:?} -> {printed:?}: policy");
-            assert_eq!(
-                (back.budget.capacity, back.budget.window_ms),
-                (spec.budget.capacity, spec.budget.window_ms),
-                "{text:?} -> {printed:?}: budget"
-            );
-        }
-    }
-
-    #[test]
-    fn restart_describe_normalises_an_unwritable_budget() {
-        // `4294967295 restarts per 60s` is a legal line and produces exactly the
-        // budget a bare `on-failure` does, so re-printing it as the policy is
-        // the only spelling that both round-trips and does not invent a limit
-        // the operator can see. The window is different, and then it is a
-        // budget again - a real one, and it prints.
+    fn an_unwritable_budget_is_the_same_budget_as_a_bare_policy() {
         let unwritable = RestartSpec::parse("4294967295 restarts per 60s").unwrap();
         assert_eq!(unwritable.budget.capacity, UNLIMITED_CAPACITY);
-        assert_eq!(unwritable.describe(), "on-failure");
-        let writable = RestartSpec::parse("4294967295 restarts per 1s").unwrap();
-        assert_eq!(writable.describe(), "4294967295 restarts per 1s");
-        // `never` must never print as a budget: `0 restarts per 0` is rejected
-        // by `parse` on purpose, so a spelling `zcheck` refuses would be a bug.
-        assert_eq!(RestartSpec::parse("never").unwrap().describe(), "never");
-    }
-
-    // ── Duration: constructors, conversions, boundaries ─────────────────────
-
-    #[test]
-    fn duration_as_millis_agrees_with_the_field_and_with_from() {
-        for ms in [0u64, 1, 999, 1_000, 60_000, 3_600_000, u64::MAX] {
-            let d = Duration::from_millis(ms);
-            assert_eq!(d.as_millis(), ms);
-            assert_eq!(d.ms, ms);
-            assert_eq!(u64::from(d), ms);
-        }
-        // `from_secs` is the one place the "bare number is seconds" rule is
-        // applied on the way *in*, so it has to agree with `parse("250")`.
-        assert_eq!(Duration::from_secs(250), Duration::parse("250").unwrap());
-        assert_eq!(Duration::from_secs(1).as_millis(), 1_000);
-    }
-
-    #[test]
-    fn duration_as_secs_rounds_down_and_never_gates_anything() {
-        // Documented as reporting-only. If a caller ever starts using it for a
-        // timeout, 1500 ms silently becoming 1 s is a very hard bug to find.
-        assert_eq!(Duration::from_millis(1_500).as_secs(), 1);
-        assert_eq!(Duration::from_millis(999).as_secs(), 0);
-        assert_eq!(Duration::from_millis(2_000).as_secs(), 2);
-        assert_eq!(Duration::from_millis(u64::MAX).as_secs(), u64::MAX / 1_000);
-    }
-
-    #[test]
-    fn duration_ordering_default_and_is_zero() {
-        assert!(Duration::default().is_zero());
-        assert_eq!(Duration::default(), Duration::from_millis(0));
-        assert!(Duration::parse("0").unwrap().is_zero());
-        assert!(Duration::parse("0ms").unwrap().is_zero());
-        assert!(Duration::parse("0s").unwrap().is_zero());
-        assert!(!Duration::parse("1ms").unwrap().is_zero());
-        // Ordering is plain integer ordering, because the representation *is*
-        // an integer in milliseconds; there is no separate comparison to drift.
-        let mut v = alloc::vec![
-            Duration::from_millis(3_600_000),
-            Duration::from_millis(1),
-            Duration::from_millis(60_000),
-        ];
-        v.sort();
         assert_eq!(
-            v,
-            alloc::vec![
-                Duration::from_millis(1),
-                Duration::from_millis(60_000),
-                Duration::from_millis(3_600_000)
-            ]
+            unwritable.budget,
+            RestartSpec::parse("on-failure").unwrap().budget
         );
-    }
-
-    #[test]
-    fn duration_display_picks_the_coarsest_exact_unit() {
-        let cases: &[(&str, u64)] = &[
-            ("0", 0),
-            ("1ms", 1),
-            ("999ms", 999),
-            ("1s", 1_000),
-            ("90s", 90_000),
-            // 1500 is NOT 2s. A magnitude-based renderer would round here.
-            ("1500ms", 1_500),
-            ("1m", 60_000),
-            ("90m", 5_400_000),
-            ("1h", 3_600_000),
-            ("25h", 90_000_000),
-            // A day is a day, not 24 hours: the unit exists, so use it.
-            ("1d", 86_400_000),
-            ("7d", 604_800_000),
-        ];
-        for &(text, ms) in cases {
-            assert_eq!(Duration::from_millis(ms).to_string(), text, "{ms}ms");
-        }
     }
 
     #[test]
     fn duration_does_not_trim_or_case_fold() {
         // A leading space is a lexer bug, not something to salvage silently.
-        assert!(Duration::parse(" 10s").is_err());
-        assert!(Duration::parse("10s ").is_err());
-        assert!(Duration::parse("10S").is_err());
-        assert!(Duration::parse("10MS").is_err());
-        assert!(Duration::parse("10D").is_err());
+        assert!(parse_duration(" 10s").is_err());
+        assert!(parse_duration("10s ").is_err());
+        assert!(parse_duration("10S").is_err());
+        assert!(parse_duration("10MS").is_err());
+        assert!(parse_duration("10D").is_err());
         // Leading zeros are fine: they are still ASCII digits, and a shell
         // substitution that produces `007` did not do anything wrong.
-        assert_eq!(Duration::parse("007s").unwrap().as_millis(), 7_000);
-        assert_eq!(Duration::parse("000").unwrap().as_millis(), 0);
+        assert_eq!(parse_duration("007s").unwrap(), 7_000);
+        assert_eq!(parse_duration("000").unwrap(), 0);
     }
 
     #[test]
     fn duration_overflow_is_caught_at_both_ends() {
         // The digits do not fit in a u64 at all.
         assert!(matches!(
-            Duration::parse("99999999999999999999999ms"),
+            parse_duration("99999999999999999999999ms"),
             Err(DurationError::NumberTooLarge { .. })
         ));
         // They fit, but the product does not.
         assert!(matches!(
-            Duration::parse("18446744073709551615d"),
+            parse_duration("18446744073709551615d"),
             Err(DurationError::Overflow { .. })
         ));
         // The largest value that *is* representable is still accepted.
-        assert_eq!(
-            Duration::parse("18446744073709551615ms")
-                .unwrap()
-                .as_millis(),
-            u64::MAX
-        );
+        assert_eq!(parse_duration("18446744073709551615ms").unwrap(), u64::MAX);
     }
 
     // ── Ready ───────────────────────────────────────────────────────────────
@@ -2626,11 +2138,7 @@ mod tests {
         let d = RestartSpec::default();
         assert_eq!(d.policy, Restart::OnFailure);
         assert_eq!(d.budget, default_budget());
-        assert_eq!(d.delay_ms, DEFAULT_RESTART_DELAY_MS);
-        assert_eq!(
-            d.budget.delay_ms, d.delay_ms,
-            "the two mirrors must never drift"
-        );
+        assert_eq!(d.budget.delay_ms, DEFAULT_RESTART_DELAY_MS);
         // `never` must not be reachable through `Default`: a service nobody
         // configured has not been told not to restart.
         assert_ne!(d.policy, Restart::Never);
@@ -2664,10 +2172,6 @@ mod tests {
         assert_eq!(
             RestartSpec::default().policy,
             RestartSpec::parse("on-failure").unwrap().policy
-        );
-        assert_eq!(
-            RestartSpec::default().delay_ms,
-            RestartSpec::parse("on-failure").unwrap().delay_ms
         );
     }
 
@@ -2780,35 +2284,6 @@ mod tests {
         );
         assert_eq!(RunAs::try_parse("www-data").unwrap(), None);
         assert_eq!(RunAs::try_parse("www-data:www-data").unwrap(), None);
-        // And the two disagree, by design: `parse` is for callers that cannot
-        // act on a name, `try_parse` for the one that can.
-        assert!(RunAs::parse("1000").is_ok());
-        assert!(RunAs::parse("www-data").is_err());
-    }
-
-    #[test]
-    fn runas_name_error_says_where_resolution_happens() {
-        // The requirement from DESIGN.md §5: an unresolvable name must produce a
-        // *clear* error pointing at zrt, never a panic and never an "unknown
-        // value". Both words the operator needs have to be in the message.
-        let text = RunAs::parse("www-data").unwrap_err().to_string();
-        assert!(text.contains("www-data"), "must quote the value: {text}");
-        assert!(
-            text.contains("resolved by the runtime"),
-            "must say who resolves it: {text}"
-        );
-        assert!(
-            text.contains("parser"),
-            "must say the parser does not: {text}"
-        );
-        let help = ValueError::from(RunAs::parse("www-data").unwrap_err())
-            .to_diagnostic(Span::point(1, 1))
-            .help
-            .expect("a deferred name deserves a next step");
-        assert!(
-            help.contains("/etc/passwd"),
-            "help must point at the lookup: {help}"
-        );
     }
 
     // ── Log ─────────────────────────────────────────────────────────────────
@@ -2825,8 +2300,6 @@ mod tests {
                 backups: DEFAULT_LOG_BACKUPS,
             }
         );
-        // Empty path, because only `zrt` knows the service name.
-        assert!(d.describe() == "file");
     }
 
     #[test]
@@ -2842,44 +2315,6 @@ mod tests {
             assert_eq!(LogSink::from(spec.clone()), expected, "{text}");
             assert_eq!(spec.clone().into_sink(), expected, "{text}");
         }
-    }
-
-    #[test]
-    fn logspec_describe_and_display_round_trip() {
-        // Only spellings that name non-default numbers survive as themselves:
-        // `describe` drops a `:size` or a `/backups` that already equals the
-        // documented default, because printing it would claim the operator
-        // wrote something they did not.
-        for text in [
-            "none",
-            "syslog",
-            "file",
-            "file:/var/log/zinit/sshd.log",
-            "file:/var/log/zinit/sshd.log:2048",
-            "file:/var/log/zinit/sshd.log:2048/5",
-            "file:sshd.log:1024/3",
-        ] {
-            let spec = LogSpec::parse(text).unwrap();
-            let printed = spec.describe();
-            // Whatever it prints must mean the same thing.
-            let back =
-                LogSpec::parse(&printed).unwrap_or_else(|e| panic!("{text:?} -> {printed:?}: {e}"));
-            assert_eq!(back, spec, "{text:?} -> {printed:?}: the sink changed");
-            assert_eq!(spec.to_string(), printed);
-        }
-        // The documented defaults are the ones that get elided.
-        assert_eq!(
-            LogSpec::parse("file:/l.log:1048576/3").unwrap().describe(),
-            "file:/l.log"
-        );
-        assert_eq!(
-            LogSpec::parse("file:/l.log:2048/3").unwrap().describe(),
-            "file:/l.log:2048"
-        );
-        assert_eq!(
-            LogSpec::parse("file:/l.log:1048576/4").unwrap().describe(),
-            "file:/l.log:1048576/4"
-        );
     }
 
     #[test]
@@ -2934,18 +2369,18 @@ mod tests {
     #[test]
     fn value_error_codes_are_pinned() {
         let all: Vec<(&str, String)> = alloc::vec![
-            ("E300", Duration::parse("").unwrap_err().to_string()),
-            ("E301", Duration::parse("10q").unwrap_err().to_string()),
-            ("E302", Duration::parse("1.5s").unwrap_err().to_string()),
+            ("E300", parse_duration("").unwrap_err().to_string()),
+            ("E301", parse_duration("10q").unwrap_err().to_string()),
+            ("E302", parse_duration("1.5s").unwrap_err().to_string()),
             (
                 "E303",
-                Duration::parse("99999999999999999999s")
+                parse_duration("99999999999999999999s")
                     .unwrap_err()
                     .to_string()
             ),
             (
                 "E304",
-                Duration::parse("18446744073709551615s")
+                parse_duration("18446744073709551615s")
                     .unwrap_err()
                     .to_string()
             ),
@@ -2987,18 +2422,23 @@ mod tests {
                     .unwrap_err()
                     .to_string()
             ),
-            ("E330", RunAs::parse("").unwrap_err().to_string()),
-            ("E331", RunAs::parse("1000 users").unwrap_err().to_string()),
+            ("E330", RunAs::try_parse("").unwrap_err().to_string()),
+            (
+                "E331",
+                RunAs::try_parse("1000 users").unwrap_err().to_string()
+            ),
             (
                 "E332",
-                RunAs::parse("1000:bad group").unwrap_err().to_string()
+                RunAs::try_parse("1000:bad group").unwrap_err().to_string()
             ),
-            ("E333", RunAs::parse("4294967296").unwrap_err().to_string()),
+            (
+                "E333",
+                RunAs::try_parse("4294967296").unwrap_err().to_string()
+            ),
             (
                 "E334",
-                RunAs::parse("0:4294967296").unwrap_err().to_string()
+                RunAs::try_parse("0:4294967296").unwrap_err().to_string()
             ),
-            ("E335", RunAs::parse("root").unwrap_err().to_string()),
             ("E340", LogSpec::parse("stderr").unwrap_err().to_string()),
             ("E341", LogSpec::parse("syslog:x").unwrap_err().to_string()),
             ("E342", LogSpec::parse("file:").unwrap_err().to_string()),
@@ -3044,8 +2484,8 @@ mod tests {
         // `ValueError` is an umbrella; wrapping must not swallow the message.
         let cases: alloc::vec::Vec<(ValueError<'_>, String)> = alloc::vec![
             (
-                ValueError::from(Duration::parse("10q").unwrap_err()),
-                Duration::parse("10q").unwrap_err().to_string(),
+                ValueError::from(parse_duration("10q").unwrap_err()),
+                parse_duration("10q").unwrap_err().to_string(),
             ),
             (
                 ValueError::from(ReadySpec::parse("tcp:0").unwrap_err()),
@@ -3058,8 +2498,8 @@ mod tests {
                     .to_string(),
             ),
             (
-                ValueError::from(RunAs::parse("root").unwrap_err()),
-                RunAs::parse("root").unwrap_err().to_string(),
+                ValueError::from(RunAs::try_parse("1000 users").unwrap_err()),
+                RunAs::try_parse("1000 users").unwrap_err().to_string(),
             ),
             (
                 ValueError::from(LogSpec::parse("stderr").unwrap_err()),
@@ -3083,48 +2523,9 @@ mod tests {
         // And every message names the offending value, so the reader never has
         // to go and find it.
         let quoted =
-            ValueError::from(Duration::parse("10w").unwrap_err()).to_diagnostic(Span::point(4, 2));
+            ValueError::from(parse_duration("10w").unwrap_err()).to_diagnostic(Span::point(4, 2));
         assert!(quoted.message.contains("10w"), "{}", quoted.message);
         assert_eq!(quoted.span, Some(Span::point(4, 2)));
-    }
-
-    #[test]
-    fn every_error_type_converts_to_a_diagnostic_directly() {
-        // A caller that only parses durations should not have to know that a
-        // `ValueError` umbrella exists. The five short cuts and the umbrella
-        // must produce byte-identical diagnostics.
-        let span = Span::range(9, 5, 6);
-        let pairs: Vec<(Diagnostic, Diagnostic)> = alloc::vec![
-            (
-                Duration::parse("10q").unwrap_err().to_diagnostic(span),
-                ValueError::from(Duration::parse("10q").unwrap_err()).to_diagnostic(span),
-            ),
-            (
-                ReadySpec::parse("tcp:0").unwrap_err().to_diagnostic(span),
-                ValueError::from(ReadySpec::parse("tcp:0").unwrap_err()).to_diagnostic(span),
-            ),
-            (
-                RestartSpec::parse("0 restarts per 1s")
-                    .unwrap_err()
-                    .to_diagnostic(span),
-                ValueError::from(RestartSpec::parse("0 restarts per 1s").unwrap_err())
-                    .to_diagnostic(span),
-            ),
-            (
-                RunAs::parse("root").unwrap_err().to_diagnostic(span),
-                ValueError::from(RunAs::parse("root").unwrap_err()).to_diagnostic(span),
-            ),
-            (
-                LogSpec::parse("stderr").unwrap_err().to_diagnostic(span),
-                ValueError::from(LogSpec::parse("stderr").unwrap_err()).to_diagnostic(span),
-            ),
-        ];
-        for (direct, via_umbrella) in pairs {
-            assert_eq!(direct, via_umbrella);
-            assert_eq!(direct.severity, Severity::Error);
-            assert_eq!(direct.span, Some(span));
-            assert!(direct.code.starts_with("E3"));
-        }
     }
 
     // ── Byte scanners ───────────────────────────────────────────────────────
@@ -3180,9 +2581,7 @@ mod tests {
     }
 
     #[test]
-    fn unit_scale_and_display_agree_on_the_five_units() {
-        // The two directions of the same grammar, from the same constants. If
-        // either side ever grows a unit alone, this is what notices.
+    fn unit_scale_agrees_with_the_documented_units() {
         for (unit, ms) in [
             ("ms", 1u64),
             ("s", 1_000),
@@ -3191,11 +2590,6 @@ mod tests {
             ("d", 86_400_000),
         ] {
             assert_eq!(unit_scale(unit), Some(ms), "{unit}");
-            assert_eq!(
-                Duration::from_millis(ms).to_string(),
-                format!("1{unit}"),
-                "{unit}"
-            );
         }
         assert_eq!(unit_scale(""), None);
         assert_eq!(unit_scale("sec"), None);

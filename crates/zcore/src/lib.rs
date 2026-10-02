@@ -49,7 +49,7 @@ pub mod runtime;
 pub mod transition;
 pub mod types;
 
-pub use action::{Action, StatusLine};
+pub use action::Action;
 pub use event::Event;
 pub use reconcile::{Tick, due_events, reconcile, should_restart};
 pub use runtime::{Runtime, ServiceState};
@@ -59,9 +59,6 @@ pub use types::{
     ServiceKind, ServicePlan, SignalKind, State, StrictReady,
 };
 
-/// Result alias for core fallible operations.
-pub type Result<T> = core::result::Result<T, Error>;
-
 /// Errors the core can produce on its own.
 ///
 /// Deliberately tiny: anything requiring the outside world surfaces as an
@@ -70,12 +67,6 @@ pub type Result<T> = core::result::Result<T, Error>;
 pub enum Error {
     /// The plan is inconsistent with the runtime's view of it. Always a bug.
     PlanMismatch { what: &'static str, idx: Idx },
-    /// A transition was requested that the state machine rejects.
-    IllegalTransition {
-        idx: Idx,
-        from: State,
-        event: &'static str,
-    },
 }
 
 impl core::fmt::Display for Error {
@@ -83,12 +74,6 @@ impl core::fmt::Display for Error {
         match self {
             Error::PlanMismatch { what, idx } => {
                 write!(f, "plan mismatch: {what} for service #{idx}")
-            }
-            Error::IllegalTransition { idx, from, event } => {
-                write!(
-                    f,
-                    "illegal transition on service #{idx}: {event} while {from:?}"
-                )
             }
         }
     }

@@ -236,7 +236,7 @@ pub fn run_check(command: &str, timeout_ms: u64) -> io::Result<bool> {
             "ping command contains a NUL byte",
         )
     })?;
-    let envp = current_envp()?;
+    let envp = EnvBlock::capture()?;
     let argv = [
         sh.as_ptr(),
         dash_c.as_ptr(),
@@ -362,11 +362,6 @@ impl EnvBlock {
     pub(crate) fn as_ptrs(&self) -> &[*const libc::c_char] {
         &self.ptrs
     }
-}
-
-/// Capture the current environment as raw parts for a pre-fork `execve`.
-fn current_envp() -> io::Result<EnvBlock> {
-    EnvBlock::capture()
 }
 
 /// Wait up to `timeout_ms` for `fd` to become readable.

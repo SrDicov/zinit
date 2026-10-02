@@ -316,9 +316,18 @@ fn probe_setresuid() -> bool {
         // cannot change anything, so a probe has no side effect. If this
         // fails, the real drop would fail too, which is exactly what we want
         // to know before starting a service rather than after.
-        let ids = crate::sys::ids();
-        crate::sys::setresuid(ids.uid, ids.euid, ids.uid).is_ok()
-            && crate::sys::setresgid(ids.gid, ids.egid, ids.gid).is_ok()
+        // SAFETY: four getters and two "set every id to what it already is"
+        // calls. No pointers, no allocation, nothing retained; the probe
+        // cannot change an id, which is the whole point of it.
+        unsafe {
+            let (uid, euid, gid, egid) = (
+                libc::getuid(),
+                libc::geteuid(),
+                libc::getgid(),
+                libc::getegid(),
+            );
+            libc::setresuid(uid, euid, uid) == 0 && libc::setresgid(gid, egid, gid) == 0
+        }
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {

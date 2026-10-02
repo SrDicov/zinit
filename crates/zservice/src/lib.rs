@@ -12,8 +12,9 @@
 //!   `tcp:<port>`), shaped so the supervisor's reactor can poll them.
 //! * [`log`] — the append-only file sink with size rotation, one `write(2)`
 //!   per line, no buffering that a `SIGKILL` could eat.
-//! * [`identity`] — `user = name` resolution plus the ordered privilege drop
-//!   (`setgroups`, `setresgid`, `setresuid`, verify-or-die).
+//! * [`identity`] — `user = name` resolution in the parent, plus the ordered
+//!   privilege drop (`setgroups`, `setresgid`, `setresuid`, verify-or-die)
+//!   the child applies through [`spawn`].
 //! * [`service::ManagedService`] — ties the
 //!   four above to a [`zcore::Runtime`] slot: deadlines armed, waitpid status
 //!   translated to [`zcore::Event`], stop escalation `TERM`-then-`KILL`.
@@ -52,9 +53,9 @@ pub mod service;
 pub mod spawn;
 
 pub use error::SpawnError;
-pub use identity::{ChildRlimit, cgroup_procs_path, drop_privileges, ensure_cgroup};
+pub use identity::{ChildRlimit, cgroup_procs_path, ensure_cgroup};
 pub use identity::{resolve_group, resolve_user, resolve_user_group};
-pub use log::{LogHandle, open_sink, rotate_now, write_line};
+pub use log::{LogHandle, open_sink, write_line};
 pub use ready::{
     PING_RUN_TIMEOUT_MS, POLL_PING_INTERVAL_MS, PollNeed, ReadyWait, TCP_CONNECT_TIMEOUT_MS,
     probe_tcp, run_check,

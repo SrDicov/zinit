@@ -29,15 +29,14 @@
 //!   The supervisor sets what the service may *use*; the ceiling stays the
 //!   system's business.
 //! * **cgroup membership is joined before the drop.** Writing to
-//!   `cgroup.procs` needs privilege; after the drop it fails. On platforms
-//!   without cgroups the request is reported back as "not joined" so the
-//!   supervisor can print the `DESIGN.md` §8.1 aviso — never silently
-//!   swallowed.
+//!   `cgroup.procs` needs privilege; after the drop it fails. On a platform
+//!   without cgroups the request is *refused* — [`SpawnError::CgroupUnsupported`]
+//!   — so the supervisor can print the `DESIGN.md` §8.1 aviso naming the
+//!   service, never silently swallowing the limits the operator asked for.
 
 use std::ffi::CString;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::SpawnError;
 
@@ -345,21 +344,15 @@ pub fn ensure_cgroup(service: &str, cgroup: &str) -> io::Result<PathBuf> {
     }
 }
 
-/// Drop privileges to `(uid, gid)`, or fail loudly.
+/// The test-only twin of the child's privilege drop, run against our own ids.
 ///
-/// The exact `DESIGN.md` §9 sequence: `setgroups(0, NULL)` first (supplementary
-/// groups survive a careless `setuid`), then the gid, then the uid — via
-/// `setresgid`/`setresuid` where they exist (Linux: atomic, no window in which
-/// privilege can be regained), via `setgid`/`setuid` plus explicit
-/// verification elsewhere — and finally the check `getuid() == geteuid() ==
-/// uid && getgid() == getegid() == gid`. Any mismatch is `PermissionDenied`,
-/// never a service quietly running as root.
-///
-/// Callable from both sides: the forked child calls it on its single-exit
-/// path (no allocation on success), and tests call it in a forked child to
-/// exercise the real syscalls. Error messages are static strings — no
-/// allocation even on failure — so the child path stays allocation-free.
-pub fn drop_privileges(uid: u32, gid: u32) -> io::Result<()> {
+/// Test code only: production drops privileges in `spawn::child_step_ids`,
+/// which is allocation-free and has a single `execve` exit. This copy exists
+/// because the tests need to drive the syscall sequence and *report the error*,
+/// which a child's errno pipe cannot do. When the two ever disagree, this one
+/// is wrong.
+#[cfg(test)]
+pub(crate) fn drop_privileges(uid: u32, gid: u32) -> io::Result<()> {
     // Drop supplementary groups first — but only when there are any. A
     // `setgroups` call with nothing to drop still needs privilege on Linux,
     // so calling it unconditionally would make "stay exactly who I am" fail
@@ -449,7 +442,8 @@ pub fn drop_privileges(uid: u32, gid: u32) -> io::Result<()> {
 ///
 /// A named wrapper rather than raw `libc::getuid` calls at every test site,
 /// so the tests read as "who am I" instead of four FFI invocations.
-pub fn current_ids() -> (u32, u32, u32, u32) {
+#[cfg(test)]
+pub(crate) fn current_ids() -> (u32, u32, u32, u32) {
     // SAFETY: four getters with no arguments and no preconditions.
     unsafe {
         (
@@ -459,27 +453,6 @@ pub fn current_ids() -> (u32, u32, u32, u32) {
             libc::getegid(),
         )
     }
-}
-
-#[allow(dead_code)]
-pub(crate) fn is_numeric(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
-}
-
-#[allow(dead_code)]
-pub(crate) fn cstr_of(path: &Path) -> io::Result<CString> {
-    CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("path contains a NUL byte: {}", path.display()),
-        )
-    })
-}
-
-/// The passwd entry behind a name, for tests that need the primary gid.
-#[cfg(test)]
-pub(crate) fn passwd_of(name: &str) -> Option<(u32, u32)> {
-    resolve_user(name).ok()
 }
 
 #[cfg(test)]
@@ -694,13 +667,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn cstr_helpers_reject_nul() {
-        assert!(cstr_of(Path::new("a\0b")).is_err());
-        assert!(cstr_of(Path::new("fine")).is_ok());
-        assert!(is_numeric("1000") && !is_numeric("") && !is_numeric("10a"));
-        let _ = passwd_of("nobody");
     }
 }

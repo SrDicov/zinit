@@ -19,7 +19,7 @@
 //! # The child sequence, and why it is in this order
 //!
 //! ```text
-//! setsid → stdio/notify fds → chdir(/) → rlimits → nice → cgroup →
+//! setsid → stdio/notify fds → chdir(/) → rlimits → cgroup →
 //!     setgroups → setresgid → setresuid → verify → no_new_privs →
 //!     TIOCSCTTY → execve  (any failure → errno pipe + _exit(127))
 //! ```
@@ -35,9 +35,9 @@
 //! * **`chdir("/")`.** A service must not pin the supervisor's working
 //!   directory (or any mount the operator wants to unmount). Consequence,
 //!   stated as a limitation: relative paths in `command` resolve from `/`.
-//! * **rlimits, then `nice`.** Both are still-privileged tunings applied while
-//!   the child is still root, so lowering works unconditionally and there is
-//!   no "re-open after the drop" second path.
+//! * **rlimits.** Still-privileged tuning applied while the child is still
+//!   root, so lowering works unconditionally and there is no "re-open after the
+//!   drop" second path.
 //! * **cgroup join before the drop.** Writing `cgroup.procs` needs privilege;
 //!   after the drop it fails. (`DESIGN.md` §9 rule 3.)
 //! * **`setgroups(0, NULL)`, `setresgid`, `setresuid`, then verify.**
@@ -129,10 +129,6 @@ pub struct SpawnCtx<'a> {
     /// take over": a console spawn without one behaves as `process` (see the
     /// limitations section below).
     pub tty: Option<&'a Path>,
-    /// `nice(2)` value, `-20..=19`. `None` leaves the inherited value alone.
-    /// There is currently no config directive spelling this; the hook exists
-    /// so the child sequence (`DESIGN.md` §9 order) has its slot.
-    pub nice: Option<i32>,
 }
 
 /// What the parent keeps after a successful fork.
@@ -157,9 +153,6 @@ pub struct Spawned {
     /// unreachable in practice and means "the pipe failed; treat the first
     /// reap as the verdict".
     pub exec_fd: Option<RawFd>,
-    /// Whether the child joined the requested cgroup (always true when no
-    /// cgroup was requested).
-    pub cgroup_joined: bool,
 }
 
 /// Fork+exec service `idx` of `plan`.
@@ -188,15 +181,6 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
             name: ctx.service_name.to_string(),
         }
         .into());
-    }
-    if let Some(n) = ctx.nice {
-        if !(-20..=19).contains(&n) {
-            return Err(SpawnError::BadValue {
-                name: ctx.service_name.to_string(),
-                what: format!("nice value {n} outside [-20, 19]"),
-            }
-            .into());
-        }
     }
 
     let wants_notify = matches!(
@@ -333,10 +317,6 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
             }
         }
     };
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let cgroup_unsupported = ctx.cgroup.is_some();
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let cgroup_unsupported = false;
 
     let tty_c: Option<CString> = match (sp.kind, ctx.tty) {
         (ServiceKind::Console, Some(t)) => Some(CString::new(t.as_os_str().as_bytes()).map_err(
@@ -362,8 +342,6 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
         uid: ctx.run_as.map_or(0, |(u, _)| u),
         gid: ctx.run_as.map_or(0, |(_, g)| g),
         drop_ids: ctx.run_as.is_some(),
-        nice: ctx.nice.unwrap_or(0),
-        have_nice: ctx.nice.is_some(),
         rlimits: rlimits.as_ptr(),
         rlimit_len: rlimits.len(),
         is_console: sp.kind == ServiceKind::Console,
@@ -409,7 +387,6 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
         log_fd: Some(log_fd),
         notify_fd: if notify_r >= 0 { Some(notify_r) } else { None },
         exec_fd: Some(exec_r),
-        cgroup_joined: !cgroup_unsupported,
     })
 }
 
@@ -462,10 +439,6 @@ struct ChildPlan {
     gid: u32,
     /// Whether to drop privileges at all.
     drop_ids: bool,
-    /// `nice` value; meaningful only when `have_nice`.
-    nice: i32,
-    /// Whether to call `nice`.
-    have_nice: bool,
     /// Pre-resolved rlimits (resource, soft).
     rlimits: *const ChildRlimit,
     /// Length of `rlimits`.
@@ -504,9 +477,6 @@ fn child_main(p: ChildPlan) -> ! {
         child_fail(p.exec_w);
     }
     if !child_step_rlimits(p) {
-        child_fail(p.exec_w);
-    }
-    if !child_step_nice(p) {
         child_fail(p.exec_w);
     }
     if !child_step_cgroup(p) {
@@ -670,20 +640,6 @@ fn child_step_rlimits(p: ChildPlan) -> bool {
     true
 }
 
-/// Apply the `nice` value, if one was given.
-fn child_step_nice(p: ChildPlan) -> bool {
-    if !p.have_nice {
-        return true;
-    }
-    // SAFETY: `setpriority` is one syscall on three ints. It returns -1 only
-    // on error — a nice value is never negative — so no errno read is needed
-    // (and none is possible portably: the errno accessor is `__errno_location`
-    // on Linux/DragonFly, `__error` on Darwin/FreeBSD, `__errno` on
-    // OpenBSD/NetBSD/Android). `PRIO_PROCESS` with `who = 0` means "this
-    // process", setting the documented value absolutely.
-    unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, p.nice as libc::c_int) == 0 }
-}
-
 /// Write our own pid to `cgroup.procs`, while still privileged.
 ///
 /// The pid is formatted into a stack buffer by hand: formatting without an
@@ -830,12 +786,11 @@ fn child_step_ctty(p: ChildPlan) -> bool {
         }
         #[allow(clippy::unnecessary_cast)]
         let req = libc::TIOCSCTTY as libc::c_ulong;
-        let ok = libc::ioctl(fd, req as _, 0) == 0;
-        libc::close(fd);
         // A console that cannot take its tty still runs: job control without
         // a controlling terminal degrades to plain session semantics, and the
         // supervisor says so in the service's log via the readiness path.
-        let _ = ok;
+        let _ = libc::ioctl(fd, req as _, 0);
+        libc::close(fd);
         true
     }
 }
@@ -1052,7 +1007,6 @@ mod tests {
             log,
             service_name: "test",
             tty: None,
-            nice: None,
         }
     }
 

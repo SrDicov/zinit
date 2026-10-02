@@ -35,19 +35,10 @@
 use std::io;
 use std::os::fd::RawFd;
 
-use zcore::{Event, Idx, Plan, Runtime, SignalKind, State, transition::arm_start_deadlines};
+use zcore::{Event, Idx, Plan, Runtime, SignalKind, transition::arm_start_deadlines};
 
 use crate::ready::{PollNeed, ReadyWait};
 use crate::spawn::{SpawnCtx, Spawned, spawn};
-
-/// Runtime states in which a child process is expected to exist.
-///
-/// Mirrors [`zcore::State::has_process`]: `Starting`, `Running`, `Stopping`.
-/// Kept as a local predicate so call sites read as policy ("only signal a
-/// service that has a process") rather than as a match on core internals.
-fn state_has_process(s: State) -> bool {
-    s.has_process()
-}
 
 /// One supervised service: the supervisor's per-service slot.
 ///
@@ -101,11 +92,6 @@ impl ManagedService {
             kill_sent: false,
             pending_warning: None,
         }
-    }
-
-    /// The frozen plan index.
-    pub const fn idx(&self) -> Idx {
-        self.idx
     }
 
     /// The main child pid, if a start is in flight or running.
@@ -351,7 +337,7 @@ impl ManagedService {
         plan: &Plan,
         now_ms: u64,
     ) -> Option<SignalKind> {
-        if self.pid.is_none() || !state_has_process(runtime.state_at(self.idx)) {
+        if self.pid.is_none() || !runtime.state_at(self.idx).has_process() {
             return None;
         }
         if self.term_sent_at.is_none() {
@@ -432,7 +418,7 @@ impl ManagedService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zcore::{Desired, LogSink, Ready, ServicePlan, StrictReady};
+    use zcore::{Desired, LogSink, Ready, ServicePlan, State, StrictReady};
 
     fn plan_with(sp: ServicePlan) -> Plan {
         Plan {
@@ -460,7 +446,6 @@ mod tests {
             log: Box::leak(Box::new(log)),
             service_name: leak(name),
             tty: None,
-            nice: None,
         };
         (plan, ctx)
     }
@@ -475,7 +460,6 @@ mod tests {
             log,
             service_name: name,
             tty: None,
-            nice: None,
         }
     }
 
@@ -496,6 +480,20 @@ mod tests {
         } else {
             let _ = zrt::sys::kill_process(pid, sig);
         }
+    }
+
+    /// Plant the slot the way a successful start leaves it: `Starting`, with a
+    /// process and both deadlines armed far enough out to be the thing under
+    /// test. The same slot for every deadline test, so each one only spells out
+    /// what makes it different.
+    fn starting(rt: &mut Runtime) {
+        let s = rt.get_mut(0);
+        s.state = State::Starting;
+        s.pid = Some(99);
+        s.pgid = Some(99);
+        s.started_at = Some(0);
+        s.start_due_at = Some(60_000);
+        s.ready_due_at = Some(1_000);
     }
 
     #[test]
@@ -610,12 +608,7 @@ mod tests {
     fn lenient_ready_timeout_becomes_ready_with_a_warning() {
         let (plan, _) = base("s", Ready::Notify, LogSink::None);
         let mut rt = Runtime::from_plan(&plan);
-        rt.get_mut(0).state = State::Starting;
-        rt.get_mut(0).pid = Some(99);
-        rt.get_mut(0).pgid = Some(99);
-        rt.get_mut(0).started_at = Some(0);
-        rt.get_mut(0).start_due_at = Some(60_000);
-        rt.get_mut(0).ready_due_at = Some(1_000);
+        starting(&mut rt);
         let mut svc = ManagedService::new(0);
         let events = svc.check_deadlines(&rt, &plan, 1_000);
         assert!(events.contains(&Event::Ready(0)), "{events:?}");
@@ -632,12 +625,7 @@ mod tests {
     fn strict_ready_timeout_is_an_error_not_a_warning() {
         let (plan, _) = base("s", Ready::Strict(StrictReady::Notify), LogSink::None);
         let mut rt = Runtime::from_plan(&plan);
-        rt.get_mut(0).state = State::Starting;
-        rt.get_mut(0).pid = Some(99);
-        rt.get_mut(0).pgid = Some(99);
-        rt.get_mut(0).started_at = Some(0);
-        rt.get_mut(0).start_due_at = Some(60_000);
-        rt.get_mut(0).ready_due_at = Some(1_000);
+        starting(&mut rt);
         let mut svc = ManagedService::new(0);
         let events = svc.check_deadlines(&rt, &plan, 1_000);
         assert!(events.contains(&Event::ReadyTimeout(0)), "{events:?}");
@@ -651,10 +639,10 @@ mod tests {
     fn start_and_stop_timeouts_surface() {
         let (plan, _) = base("s", Ready::None, LogSink::None);
         let mut rt = Runtime::from_plan(&plan);
-        rt.get_mut(0).state = State::Starting;
-        rt.get_mut(0).pid = Some(1);
-        rt.get_mut(0).started_at = Some(0);
+        // `ready = none`: no handshake deadline, only the start deadline.
+        starting(&mut rt);
         rt.get_mut(0).start_due_at = Some(100);
+        rt.get_mut(0).ready_due_at = None;
         let mut svc = ManagedService::new(0);
         assert!(svc.check_deadlines(&rt, &plan, 50).is_empty());
         assert!(
@@ -787,7 +775,6 @@ mod tests {
             log: Box::leak(Box::new(LogSink::None)),
             service_name: Box::leak(Box::new(String::from("stubborn"))),
             tty: None,
-            nice: None,
         };
         let mut rt = Runtime::from_plan(&plan);
         rt.set_desired(0, Desired::Up);
@@ -871,7 +858,6 @@ mod tests {
             log: Box::leak(Box::new(LogSink::None)),
             service_name: Box::leak(Box::new(String::from("ntfy"))),
             tty: None,
-            nice: None,
         };
         let mut rt = Runtime::from_plan(&plan);
         rt.set_desired(0, Desired::Up);
@@ -929,7 +915,6 @@ mod tests {
             log,
             service_name: Box::leak(Box::new(String::from("logged"))),
             tty: None,
-            nice: None,
         };
         let mut rt = Runtime::from_plan(&plan);
         let mut svc = ManagedService::new(0);

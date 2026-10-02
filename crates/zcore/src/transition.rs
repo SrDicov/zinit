@@ -28,7 +28,7 @@ use crate::action::{Action, log};
 use crate::event::Event;
 use crate::reconcile::should_restart;
 use crate::runtime::{Runtime, ServiceState};
-use crate::types::{Desired, Idx, LogLevel, Plan, Ready, Restart, SignalKind, State};
+use crate::types::{Desired, Idx, LogLevel, Plan, Restart, SignalKind, State};
 
 /// Outcome of applying one event.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,10 +64,6 @@ impl Transition {
     }
 
     /// The signals issued for one service, in order.
-    ///
-    /// Duplicated from [`Tick::signals_for`](crate::Tick::signals_for) because
-    /// the two types are deliberately separate: a `Tick` is a sweep, a
-    /// `Transition` is a reaction.
     pub fn signals_for(&self, idx: Idx) -> Vec<SignalKind> {
         self.for_service(idx)
             .filter_map(|a| match *a {
@@ -100,8 +96,6 @@ pub fn apply(event: &Event, runtime: &mut Runtime, plan: &Plan, now_ms: u64) -> 
 
     match *event {
         // ── Spawn lifecycle ────────────────────────────────────────────────
-        Event::Forked(_) => Transition::quiet(),
-
         Event::ExecOk(_) => {
             // execve succeeded: the process image is real now.
             if runtime.state_at(idx) != State::Starting {
@@ -424,13 +418,6 @@ fn handle_death(
     });
     actions.push(Action::DepsChanged(idx));
 
-    if restarting {
-        // The reconciler will spawn it on the next pass. Emitting `Spawn` here
-        // too would race with that pass and can double-spawn; the budget token
-        // taken above is what makes the reconciler's decision correct.
-        actions.push(Action::DepsChanged(idx));
-    }
-
     Transition {
         actions,
         changed: true,
@@ -499,21 +486,11 @@ pub fn arm_start_deadlines(runtime: &mut Runtime, plan: &Plan, idx: Idx, now_ms:
     };
 }
 
-/// True when the service is `Up` and should be reported as healthy.
-pub fn is_healthy(runtime: &Runtime, idx: Idx) -> bool {
-    runtime.get(idx).state.is_up() && runtime.get(idx).desired == Desired::Up
-}
-
-/// True when this readiness variant gates startup.
-pub fn ready_gates(ready: &Ready) -> bool {
-    ready.is_strict()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::types::{Budget, ServicePlan, StrictReady};
+    use crate::types::{Budget, Ready, ServicePlan, StrictReady};
 
     fn plan1(desc: ServicePlan) -> Plan {
         let mut p = Plan::default();
@@ -538,10 +515,7 @@ mod tests {
     fn ready_moves_starting_to_running() {
         let p = plan1(ServicePlan::new(String::from("a")));
         let mut rt = Runtime::from_plan(&p);
-        rt.get_mut(0).state = State::Starting;
-        rt.get_mut(0).pid = Some(1);
-        rt.get_mut(0).started_at = Some(0);
-        rt.get_mut(0).start_due_at = Some(1000);
+        *rt.get_mut(0) = starting();
 
         let t = apply(&Event::Ready(0), &mut rt, &p, 10);
         assert!(t.changed);
@@ -735,11 +709,7 @@ mod tests {
         sp.ready = Ready::Strict(StrictReady::Tcp(1));
         let p = plan1(sp);
         let mut rt = Runtime::from_plan(&p);
-        rt.get_mut(0).state = State::Starting;
-        rt.get_mut(0).pid = Some(1);
-        rt.get_mut(0).started_at = Some(0);
-        rt.get_mut(0).start_due_at = Some(10);
-        rt.get_mut(0).ready_due_at = Some(10);
+        *rt.get_mut(0) = starting();
 
         let t = apply(&Event::ReadyTimeout(0), &mut rt, &p, 10);
         assert!(t.actions.iter().any(|a| matches!(
@@ -758,9 +728,7 @@ mod tests {
         sp.kind = crate::types::ServiceKind::Console;
         let p = plan1(sp);
         let mut rt = Runtime::from_plan(&p);
-        rt.get_mut(0).state = State::Starting;
-        rt.get_mut(0).pid = Some(1);
-        rt.get_mut(0).started_at = Some(0);
+        *rt.get_mut(0) = starting();
         rt.get_mut(0).is_console = true;
 
         let t = apply(&Event::Ready(0), &mut rt, &p, 0);
