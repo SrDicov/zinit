@@ -210,12 +210,10 @@ pub fn parse_duration(input: &str) -> Result<u64, DurationError<'_>> {
         });
     };
 
-    value
-        .checked_mul(scale)
-        .ok_or(DurationError::Overflow {
-            value: input,
-            unit: rest,
-        })
+    value.checked_mul(scale).ok_or(DurationError::Overflow {
+        value: input,
+        unit: rest,
+    })
 }
 
 /// Why a duration failed to parse.

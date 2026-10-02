@@ -863,7 +863,10 @@ mod tests {
             desc_with("b", ServiceKind::Process, &[], &["a"]),
         ]);
         let b = p.index_of("b").unwrap();
-        assert!(p.services[b].required.is_empty(), "optional is not required");
+        assert!(
+            p.services[b].required.is_empty(),
+            "optional is not required"
+        );
         assert_eq!(p.order_up, vec![0, 1]);
     }
 
