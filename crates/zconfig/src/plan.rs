@@ -852,14 +852,18 @@ mod tests {
     }
 
     #[test]
-    fn an_optional_edge_is_waited_for_but_never_blocks_the_order() {
+    fn an_optional_edge_orders_without_becoming_a_blocker() {
+        // The plan does not store optional edges: `Runtime::deps_satisfied`
+        // reads `required` only, which is exactly what makes `Optional` never
+        // block (DESIGN §4.1, invariant 5). The ordering still honours the
+        // optional edge, and that comes from the graph's indegree, not from the
+        // service's own edge list.
         let p = plan_of(vec![
             desc_with("a", ServiceKind::Process, &[], &[]),
             desc_with("b", ServiceKind::Process, &[], &["a"]),
         ]);
         let b = p.index_of("b").unwrap();
-        assert_eq!(p.services[b].optional, vec![0]);
-        assert!(p.services[b].required.is_empty());
+        assert!(p.services[b].required.is_empty(), "optional is not required");
         assert_eq!(p.order_up, vec![0, 1]);
     }
 
@@ -873,14 +877,13 @@ mod tests {
             desc_with("b", ServiceKind::Process, &[], &["a"]),
         ]);
         assert_eq!(p.order_up, vec![0, 1]);
-        assert!(p.services[0].optional.contains(&1));
-        assert!(p.services[1].optional.contains(&0));
     }
 
     #[test]
     fn an_unknown_optional_edge_disappears_from_the_plan() {
         let p = plan_of(vec![desc_with("b", ServiceKind::Process, &[], &["ghost"])]);
         assert!(
+            p.services[0].required.is_empty(),
             "a dangling edge is not an index"
         );
     }
