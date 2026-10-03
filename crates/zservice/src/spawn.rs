@@ -19,11 +19,19 @@
 //! # The child sequence, and why it is in this order
 //!
 //! ```text
-//! setsid → stdio/notify fds → chdir(/) → rlimits → cgroup →
+//! sigmask → setsid → stdio/notify fds → chdir(/) → rlimits → cgroup →
 //!     setgroups → setresgid → setresuid → verify → no_new_privs →
 //!     TIOCSCTTY → execve  (any failure → errno pipe + _exit(127))
 //! ```
 //!
+//! * **An empty signal mask, before anything else.** `fork` copies the
+//!   supervisor's blocked set and `execve` *preserves* it (only dispositions
+//!   are reset), so a child that does not clear the mask runs with every
+//!   catchable signal blocked — including `SIGTERM`, which is exactly how a
+//!   service is asked to stop. Blocked *and* default means *pending forever*:
+//!   the service survives its own `SIGTERM` and only the `stop-timeout`
+//!   `SIGKILL` escalation can end it. A real, observed bug, not a hypothetical;
+//!   `crates/zinit/tests/supervises_real_service.rs` is its regression test.
 //! * **`setsid` first.** The supervisor stops a service with `kill(-pgid)`;
 //!   the child must be a session (and therefore process-group) leader before
 //!   anything else, or helpers forked in between would escape the group.
@@ -328,6 +336,15 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
         _ => None,
     };
 
+    // An empty signal mask, built here because past the fork the child may not
+    // do setup work. `fork` copies the supervisor's blocked set and `execve`
+    // preserves it, so a child that does not clear it would run with `SIGTERM`
+    // blocked — pending, never delivered, un-stoppable until `SIGKILL`.
+    let mut empty_mask: libc::sigset_t = unsafe { core::mem::zeroed() };
+    // SAFETY: `empty_mask` is a live, zeroed `sigset_t` and `sigemptyset` only
+    // clears bits inside it. POSIX says it cannot fail.
+    unsafe { libc::sigemptyset(&raw mut empty_mask) };
+
     let plan_child = ChildPlan {
         path: path_c.as_ptr(),
         argv: argv_ptrs.as_ptr(),
@@ -346,6 +363,7 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
         rlimit_len: rlimits.len(),
         is_console: sp.kind == ServiceKind::Console,
         tty: tty_c.as_ref().map_or(core::ptr::null(), |c| c.as_ptr()),
+        sigmask: &raw const empty_mask,
     };
 
     // SAFETY: `fork` takes no arguments and has no preconditions. The dangers
@@ -447,6 +465,8 @@ struct ChildPlan {
     is_console: bool,
     /// Controlling terminal path, or null.
     tty: *const libc::c_char,
+    /// Empty signal mask, installed by the child before anything else.
+    sigmask: *const libc::sigset_t,
 }
 
 // SAFETY rationale for `Send`-free raw pointers: `ChildPlan` never crosses a
@@ -467,6 +487,9 @@ fn child_main(p: ChildPlan) -> ! {
     // have gone away); the `_exit(127)` is not.
     // Zero: let `setpgid` pick, which means "my own pid", the group the
     // supervisor will later signal with `kill(-pid)`.
+    if !child_step_sigmask(p) {
+        child_fail(p.exec_w);
+    }
     if !child_step_session(0) {
         child_fail(p.exec_w);
     }
@@ -529,6 +552,26 @@ fn child_fail(exec_w: RawFd) -> ! {
 /// The supervisor stops trees with `kill(-pgid)`. Without this call the
 /// child would share the supervisor's group, and signalling "the service"
 /// would signal the supervisor too — the self-`SIGKILL` class of bug.
+/// Take back a usable signal mask.
+///
+/// The supervisor blocks every catchable signal at start-up because its own
+/// event loop must not be interrupted at an arbitrary instruction. `fork`
+/// copies that mask and `execve` does not restore it, so a child that did not
+/// clear it would run with `SIGTERM` blocked — pending forever, and un-stoppable
+/// until the `stop-timeout` `SIGKILL`.
+///
+/// First in the sequence because nothing after it should run under the
+/// supervisor's mask. Pending signals are cleared by `fork`, so unblocking
+/// here cannot deliver one that was queued for the supervisor.
+///
+/// SAFETY: `p.sigmask` points at a parent-prepared, fully initialised
+/// `sigset_t` alive in this frame's inherited copy; `pthread_sigmask` reads it
+/// and retains nothing.
+fn child_step_sigmask(p: ChildPlan) -> bool {
+    // SAFETY: see the SAFETY note above the function.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, p.sigmask, core::ptr::null_mut()) == 0 }
+}
+
 fn child_step_session(pgid_want: i32) -> bool {
     // `setsid` is the goal - a new session, so no controlling terminal can be
     // inherited and `kill(-pgid)` is the only way in - but it fails with

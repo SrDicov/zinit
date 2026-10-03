@@ -16,7 +16,7 @@
 //! attributes to dinit's `sleep(1)` inside `kill_all_on_stop`.
 //!
 //! **The core decides; this file obeys.** Every state change goes through
-//! [`zcore::apply`] or [`zcore::reconcile`], and this module never writes a
+//! [`zcore::apply`] or [`zcore::reconcile()`], and this module never writes a
 //! `State` of its own accord. The single exception is the one the core cannot
 //! express: a stop the *operator* asked for, where nothing emits a `SIGTERM`
 //! (see [`Sup::begin_stop`]).
