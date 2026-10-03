@@ -302,7 +302,9 @@ impl<'a> Sup<'a> {
     /// The supervisor's exit status, if it has exited. Repeated calls keep
     /// reporting the same status.
     fn exited(&mut self) -> Option<ExitStatus> {
-        self.child.try_wait().expect("waiting on the supervisor failed")
+        self.child
+            .try_wait()
+            .expect("waiting on the supervisor failed")
     }
 
     fn note_service(&mut self, pid: i32) {

@@ -39,7 +39,9 @@ pub fn run() -> ! {
     if let Err(e) = zrt::signals::block_all() {
         // Announced, not fatal. An init with signals unblocked is a degraded
         // init; an init that exits here is a machine with no init.
-        announce_degradation(&format!("could not block signals ({e}); continuing unblocked"));
+        announce_degradation(&format!(
+            "could not block signals ({e}); continuing unblocked"
+        ));
     }
     // ponytail: power signals (firmware `SIGTERM`) are queued and ignored, not
     // forwarded. Forwarding them means delivering to the supervisor's control
@@ -142,7 +144,9 @@ fn mount_minimum() {
     let flags = (libc::MS_NOSUID | libc::MS_NODEV) as u32;
 
     if let Err(e) = std::fs::create_dir_all("/run") {
-        announce_degradation(&format!("cannot create /run ({e}); the tmpfs below will fail too"));
+        announce_degradation(&format!(
+            "cannot create /run ({e}); the tmpfs below will fail too"
+        ));
     }
 
     // (filesystem type, mount point, tmpfs options). `mount` takes the source

@@ -47,10 +47,9 @@ fn main() -> ExitCode {
             init::run();
         }
         "--sup" => {
-            let dir: PathBuf = args.next().map_or_else(
-                || PathBuf::from(DEFAULT_CONFIG_DIR),
-                PathBuf::from,
-            );
+            let dir: PathBuf = args
+                .next()
+                .map_or_else(|| PathBuf::from(DEFAULT_CONFIG_DIR), PathBuf::from);
             if args.next().is_some() {
                 announce_degradation("--sup takes at most one argument: a directory");
                 usage();
