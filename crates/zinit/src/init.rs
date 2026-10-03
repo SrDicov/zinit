@@ -145,15 +145,22 @@ fn mount_minimum() {
         announce_degradation(&format!("cannot create /run ({e}); the tmpfs below will fail too"));
     }
 
-    // (filesystem type, mount point, tmpfs options). The source and the type
-    // are the same name in all three cases, which is what `mount(2)` wants.
+    // (filesystem type, mount point, tmpfs options). `mount` takes the source
+    // as a `Path` and the type as a `str`, and for all three the two are the
+    // same word — `mount(2)` wants exactly that on Linux.
     const TABLE: &[(&str, &str, Option<&str>)] = &[
         ("proc", "/proc", None),
         ("sysfs", "/sys", None),
         ("tmpfs", "/run", Some("mode=0755")),
     ];
     for (fstype, target, data) in TABLE.iter().copied() {
-        match zrt::sys::mount(Some(fstype), Path::new(target), Some(fstype), flags, data) {
+        match zrt::sys::mount(
+            Some(Path::new(fstype)),
+            Path::new(target),
+            Some(fstype),
+            flags,
+            data,
+        ) {
             Ok(()) => {}
             // Already mounted is exactly the state we wanted. Asking
             // `/proc/mounts` first would be a second parser to keep correct,

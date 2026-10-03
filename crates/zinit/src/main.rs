@@ -20,7 +20,7 @@
 mod init;
 mod sup;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use zrt::report::announce_degradation;

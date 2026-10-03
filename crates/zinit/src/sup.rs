@@ -475,7 +475,7 @@ impl Sup {
             }
 
             // 3. Expired deadlines, mapped to events by the core itself.
-            let slot = &self.slots[idx];
+            let slot = &mut self.slots[idx];
             let due = slot.svc.check_deadlines(&self.runtime, &self.plan, now);
             for event in due {
                 self.feed(&event, now);
@@ -656,7 +656,9 @@ impl Sup {
             // failing; pass `Some("/dev/ttyN")` when the console service lands.
             tty: None,
         };
-        let started = self.slots[idx].svc.start(sp, &mut self.runtime, &ctx, now);
+        let started = self.slots[idx]
+            .svc
+            .start(&self.plan, &mut self.runtime, &ctx, now);
         self.slots[idx].desc = Some(desc);
 
         if let Err(e) = started {
