@@ -1,0 +1,49 @@
+name: alpine-e2e
+
+# Final acceptance in a minimal Alpine (musl/busybox). No PID-1 binary exists
+# yet, so privileged boot with sshd/nginx/postgres is Phase 3+. Today this
+# proves the load-bearing half instead: the real fork+exec path (`spawn`,
+# `setsid` fallback, reactor) inside musl libc with busybox `/bin/true`,
+# `/bin/sleep`, `/bin/sh` — including the new
+# `group_leader_parent_still_spawns_with_own_group` regression test.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  alpine-musl:
+    name: spawn+reactor on alpine (musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: alpine:latest
+    steps:
+      - name: Install toolchain (container-scoped)
+        # The container runs as root but $HOME is /github/home: rustup refuses
+        # when $HOME disagrees with the euid home, so pin everything to /root.
+        run: |
+          export HOME=/root RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo
+          echo "HOME=/root" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=/root/.rustup" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=/root/.cargo" >> "$GITHUB_ENV"
+          echo "/root/.cargo/bin" >> "$GITHUB_PATH"
+          apk add --no-cache curl gcc musl-dev
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+      - uses: actions/checkout@v5
+      - name: Prove busybox prologue exists
+        run: ls -l /bin/true /bin/sleep /bin/sh
+      - name: Fork path incl. setsid regression
+        env:
+          PATH: /root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        run: cargo test -p zservice --release spawn
+      - name: Reactor on musl
+        env:
+          PATH: /root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        run: cargo test -p zrt --release reactor

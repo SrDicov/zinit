@@ -19,11 +19,19 @@
 //! # The child sequence, and why it is in this order
 //!
 //! ```text
-//! setsid → stdio/notify fds → chdir(/) → rlimits → nice → cgroup →
+//! sigmask → setsid → stdio/notify fds → chdir(/) → rlimits → cgroup →
 //!     setgroups → setresgid → setresuid → verify → no_new_privs →
 //!     TIOCSCTTY → execve  (any failure → errno pipe + _exit(127))
 //! ```
 //!
+//! * **An empty signal mask, before anything else.** `fork` copies the
+//!   supervisor's blocked set and `execve` *preserves* it (only dispositions
+//!   are reset), so a child that does not clear the mask runs with every
+//!   catchable signal blocked — including `SIGTERM`, which is exactly how a
+//!   service is asked to stop. Blocked *and* default means *pending forever*:
+//!   the service survives its own `SIGTERM` and only the `stop-timeout`
+//!   `SIGKILL` escalation can end it. A real, observed bug, not a hypothetical;
+//!   `crates/zinit/tests/supervises_real_service.rs` is its regression test.
 //! * **`setsid` first.** The supervisor stops a service with `kill(-pgid)`;
 //!   the child must be a session (and therefore process-group) leader before
 //!   anything else, or helpers forked in between would escape the group.
@@ -35,9 +43,9 @@
 //! * **`chdir("/")`.** A service must not pin the supervisor's working
 //!   directory (or any mount the operator wants to unmount). Consequence,
 //!   stated as a limitation: relative paths in `command` resolve from `/`.
-//! * **rlimits, then `nice`.** Both are still-privileged tunings applied while
-//!   the child is still root, so lowering works unconditionally and there is
-//!   no "re-open after the drop" second path.
+//! * **rlimits.** Still-privileged tuning applied while the child is still
+//!   root, so lowering works unconditionally and there is no "re-open after the
+//!   drop" second path.
 //! * **cgroup join before the drop.** Writing `cgroup.procs` needs privilege;
 //!   after the drop it fails. (`DESIGN.md` §9 rule 3.)
 //! * **`setgroups(0, NULL)`, `setresgid`, `setresuid`, then verify.**
@@ -129,10 +137,6 @@ pub struct SpawnCtx<'a> {
     /// take over": a console spawn without one behaves as `process` (see the
     /// limitations section below).
     pub tty: Option<&'a Path>,
-    /// `nice(2)` value, `-20..=19`. `None` leaves the inherited value alone.
-    /// There is currently no config directive spelling this; the hook exists
-    /// so the child sequence (`DESIGN.md` §9 order) has its slot.
-    pub nice: Option<i32>,
 }
 
 /// What the parent keeps after a successful fork.
@@ -157,9 +161,6 @@ pub struct Spawned {
     /// unreachable in practice and means "the pipe failed; treat the first
     /// reap as the verdict".
     pub exec_fd: Option<RawFd>,
-    /// Whether the child joined the requested cgroup (always true when no
-    /// cgroup was requested).
-    pub cgroup_joined: bool,
 }
 
 /// Fork+exec service `idx` of `plan`.
@@ -188,15 +189,6 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
             name: ctx.service_name.to_string(),
         }
         .into());
-    }
-    if let Some(n) = ctx.nice {
-        if !(-20..=19).contains(&n) {
-            return Err(SpawnError::BadValue {
-                name: ctx.service_name.to_string(),
-                what: format!("nice value {n} outside [-20, 19]"),
-            }
-            .into());
-        }
     }
 
     let wants_notify = matches!(
@@ -333,10 +325,6 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
             }
         }
     };
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let cgroup_unsupported = ctx.cgroup.is_some();
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let cgroup_unsupported = false;
 
     let tty_c: Option<CString> = match (sp.kind, ctx.tty) {
         (ServiceKind::Console, Some(t)) => Some(CString::new(t.as_os_str().as_bytes()).map_err(
@@ -347,6 +335,15 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
         )?),
         _ => None,
     };
+
+    // An empty signal mask, built here because past the fork the child may not
+    // do setup work. `fork` copies the supervisor's blocked set and `execve`
+    // preserves it, so a child that does not clear it would run with `SIGTERM`
+    // blocked — pending, never delivered, un-stoppable until `SIGKILL`.
+    let mut empty_mask: libc::sigset_t = unsafe { core::mem::zeroed() };
+    // SAFETY: `empty_mask` is a live, zeroed `sigset_t` and `sigemptyset` only
+    // clears bits inside it. POSIX says it cannot fail.
+    unsafe { libc::sigemptyset(&raw mut empty_mask) };
 
     let plan_child = ChildPlan {
         path: path_c.as_ptr(),
@@ -362,12 +359,11 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
         uid: ctx.run_as.map_or(0, |(u, _)| u),
         gid: ctx.run_as.map_or(0, |(_, g)| g),
         drop_ids: ctx.run_as.is_some(),
-        nice: ctx.nice.unwrap_or(0),
-        have_nice: ctx.nice.is_some(),
         rlimits: rlimits.as_ptr(),
         rlimit_len: rlimits.len(),
         is_console: sp.kind == ServiceKind::Console,
         tty: tty_c.as_ref().map_or(core::ptr::null(), |c| c.as_ptr()),
+        sigmask: &raw const empty_mask,
     };
 
     // SAFETY: `fork` takes no arguments and has no preconditions. The dangers
@@ -409,7 +405,6 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
         log_fd: Some(log_fd),
         notify_fd: if notify_r >= 0 { Some(notify_r) } else { None },
         exec_fd: Some(exec_r),
-        cgroup_joined: !cgroup_unsupported,
     })
 }
 
@@ -462,10 +457,6 @@ struct ChildPlan {
     gid: u32,
     /// Whether to drop privileges at all.
     drop_ids: bool,
-    /// `nice` value; meaningful only when `have_nice`.
-    nice: i32,
-    /// Whether to call `nice`.
-    have_nice: bool,
     /// Pre-resolved rlimits (resource, soft).
     rlimits: *const ChildRlimit,
     /// Length of `rlimits`.
@@ -474,6 +465,8 @@ struct ChildPlan {
     is_console: bool,
     /// Controlling terminal path, or null.
     tty: *const libc::c_char,
+    /// Empty signal mask, installed by the child before anything else.
+    sigmask: *const libc::sigset_t,
 }
 
 // SAFETY rationale for `Send`-free raw pointers: `ChildPlan` never crosses a
@@ -494,6 +487,9 @@ fn child_main(p: ChildPlan) -> ! {
     // have gone away); the `_exit(127)` is not.
     // Zero: let `setpgid` pick, which means "my own pid", the group the
     // supervisor will later signal with `kill(-pid)`.
+    if !child_step_sigmask(p) {
+        child_fail(p.exec_w);
+    }
     if !child_step_session(0) {
         child_fail(p.exec_w);
     }
@@ -504,9 +500,6 @@ fn child_main(p: ChildPlan) -> ! {
         child_fail(p.exec_w);
     }
     if !child_step_rlimits(p) {
-        child_fail(p.exec_w);
-    }
-    if !child_step_nice(p) {
         child_fail(p.exec_w);
     }
     if !child_step_cgroup(p) {
@@ -559,6 +552,26 @@ fn child_fail(exec_w: RawFd) -> ! {
 /// The supervisor stops trees with `kill(-pgid)`. Without this call the
 /// child would share the supervisor's group, and signalling "the service"
 /// would signal the supervisor too — the self-`SIGKILL` class of bug.
+/// Take back a usable signal mask.
+///
+/// The supervisor blocks every catchable signal at start-up because its own
+/// event loop must not be interrupted at an arbitrary instruction. `fork`
+/// copies that mask and `execve` does not restore it, so a child that did not
+/// clear it would run with `SIGTERM` blocked — pending forever, and un-stoppable
+/// until the `stop-timeout` `SIGKILL`.
+///
+/// First in the sequence because nothing after it should run under the
+/// supervisor's mask. Pending signals are cleared by `fork`, so unblocking
+/// here cannot deliver one that was queued for the supervisor.
+///
+/// SAFETY: `p.sigmask` points at a parent-prepared, fully initialised
+/// `sigset_t` alive in this frame's inherited copy; `pthread_sigmask` reads it
+/// and retains nothing.
+fn child_step_sigmask(p: ChildPlan) -> bool {
+    // SAFETY: see the SAFETY note above the function.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, p.sigmask, core::ptr::null_mut()) == 0 }
+}
+
 fn child_step_session(pgid_want: i32) -> bool {
     // `setsid` is the goal - a new session, so no controlling terminal can be
     // inherited and `kill(-pgid)` is the only way in - but it fails with
@@ -661,26 +674,13 @@ fn child_step_rlimits(p: ChildPlan) -> bool {
             rlim_max: r.max as libc::rlim_t,
         };
         // SAFETY: `setrlimit` reads one `rlimit` through the pointer and
-        // retains nothing.
-        if unsafe { libc::setrlimit(r.resource, &raw const lim) } != 0 {
+        // retains nothing. `r.resource as _` resolves against the callee's
+        // (private since libc 0.2.189) resource type.
+        if unsafe { libc::setrlimit(r.resource as _, &raw const lim) } != 0 {
             return false;
         }
     }
     true
-}
-
-/// Apply the `nice` value, if one was given.
-fn child_step_nice(p: ChildPlan) -> bool {
-    if !p.have_nice {
-        return true;
-    }
-    // SAFETY: `nice` takes an int. It returns -1 both on error and legally,
-    // so errno is cleared first and only a set errno means failure.
-    unsafe {
-        *libc::__errno_location() = 0;
-        libc::nice(p.nice as libc::c_int);
-        *libc::__errno_location() == 0
-    }
 }
 
 /// Write our own pid to `cgroup.procs`, while still privileged.
@@ -829,12 +829,11 @@ fn child_step_ctty(p: ChildPlan) -> bool {
         }
         #[allow(clippy::unnecessary_cast)]
         let req = libc::TIOCSCTTY as libc::c_ulong;
-        let ok = libc::ioctl(fd, req as _, 0) == 0;
-        libc::close(fd);
         // A console that cannot take its tty still runs: job control without
         // a controlling terminal degrades to plain session semantics, and the
         // supervisor says so in the service's log via the readiness path.
-        let _ = ok;
+        let _ = libc::ioctl(fd, req as _, 0);
+        libc::close(fd);
         true
     }
 }
@@ -1051,7 +1050,6 @@ mod tests {
             log,
             service_name: "test",
             tty: None,
-            nice: None,
         }
     }
 
@@ -1096,7 +1094,7 @@ mod tests {
     fn unknown_service_index_is_refused() {
         let plan = process_plan("a");
         let log = LogSink::None;
-        let c = ctx("/bin/true", &[], &log);
+        let c = ctx(crate::testutil::true_bin(), &[], &log);
         let e = spawn(&plan, 9, &c).expect_err("bad index");
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
     }
@@ -1105,9 +1103,25 @@ mod tests {
     fn true_exits_zero() {
         let plan = process_plan("t");
         let log = LogSink::None;
-        let c = ctx("/bin/true", &[], &log);
+        let c = ctx(crate::testutil::true_bin(), &[], &log);
         let s = spawn(&plan, 0, &c).expect("spawn");
         assert_eq!(s.pgid, s.pid, "setsid makes the child its own group");
+        assert_eq!(reap(&s), zrt::sys::ExitStatus::Exited(0));
+    }
+
+    #[test]
+    fn group_leader_parent_still_spawns_with_own_group() {
+        // Regression for the intermittent `setsid` EPERM boot failure: a fresh
+        // fork *is* a process-group leader whenever the supervisor itself was
+        // launched by a group-leading shell (always, under `cargo test`), so
+        // `setsid` fails and only the `setpgid(0, 0)` fallback in
+        // `child_step_session` saves the spawn. This runs in that exact
+        // condition, so `pgid == pid` here proves the fallback path works.
+        let plan = process_plan("grp");
+        let log = LogSink::None;
+        let c = ctx(crate::testutil::true_bin(), &[], &log);
+        let s = spawn(&plan, 0, &c).expect("spawn under group-leading parent");
+        assert_eq!(s.pgid, s.pid, "fallback must still own its group");
         assert_eq!(reap(&s), zrt::sys::ExitStatus::Exited(0));
     }
 
@@ -1218,7 +1232,7 @@ mod tests {
         let rl = [(String::from("bogus"), 1u64)];
         let c = SpawnCtx {
             rlimits: &rl,
-            ..ctx("/bin/true", &[], &log)
+            ..ctx(crate::testutil::true_bin(), &[], &log)
         };
         assert!(spawn(&plan, 0, &c).is_err());
     }
@@ -1231,7 +1245,7 @@ mod tests {
         sp.log = LogSink::None;
         let plan = plan_with(sp);
         let log = LogSink::None;
-        let c = ctx("/bin/true", &[], &log);
+        let c = ctx(crate::testutil::true_bin(), &[], &log);
         let s = spawn(&plan, 0, &c).expect("spawn");
         assert_eq!(reap(&s), zrt::sys::ExitStatus::Exited(0));
     }

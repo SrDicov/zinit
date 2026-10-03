@@ -1,0 +1,22 @@
+[package]
+name = "zinit"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license.workspace = true
+description = "The init binary: --init is PID 1, --sup is the supervisor"
+repository = "https://github.com/SrDicov/zinit"
+
+[dependencies]
+# The boundary is the point. This crate is the ONLY place where the pure core
+# and the syscall layer meet: it may depend on all four, and each of those four
+# may not depend on it.
+zcore = { path = "../zcore" }
+zconfig = { path = "../zconfig" }
+zrt = { path = "../zrt" }
+zservice = { path = "../zservice" }
+libc = "0.2"
+
+[[bin]]
+name = "zinit"
+path = "src/main.rs"

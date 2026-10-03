@@ -651,15 +651,25 @@ mod tests {
     use crate::reactor::{Interest, Reactor};
     use crate::signals::Signal;
 
-    /// Fork a child that `_exit`s immediately with `code`.
+    /// Fork a child that `_exit`s with `code` after a short pause.
     ///
     /// The child path does exactly one thing and never returns: no
     /// allocation, no lock, no destructor. That is the same constraint the
     /// real spawn path has, and exercising it here means a violation shows up
     /// as a hung test rather than as a mysterious production crash.
+    ///
+    /// The pause is what makes this deterministic. `EVFILT_PROC` answers
+    /// `ESRCH` for a process that has already exited, and `fork` returns in
+    /// *both* processes, so an instant `_exit` can win against the parent's
+    /// `track` syscall — no ordering of the parent's own calls closes that
+    /// window. `nanosleep` is async-signal-safe, so the child path stays
+    /// legal, and the burst still lands inside one reap window.
     fn fork_exiting(code: i32) -> i32 {
         match sys::fork() {
-            Ok(0) => sys::_exit(code),
+            Ok(0) => {
+                let _ = crate::clock::sleep_ms(50);
+                sys::_exit(code)
+            }
             Ok(pid) => pid,
             Err(e) => panic!("fork: {e}"),
         }

@@ -1,0 +1,46 @@
+name: fuzz
+
+# Continuous fuzzing proxy. No `fuzz/` targets exist yet (Phase 5 tooling), so
+# the run exercises the parser's mutation tests — the honest fuzz surface
+# available today. Real `cargo fuzz` lands with `fuzz/fuzz_targets/`, and this
+# file grows a `cargo-fuzz` job the same day. Heavy by design: nightly +
+# manual + parser PRs only, never every push.
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/zconfig/src/parser.rs"
+      - "crates/zconfig/src/value.rs"
+      - "crates/zrt/src/**"
+      - ".github/workflows/fuzz.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: -D warnings
+
+jobs:
+  mutation-tests:
+    name: parser mutation tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-fuzz-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-fuzz-
+      - name: Parser no-panic suite (fuzz proxy)
+        run: cargo test -p zconfig --release no_panic
+      - name: Full zconfig suite
+        run: cargo test -p zconfig --release

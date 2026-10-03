@@ -30,10 +30,9 @@
 //! The two are never mixed. A function that takes a deadline wants
 //! [`now_ms`]; a function that writes a timestamp wants [`now_realtime_ms`].
 
-use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use std::io;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// A source of time.
 ///
@@ -79,25 +78,27 @@ impl Clock for SystemClock {
 #[derive(Debug)]
 pub struct ManualClock {
     /// Milliseconds since boot, i.e. the monotonic value.
-    monotonic_ms: AtomicU64,
+    monotonic_ms: Mutex<u64>,
     /// Milliseconds since the epoch, i.e. the realtime value.
-    realtime_ms: AtomicU64,
+    realtime_ms: Mutex<u64>,
 }
 
 impl ManualClock {
     /// A clock reading 0 on both timelines, with the monotonic origin at 0.
     pub const fn new() -> Self {
         Self {
-            monotonic_ms: AtomicU64::new(0),
-            realtime_ms: AtomicU64::new(0),
+            monotonic_ms: Mutex::new(0),
+            realtime_ms: Mutex::new(0),
         }
     }
 
     /// Move both timelines forward. The only way a test makes time pass.
     pub fn advance(&self, by: Duration) {
         let ms = duration_ms_u64(by);
-        self.monotonic_ms.fetch_add(ms, Ordering::SeqCst);
-        self.realtime_ms.fetch_add(ms, Ordering::SeqCst);
+        // Poison-tolerant: a test fake must never panic, so a poisoned mutex
+        // is recovered rather than unwrapped.
+        *self.monotonic_ms.lock().unwrap_or_else(|e| e.into_inner()) += ms;
+        *self.realtime_ms.lock().unwrap_or_else(|e| e.into_inner()) += ms;
     }
 
     /// Jump the monotonic timeline to an absolute value.
@@ -106,7 +107,7 @@ impl ManualClock {
     /// for ordinary advancement — a backwards jump is not a thing real time
     /// does, and code that survives one is not necessarily correct.
     pub fn set_monotonic_ms(&self, ms: u64) {
-        self.monotonic_ms.store(ms, Ordering::SeqCst);
+        *self.monotonic_ms.lock().unwrap_or_else(|e| e.into_inner()) = ms;
     }
 }
 
@@ -118,11 +119,11 @@ impl Default for ManualClock {
 
 impl Clock for ManualClock {
     fn now_ms(&self) -> u64 {
-        self.monotonic_ms.load(Ordering::SeqCst)
+        *self.monotonic_ms.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn now_realtime_ms(&self) -> u64 {
-        self.realtime_ms.load(Ordering::SeqCst)
+        *self.realtime_ms.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -182,21 +183,22 @@ pub fn remaining_ms(deadline: u64) -> u64 {
 /// constantly — and propagating that would make every sleep in the system a
 /// lie. Retrying is the only correct behaviour here.
 pub fn sleep_ms(ms: u64) -> io::Result<()> {
-    // `libc::time_t` is deprecated on musl because its width is changing with
-    // the C library, so the seconds are computed as an `i64` and coerced to
-    // whatever `timespec::tv_sec` is declared as on the target being built.
-    // `tv_sec` is at least 32 bits on every platform in scope and 64 bits on
-    // every 64-bit one, so this cannot truncate a value that matters.
+    // `libc::time_t` is deprecated upstream (libc#1848: width changing with
+    // musl 1.2.0). The seconds are still computed through it and coerced to
+    // whatever `timespec::tv_sec` is declared as; `tv_sec` is at least 32 bits
+    // on every platform in scope and 64 bits on every 64-bit one, so this
+    // cannot truncate a value that matters.
+    #[allow(deprecated)]
     let secs = (ms / 1000) as libc::time_t;
-    // `tv_nsec` is `c_long`: 64 bits on every 64-bit target, 32 bits on
-    // 32-bit ones. An unadorned `as i64` compiles on x86_64 and breaks on
-    // i686 — this exact failure is what the CI's 32-bit jobs exist to catch.
-    // The value is bounded by construction (sub-second nanos), so the
-    // narrowing coercion cannot truncate.
-    let nsecs = ((ms % 1000) * 1_000_000) as libc::c_long;
+    // `tv_nsec` is `c_long` almost everywhere, but `i64` on x32 (whose
+    // syscalls stay 64-bit under 32-bit pointers) — this exact failure is
+    // what the CI's exotic-width jobs exist to catch. Computed wide, narrowed
+    // with `as _` at the field. The value is bounded by construction
+    // (sub-second nanos), so the narrowing cannot truncate.
+    let nsecs = ((ms % 1000) * 1_000_000) as i64;
     let req = libc::timespec {
         tv_sec: secs,
-        tv_nsec: nsecs,
+        tv_nsec: nsecs as _,
     };
     let mut rem = req;
     loop {

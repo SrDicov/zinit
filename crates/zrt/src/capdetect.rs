@@ -316,9 +316,18 @@ fn probe_setresuid() -> bool {
         // cannot change anything, so a probe has no side effect. If this
         // fails, the real drop would fail too, which is exactly what we want
         // to know before starting a service rather than after.
-        let ids = crate::sys::ids();
-        crate::sys::setresuid(ids.uid, ids.euid, ids.uid).is_ok()
-            && crate::sys::setresgid(ids.gid, ids.egid, ids.gid).is_ok()
+        // SAFETY: four getters and two "set every id to what it already is"
+        // calls. No pointers, no allocation, nothing retained; the probe
+        // cannot change an id, which is the whole point of it.
+        unsafe {
+            let (uid, euid, gid, egid) = (
+                libc::getuid(),
+                libc::geteuid(),
+                libc::getgid(),
+                libc::getegid(),
+            );
+            libc::setresuid(uid, euid, uid) == 0 && libc::setresgid(gid, egid, gid) == 0
+        }
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
@@ -445,7 +454,10 @@ fn probe_procfs() -> bool {
             Err(_) => return false,
         };
     let _ = crate::sys::close(dir);
-    crate::sys::stat_dev_ino(Path::new("/proc/self")).is_ok()
+    // `stat`/`lstat` on the mount point, via `std`: the probe asks "does this
+    // directory have a usable st_dev/st_ino", and std hands both back without
+    // a `mem::zeroed` struct this crate has to keep in sync with libc's.
+    std::fs::metadata("/proc/self").is_ok()
 }
 
 fn probe_reboot_style() -> Option<RebootStyle> {
@@ -506,6 +518,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn detection_on_this_linux_machine_is_correct() {
         let caps = detect();
 
@@ -529,6 +542,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn linux_capabilities_are_all_detected() {
         let caps = detect();
         // These are facts about the *kernel and the libc*, and every Linux of

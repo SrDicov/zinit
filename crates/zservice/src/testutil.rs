@@ -9,6 +9,26 @@
 
 use std::path::PathBuf;
 
+/// Absolute path of a `true` binary: `/bin/true` on Linux/BSD, with a
+/// `/usr/bin/true` fallback for macOS, which has no `/bin/true`. Probed, not
+/// `cfg`d: the filesystem is the truth and a new platform needs no code change.
+pub(crate) fn true_bin() -> &'static str {
+    if std::path::Path::new("/bin/true").exists() {
+        "/bin/true"
+    } else {
+        "/usr/bin/true"
+    }
+}
+
+/// Same as [`true_bin`], for `false`.
+pub(crate) fn false_bin() -> &'static str {
+    if std::path::Path::new("/bin/false").exists() {
+        "/bin/false"
+    } else {
+        "/usr/bin/false"
+    }
+}
+
 /// A fresh, writable, empty directory for one test.
 ///
 /// The directory is created (previous runs with the same `tag` are removed

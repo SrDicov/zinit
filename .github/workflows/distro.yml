@@ -1,0 +1,94 @@
+name: distro
+
+# x86_64 distro matrix: Void (glibc+musl), Alpine, Chimera, Arch, eweOS,
+# Gentoo. There is no shippable binary yet (workspace is lib-only until
+# the binary cut), so "testing zinit" here means the full test suite — above
+# all the real fork+exec spawn path and the reactor — on each distro's own
+# libc, coreutils and /bin layout. That is exactly the surface that bit us
+# on macOS (`/bin/true`, `nobody`, `/proc`): this job exists so the next
+# such assumption fails here first, on x86_64, in seconds.
+#
+# Shape: checkout on the host, then one `docker run -v` per leg. Job-level
+# `container:` cannot work here: node-based actions (checkout, cache) exec
+# node *inside* the container, and minimal images (void bare, chimera 7.6 MB)
+# lack the loader/libs it expects (`exec /__e/node24/bin/node: no such file
+# or directory`). Only build/test runs in-container; zero action steps do.
+# No cache either: a shared `target/` across libc variants is poison.
+# No clippy/fmt here (covered by `ci.yml`); build + test only.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: -D warnings
+
+jobs:
+  distro:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: void-glibc
+            image: ghcr.io/void-linux/void-glibc:latest
+            prep: xbps-install -Syu curl gcc
+          - name: void-musl
+            image: ghcr.io/void-linux/void-musl:latest
+            prep: xbps-install -Syu curl gcc
+          - name: alpine
+            image: alpine:latest
+            prep: apk add --no-cache curl gcc musl-dev
+          - name: chimera
+            image: chimeralinux/chimera:latest
+            # Empty apk index on the minimal image: update first. Chimera is a
+            # clang+musl distro with no gcc at all (hence no libgcc_s for
+            # rustup's musl cargo): take the distro `cargo` instead and skip
+            # rustup when a cargo already exists. Headers are `musl-devel`,
+            # and nothing provides `cc`, so link it to clang.
+            prep: apk update && apk add curl clang lld musl-devel cargo && (test -e /usr/bin/cc || ln -s clang /usr/bin/cc)
+          - name: arch
+            image: archlinux:latest
+            prep: pacman -Syu --noconfirm curl gcc
+          - name: eweos
+            # eweOS is Arch-derived, so pacman, not apk. `eweos/eweos` never
+            # existed on any registry; upstream publishes `eweos/docker` with
+            # metadata-action tags (`master`, no `latest`).
+            image: ghcr.io/eweos/docker:master
+            # No `gcc` package in eweOS repos: take the Arch-convention
+            # `base-devel` group instead. `cc` link as above.
+            prep: pacman -Syu --noconfirm base-devel curl && (test -e /usr/bin/cc || ln -s "$(command -v gcc || command -v clang)" /usr/bin/cc)
+          - name: gentoo
+            image: gentoo/stage3:latest
+            prep: true
+
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build + test inside ${{ matrix.name }}
+        # SETUID/SETGID: confined container roots get EPERM on the id-changing
+        # syscalls otherwise, which fails `dropping_to_nobody_as_root` — an
+        # environment gap, not a code bug, so the caps live here, not in a
+        # test skip.
+        run: >
+          docker run --rm
+          --cap-add=SETUID --cap-add=SETGID --cap-add=CHOWN
+          -v ${{ github.workspace }}:/work -w /work
+          ${{ matrix.image }}
+          sh -c '${{ matrix.prep }}
+          && (ldd --version 2>&1 || true) | head -1
+          && ls -l /bin/sh /bin/true /usr/bin/true 2>&1 || true
+          && id nobody 2>&1 || true
+          && (command -v cargo || curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs
+          | sh -s -- -y --default-toolchain stable --profile minimal)
+          && export PATH="$HOME/.cargo/bin:$PATH"
+          && cargo build --workspace --all-targets
+          && cargo test --workspace'

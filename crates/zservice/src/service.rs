@@ -35,19 +35,10 @@
 use std::io;
 use std::os::fd::RawFd;
 
-use zcore::{Event, Idx, Plan, Runtime, SignalKind, State, transition::arm_start_deadlines};
+use zcore::{Event, Idx, Plan, Runtime, SignalKind, transition::arm_start_deadlines};
 
 use crate::ready::{PollNeed, ReadyWait};
 use crate::spawn::{SpawnCtx, Spawned, spawn};
-
-/// Runtime states in which a child process is expected to exist.
-///
-/// Mirrors [`zcore::State::has_process`]: `Starting`, `Running`, `Stopping`.
-/// Kept as a local predicate so call sites read as policy ("only signal a
-/// service that has a process") rather than as a match on core internals.
-fn state_has_process(s: State) -> bool {
-    s.has_process()
-}
 
 /// One supervised service: the supervisor's per-service slot.
 ///
@@ -101,11 +92,6 @@ impl ManagedService {
             kill_sent: false,
             pending_warning: None,
         }
-    }
-
-    /// The frozen plan index.
-    pub const fn idx(&self) -> Idx {
-        self.idx
     }
 
     /// The main child pid, if a start is in flight or running.
@@ -351,7 +337,7 @@ impl ManagedService {
         plan: &Plan,
         now_ms: u64,
     ) -> Option<SignalKind> {
-        if self.pid.is_none() || !state_has_process(runtime.state_at(self.idx)) {
+        if self.pid.is_none() || !runtime.state_at(self.idx).has_process() {
             return None;
         }
         if self.term_sent_at.is_none() {
@@ -432,7 +418,7 @@ impl ManagedService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zcore::{Desired, LogSink, Ready, ServicePlan, StrictReady};
+    use zcore::{Desired, LogSink, Ready, ServicePlan, State, StrictReady};
 
     fn plan_with(sp: ServicePlan) -> Plan {
         Plan {
@@ -460,14 +446,13 @@ mod tests {
             log: Box::leak(Box::new(log)),
             service_name: leak(name),
             tty: None,
-            nice: None,
         };
         (plan, ctx)
     }
 
     fn true_ctx(name: &'static str, log: &'static LogSink) -> SpawnCtx<'static> {
         SpawnCtx {
-            command: "/bin/true",
+            command: crate::testutil::true_bin(),
             env: &[],
             run_as: None,
             rlimits: &[],
@@ -475,7 +460,6 @@ mod tests {
             log,
             service_name: name,
             tty: None,
-            nice: None,
         }
     }
 
@@ -489,30 +473,6 @@ mod tests {
     /// Mirrors [`ManagedService::group_is_signallable`] on purpose. The tests
     /// that go through this helper are testing the supervisor's signalling
     /// contract, and that contract is "never send a signal that cannot land".
-    /// Wait until `pid` has a child, i.e. it is past the point where a shell
-    /// has installed its traps and entered its loop.
-    ///
-    /// Reading `/proc/<pid>/task/<pid>/children` is Linux-only, and this is a
-    /// test helper on a machine that happens to be Linux, so that is fine — but
-    /// the timeout is what makes it safe to assert on: if the child never
-    /// shows up the helper returns and the following assertion fails with a
-    /// message about the mechanism rather than hanging.
-    fn wait_for_grandchild(pid: i32, timeout_ms: u64) {
-        let path = format!("/proc/{pid}/task/{pid}/children");
-        let deadline = zrt::clock::now_ms().saturating_add(timeout_ms);
-        loop {
-            if let Ok(text) = std::fs::read_to_string(&path)
-                && !text.trim().is_empty()
-            {
-                return;
-            }
-            if zrt::clock::now_ms() >= deadline {
-                panic!("{pid} never forked a child; the service is not running yet");
-            }
-            zrt::clock::sleep_ms(5).expect("sleep");
-        }
-    }
-
     fn kill_group(svc: &ManagedService, sig: zrt::signals::Signal) {
         let pid = svc.pid().expect("a spawned service has a pid");
         if svc.group_is_signallable() {
@@ -520,6 +480,20 @@ mod tests {
         } else {
             let _ = zrt::sys::kill_process(pid, sig);
         }
+    }
+
+    /// Plant the slot the way a successful start leaves it: `Starting`, with a
+    /// process and both deadlines armed far enough out to be the thing under
+    /// test. The same slot for every deadline test, so each one only spells out
+    /// what makes it different.
+    fn starting(rt: &mut Runtime) {
+        let s = rt.get_mut(0);
+        s.state = State::Starting;
+        s.pid = Some(99);
+        s.pgid = Some(99);
+        s.started_at = Some(0);
+        s.start_due_at = Some(60_000);
+        s.ready_due_at = Some(1_000);
     }
 
     #[test]
@@ -634,12 +608,7 @@ mod tests {
     fn lenient_ready_timeout_becomes_ready_with_a_warning() {
         let (plan, _) = base("s", Ready::Notify, LogSink::None);
         let mut rt = Runtime::from_plan(&plan);
-        rt.get_mut(0).state = State::Starting;
-        rt.get_mut(0).pid = Some(99);
-        rt.get_mut(0).pgid = Some(99);
-        rt.get_mut(0).started_at = Some(0);
-        rt.get_mut(0).start_due_at = Some(60_000);
-        rt.get_mut(0).ready_due_at = Some(1_000);
+        starting(&mut rt);
         let mut svc = ManagedService::new(0);
         let events = svc.check_deadlines(&rt, &plan, 1_000);
         assert!(events.contains(&Event::Ready(0)), "{events:?}");
@@ -656,12 +625,7 @@ mod tests {
     fn strict_ready_timeout_is_an_error_not_a_warning() {
         let (plan, _) = base("s", Ready::Strict(StrictReady::Notify), LogSink::None);
         let mut rt = Runtime::from_plan(&plan);
-        rt.get_mut(0).state = State::Starting;
-        rt.get_mut(0).pid = Some(99);
-        rt.get_mut(0).pgid = Some(99);
-        rt.get_mut(0).started_at = Some(0);
-        rt.get_mut(0).start_due_at = Some(60_000);
-        rt.get_mut(0).ready_due_at = Some(1_000);
+        starting(&mut rt);
         let mut svc = ManagedService::new(0);
         let events = svc.check_deadlines(&rt, &plan, 1_000);
         assert!(events.contains(&Event::ReadyTimeout(0)), "{events:?}");
@@ -675,10 +639,10 @@ mod tests {
     fn start_and_stop_timeouts_surface() {
         let (plan, _) = base("s", Ready::None, LogSink::None);
         let mut rt = Runtime::from_plan(&plan);
-        rt.get_mut(0).state = State::Starting;
-        rt.get_mut(0).pid = Some(1);
-        rt.get_mut(0).started_at = Some(0);
+        // `ready = none`: no handshake deadline, only the start deadline.
+        starting(&mut rt);
         rt.get_mut(0).start_due_at = Some(100);
+        rt.get_mut(0).ready_due_at = None;
         let mut svc = ManagedService::new(0);
         assert!(svc.check_deadlines(&rt, &plan, 50).is_empty());
         assert!(
@@ -792,9 +756,17 @@ mod tests {
         // refuses SIGTERM: the shell traps it, and `wait` is interrupted by a
         // trapped signal rather than by a dying child, so the loop only ends
         // when the shell itself is killed.
+        //
+        // The `: > flag` write is the loop-running signal: it runs after the
+        // `trap` line and before the loop, so the file existing means the
+        // traps are installed. A fixed sleep races that (comment above); the
+        // file measures the mechanism instead of the scheduler — portably, via
+        // the filesystem every platform under test has, instead of `/proc`.
+        let flag = crate::testutil::scratch("stubborn").join("looping");
         let ctx = SpawnCtx {
-            command: Box::leak(Box::new(String::from(
-                "trap '' TERM INT HUP; while :; do sleep 1 & wait $!; done",
+            command: Box::leak(Box::new(format!(
+                "trap '' TERM INT HUP; : > '{}'; while :; do sleep 1 & wait $!; done",
+                flag.display()
             ))),
             env: &[],
             run_as: None,
@@ -803,7 +775,6 @@ mod tests {
             log: Box::leak(Box::new(LogSink::None)),
             service_name: Box::leak(Box::new(String::from("stubborn"))),
             tty: None,
-            nice: None,
         };
         let mut rt = Runtime::from_plan(&plan);
         rt.set_desired(0, Desired::Up);
@@ -830,10 +801,15 @@ mod tests {
         // before a TERM can be ignored. A fixed sleep races that: the signal
         // can arrive first, hit the default disposition, and the service dies
         // at the TERM - which is exactly what the next assertion says must not
-        // happen. Waiting for the shell to have a child of its own is a
-        // observable "the loop is running" signal, so the test measures the
-        // mechanism instead of the scheduler.
-        wait_for_grandchild(svc.pid().expect("pid"), 2000);
+        // happen. The flag file written past the `trap` line is the observable
+        // "the loop is running" signal.
+        let deadline = zrt::clock::now_ms().saturating_add(2000);
+        while !flag.exists() {
+            if zrt::clock::now_ms() >= deadline {
+                panic!("shell never reached its loop; traps may not be installed");
+            }
+            zrt::clock::sleep_ms(5).expect("sleep");
+        }
         kill_group(&svc, zrt::signals::Signal::Term);
         zrt::clock::sleep_ms(50).expect("sleep");
         // Still alive: TERM was trapped. No escalation before the deadline.
@@ -882,7 +858,6 @@ mod tests {
             log: Box::leak(Box::new(LogSink::None)),
             service_name: Box::leak(Box::new(String::from("ntfy"))),
             tty: None,
-            nice: None,
         };
         let mut rt = Runtime::from_plan(&plan);
         rt.set_desired(0, Desired::Up);
@@ -892,6 +867,15 @@ mod tests {
         let ready = loop {
             if let Some(e) = svc.poll_ready(zrt::clock::now_ms()).expect("poll") {
                 break e;
+            }
+            // A dead child can never notify: EOF on the notify pipe reads as
+            // "not yet" forever, so any early child death (failed exec,
+            // signal, OOM) would otherwise burn the whole deadline and
+            // misreport as "notify never arrived". Fail fast with the status;
+            // a live child keeps waiting, which is the only case where
+            // waiting can still succeed.
+            if let Some(waited) = zrt::sys::waitpid_nohang(svc.pid().expect("pid")).expect("wait") {
+                panic!("child died before notifying: {:?}", waited.status);
             }
             assert!(zrt::clock::now_ms() < deadline, "notify never arrived");
             zrt::clock::sleep_ms(5).expect("sleep");
@@ -931,7 +915,6 @@ mod tests {
             log,
             service_name: Box::leak(Box::new(String::from("logged"))),
             tty: None,
-            nice: None,
         };
         let mut rt = Runtime::from_plan(&plan);
         let mut svc = ManagedService::new(0);

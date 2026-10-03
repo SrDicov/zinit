@@ -29,15 +29,14 @@
 //!   The supervisor sets what the service may *use*; the ceiling stays the
 //!   system's business.
 //! * **cgroup membership is joined before the drop.** Writing to
-//!   `cgroup.procs` needs privilege; after the drop it fails. On platforms
-//!   without cgroups the request is reported back as "not joined" so the
-//!   supervisor can print the `DESIGN.md` §8.1 aviso — never silently
-//!   swallowed.
+//!   `cgroup.procs` needs privilege; after the drop it fails. On a platform
+//!   without cgroups the request is *refused* — [`SpawnError::CgroupUnsupported`]
+//!   — so the supervisor can print the `DESIGN.md` §8.1 aviso naming the
+//!   service, never silently swallowing the limits the operator asked for.
 
 use std::ffi::CString;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::SpawnError;
 
@@ -49,8 +48,11 @@ use crate::SpawnError;
 /// hard limit is never moved.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ChildRlimit {
-    /// Kernel resource constant, e.g. `libc::RLIMIT_NOFILE`.
-    pub resource: libc::__rlimit_resource_t,
+    /// Kernel resource constant value (`RLIMIT_NOFILE`, …) as a plain `u32`.
+    /// `libc::setrlimit`/`getrlimit` take the now-private `__rlimit_resource_t`
+    /// (libc 0.2.189), so the constant is stored by value and cast back with
+    /// `as _` at the call, resolved against whatever the callee declares.
+    pub resource: u32,
     /// New soft limit to install.
     pub cur: u64,
     /// Hard limit, carried over untouched.
@@ -250,10 +252,15 @@ pub fn resolve_user_group(spec: &str) -> io::Result<(u32, u32)> {
 pub fn prepare_rlimits(rlimits: &[(String, u64)]) -> io::Result<Vec<ChildRlimit>> {
     let mut out = Vec::with_capacity(rlimits.len());
     for (name, value) in rlimits {
-        let resource: libc::__rlimit_resource_t = match name.as_str() {
-            "nofile" => libc::RLIMIT_NOFILE,
-            "nproc" => libc::RLIMIT_NPROC,
-            "as" => libc::RLIMIT_AS,
+        // `RLIMIT_*` is `u32` on glibc and `c_int` on musl/BSD, so this cast
+        // is a no-op on the targets that deny warnings and load-bearing on
+        // the others. Kept, with the lint silenced by reason, rather than
+        // bent to whichever target happens to be the host.
+        #[allow(clippy::unnecessary_cast)]
+        let resource: u32 = match name.as_str() {
+            "nofile" => libc::RLIMIT_NOFILE as u32,
+            "nproc" => libc::RLIMIT_NPROC as u32,
+            "as" => libc::RLIMIT_AS as u32,
             other => {
                 return Err(SpawnError::UnknownRlimit {
                     key: other.to_string(),
@@ -263,8 +270,9 @@ pub fn prepare_rlimits(rlimits: &[(String, u64)]) -> io::Result<Vec<ChildRlimit>
         };
         let mut current: libc::rlimit = unsafe { core::mem::zeroed() };
         // SAFETY: `current` is a live, aligned `rlimit`; `getrlimit` writes
-        // exactly one and retains nothing.
-        if unsafe { libc::getrlimit(resource, &raw mut current) } != 0 {
+        // exactly one and retains nothing. `resource as _` resolves against
+        // the callee's (private) resource type.
+        if unsafe { libc::getrlimit(resource as _, &raw mut current) } != 0 {
             return Err(io::Error::last_os_error());
         }
         out.push(ChildRlimit {
@@ -308,10 +316,10 @@ pub fn ensure_cgroup(service: &str, cgroup: &str) -> io::Result<PathBuf> {
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let _ = cgroup;
-        return Err(SpawnError::CgroupUnsupported {
+        Err(SpawnError::CgroupUnsupported {
             name: service.to_string(),
         }
-        .into());
+        .into())
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -336,21 +344,15 @@ pub fn ensure_cgroup(service: &str, cgroup: &str) -> io::Result<PathBuf> {
     }
 }
 
-/// Drop privileges to `(uid, gid)`, or fail loudly.
+/// The test-only twin of the child's privilege drop, run against our own ids.
 ///
-/// The exact `DESIGN.md` §9 sequence: `setgroups(0, NULL)` first (supplementary
-/// groups survive a careless `setuid`), then the gid, then the uid — via
-/// `setresgid`/`setresuid` where they exist (Linux: atomic, no window in which
-/// privilege can be regained), via `setgid`/`setuid` plus explicit
-/// verification elsewhere — and finally the check `getuid() == geteuid() ==
-/// uid && getgid() == getegid() == gid`. Any mismatch is `PermissionDenied`,
-/// never a service quietly running as root.
-///
-/// Callable from both sides: the forked child calls it on its single-exit
-/// path (no allocation on success), and tests call it in a forked child to
-/// exercise the real syscalls. Error messages are static strings — no
-/// allocation even on failure — so the child path stays allocation-free.
-pub fn drop_privileges(uid: u32, gid: u32) -> io::Result<()> {
+/// Test code only: production drops privileges in `spawn::child_step_ids`,
+/// which is allocation-free and has a single `execve` exit. This copy exists
+/// because the tests need to drive the syscall sequence and *report the error*,
+/// which a child's errno pipe cannot do. When the two ever disagree, this one
+/// is wrong.
+#[cfg(test)]
+pub(crate) fn drop_privileges(uid: u32, gid: u32) -> io::Result<()> {
     // Drop supplementary groups first — but only when there are any. A
     // `setgroups` call with nothing to drop still needs privilege on Linux,
     // so calling it unconditionally would make "stay exactly who I am" fail
@@ -359,13 +361,30 @@ pub fn drop_privileges(uid: u32, gid: u32) -> io::Result<()> {
     // the self-drop testable without root. `getgroups` itself needs no
     // privilege.
     let mut groups = [0 as libc::gid_t; 1];
-    // SAFETY: one-slot buffer with size 1; the return is the count (or -1).
-    // Only the count is read — the slot is never trusted when it is 0.
+    // SAFETY: one-slot buffer with size 1. A size-1 query reports EINVAL —
+    // not a count — when the process carries more than one supplementary
+    // group (container roots often do), which still means "groups exist".
+    // Anything else failing here is a real error.
     let ngroups = unsafe { libc::getgroups(1, groups.as_mut_ptr()) };
-    if ngroups < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if ngroups > 0 {
+    let has_groups = if ngroups < 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINVAL) {
+            return Err(e);
+        }
+        // EINVAL means "more groups than the one slot", so there are groups
+        // to shed — but only a privileged caller can finish the drop
+        // afterwards. An unprivileged attempt would shed the supplementary
+        // groups and then fail at setgid anyway (mutate-then-fail, which the
+        // fail-cleanly test forbids), so bail out untouched instead.
+        // SAFETY: getter, no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return Err(e);
+        }
+        true
+    } else {
+        ngroups > 0
+    };
+    if has_groups {
         // SAFETY: `setgroups(0, NULL)` is the documented empty-set form; the
         // kernel checks the count and never dereferences the pointer.
         if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
@@ -423,7 +442,8 @@ pub fn drop_privileges(uid: u32, gid: u32) -> io::Result<()> {
 ///
 /// A named wrapper rather than raw `libc::getuid` calls at every test site,
 /// so the tests read as "who am I" instead of four FFI invocations.
-pub fn current_ids() -> (u32, u32, u32, u32) {
+#[cfg(test)]
+pub(crate) fn current_ids() -> (u32, u32, u32, u32) {
     // SAFETY: four getters with no arguments and no preconditions.
     unsafe {
         (
@@ -435,35 +455,23 @@ pub fn current_ids() -> (u32, u32, u32, u32) {
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn is_numeric(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
-}
-
-#[allow(dead_code)]
-pub(crate) fn cstr_of(path: &Path) -> io::Result<CString> {
-    CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("path contains a NUL byte: {}", path.display()),
-        )
-    })
-}
-
-/// The passwd entry behind a name, for tests that need the primary gid.
-#[cfg(test)]
-pub(crate) fn passwd_of(name: &str) -> Option<(u32, u32)> {
-    resolve_user(name).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn resolves_nobody_to_65534() {
+    fn resolves_nobody_to_the_platform_convention() {
         let (uid, gid) = resolve_user("nobody").expect("nobody must exist");
-        assert_eq!(uid, 65534, "nobody is uid 65534 by convention");
+        // Pinned where the *platform* fixes it: -2 (4294967294) on macOS,
+        // 32767 on OpenBSD/NetBSD. On Linux it is the *distro's* (65534 on
+        // Arch/Alpine/Gentoo, 99 on Void) and no cfg can tell distros apart,
+        // so Linux only pins "unprivileged".
+        #[cfg(target_vendor = "apple")]
+        assert_eq!(uid, 4294967294, "nobody is -2 on macOS");
+        #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+        assert_eq!(uid, 32767, "nobody is 32767 on OpenBSD/NetBSD");
+        #[cfg(target_os = "linux")]
+        assert_ne!(uid, 0, "nobody must not be root");
         let _ = gid;
         // Deterministic: resolving twice gives the same answer.
         assert_eq!(resolve_user("nobody").expect("again"), (uid, gid));
@@ -497,9 +505,8 @@ mod tests {
 
     #[test]
     fn named_specs_resolve_each_side() {
-        // `nobody` exists with primary gid 65534 on this machine; where it
-        // does not, `resolve_user` already failed above and this would too —
-        // both answers come from the same source, which is the point.
+        // `nobody` resolves wherever the platform keeps it; both answers come
+        // from the same source, which is the point (exact uid pinned above).
         let (uid, gid) = resolve_user("nobody").expect("nobody");
         assert_eq!(resolve_user_group("nobody").expect("bare name"), (uid, gid));
     }
@@ -631,27 +638,34 @@ mod tests {
         match unsafe { libc::fork() } {
             -1 => panic!("fork failed"),
             0 => {
-                let ok = drop_privileges(65534, 65534).is_ok() && current_ids().0 == 65534;
+                // uid 0 without CAP_SETUID/CAP_SETGID (confined containers)
+                // fails the id-changing syscalls. The exit code carries the
+                // diagnosis: 2 is the environmental EPERM skip, printed by
+                // the parent assert below; anything else is a real failure (a
+                // regression on a capable host fails verification, which
+                // carries no errno, so it can never hide as a skip).
+                let code = match drop_privileges(65534, 65534) {
+                    Ok(()) if current_ids().0 == 65534 => 0,
+                    Ok(()) => 10,
+                    Err(e) => match e.raw_os_error() {
+                        Some(libc::EPERM) => 2,
+                        Some(n) => 100 + n.min(27),
+                        None => 3,
+                    },
+                };
                 // SAFETY: `_exit` never returns.
-                unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+                unsafe { libc::_exit(code) };
             }
             pid => {
                 let mut status = 0;
                 // SAFETY: blocking wait on our own child.
                 assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid);
+                let exit = libc::WEXITSTATUS(status);
                 assert!(
-                    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-                    "root must be able to drop to nobody"
+                    libc::WIFEXITED(status) && matches!(exit, 0 | 2),
+                    "root must be able to drop to nobody (child exit {exit})"
                 );
             }
         }
-    }
-
-    #[test]
-    fn cstr_helpers_reject_nul() {
-        assert!(cstr_of(Path::new("a\0b")).is_err());
-        assert!(cstr_of(Path::new("fine")).is_ok());
-        assert!(is_numeric("1000") && !is_numeric("") && !is_numeric("10a"));
-        let _ = passwd_of("nobody");
     }
 }

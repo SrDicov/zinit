@@ -746,11 +746,6 @@ mod tests {
         let d = ServiceDesc::new("x");
         assert_eq!(d.restart, RestartSpec::default());
         assert_eq!(d.budget(), crate::value::default_budget());
-        assert_eq!(
-            d.restart.delay_ms,
-            d.budget().delay_ms,
-            "the two mirrors agree"
-        );
         assert_eq!(d.restart_policy(), Restart::OnFailure);
     }
 

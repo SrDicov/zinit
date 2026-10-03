@@ -60,7 +60,7 @@ pub enum SpawnError {
         wanted: String,
     },
     /// A value in the spawn contract is malformed: an empty `argv` word, a
-    /// NUL byte in the environment, a `nice` outside `[-20, 19]`.
+    /// NUL byte in a path or in the environment.
     BadValue {
         /// The service concerned.
         name: String,
@@ -72,18 +72,6 @@ pub enum SpawnError {
     UnknownRlimit {
         /// The offending directive value.
         key: String,
-    },
-    /// A `user =` naming an account when no numeric ids were supplied.
-    ///
-    /// `zconfig` refuses to build a plan while an identity is unresolved, so
-    /// reaching this point means the supervisor skipped the resolution pass.
-    /// Refusing here is the backstop that keeps "run as root by accident"
-    /// unreachable even then.
-    IdentityUnresolved {
-        /// The service that asked to drop privileges.
-        name: String,
-        /// The account specification that was never resolved.
-        spec: String,
     },
     /// `log = syslog` before the syslog sink exists.
     ///
@@ -128,10 +116,6 @@ impl core::fmt::Display for SpawnError {
                 f,
                 "unknown rlimit `{key}`: expected `nofile`, `nproc` or `as`"
             ),
-            SpawnError::IdentityUnresolved { name, spec } => write!(
-                f,
-                "service `{name}` names account `{spec}` that was never resolved to a uid:gid pair"
-            ),
             SpawnError::SyslogNotWired { name } => write!(
                 f,
                 "service `{name}` asks for `log = syslog`, which is not wired yet; use `log = file`"
@@ -157,8 +141,7 @@ impl From<SpawnError> for io::Error {
             SpawnError::TargetHasNoProcess { .. }
             | SpawnError::EmptyCommand { .. }
             | SpawnError::BadValue { .. }
-            | SpawnError::UnknownRlimit { .. }
-            | SpawnError::IdentityUnresolved { .. } => io::ErrorKind::InvalidInput,
+            | SpawnError::UnknownRlimit { .. } => io::ErrorKind::InvalidInput,
             SpawnError::UnknownService { .. } | SpawnError::NotFound { .. } => {
                 io::ErrorKind::NotFound
             }
