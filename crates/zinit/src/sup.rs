@@ -295,10 +295,11 @@ impl Sup {
                 deadline = deadline.min(at);
             }
             let core = self.runtime.get(idx);
-            for due in [core.ready_due_at, core.start_due_at, core.stop_due_at] {
-                if let Some(at) = due {
-                    deadline = deadline.min(at);
-                }
+            for at in [core.ready_due_at, core.start_due_at, core.stop_due_at]
+                .into_iter()
+                .flatten()
+            {
+                deadline = deadline.min(at);
             }
             // A restart the core is holding back. `Bucket` does not say when its
             // delay expires, but the plan does — and waking one `delay_ms` from
