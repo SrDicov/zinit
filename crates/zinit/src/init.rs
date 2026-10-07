@@ -141,6 +141,9 @@ fn mount_minimum() {
     // bit and both cost nothing. `noexec` is deliberately not forced on
     // `/proc` and `/sys` — the kernel mounts those with its own opinions and
     // overriding them buys nothing an init needs.
+    // `c_ulong` is 32-bit on i686 and 64-bit on x86_64, so the cast is redundant
+    // on the former and load-bearing on the latter. Clippy only sees one side.
+    #[allow(clippy::unnecessary_cast)]
     let flags = (libc::MS_NOSUID | libc::MS_NODEV) as u32;
 
     if let Err(e) = std::fs::create_dir_all("/run") {
