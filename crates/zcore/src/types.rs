@@ -41,15 +41,6 @@ pub enum Desired {
 }
 
 impl Desired {
-    /// Parse the operator-facing spelling. Returns `None` for anything else.
-    pub const fn parse(s: &str) -> Option<Desired> {
-        match s.as_bytes() {
-            b"up" => Some(Desired::Up),
-            b"down" => Some(Desired::Down),
-            _ => None,
-        }
-    }
-
     /// True when the service should be running.
     pub const fn is_up(self) -> bool {
         matches!(self, Desired::Up)
@@ -85,21 +76,6 @@ impl State {
     pub const fn is_up(self) -> bool {
         matches!(self, State::Running)
     }
-
-    /// Legal `(State, Desired)` combinations.
-    ///
-    /// `(Starting, Down)` and `(Stopping, Up)` are reachable - a stop can be
-    /// interrupted, and a start can be cancelled. `(Running, Down)` is the
-    /// normal shutdown transient. `Stopped` pairs with both. `debug_assert` in
-    /// the runtime uses this to catch an impossible pair.
-    pub const fn pair_is_legal(self, d: Desired) -> bool {
-        match (self, d) {
-            (State::Stopped, _)
-            | (State::Starting, _)
-            | (State::Running, _)
-            | (State::Stopping, _) => true,
-        }
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -110,48 +86,13 @@ impl State {
 ///
 /// Deliberately a closed enum rather than a raw `i32`: `zcore` cannot include
 /// `libc`, and a closed set makes every send site reviewable at a glance.
-/// The numeric values are assigned in `zrt`, never here.
+/// The numeric values are assigned in `zrt`, never here. Only the two signals
+/// the supervisor itself issues are modelled; anything else an operator wants
+/// is not a thing this core sends.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum SignalKind {
     Term,
     Kill,
-    Cont,
-    Hup,
-    Int,
-    Usr1,
-    Usr2,
-}
-
-impl SignalKind {
-    /// Canonical lowercase name, as used in the control protocol.
-    pub const fn name(self) -> &'static str {
-        match self {
-            SignalKind::Term => "TERM",
-            SignalKind::Kill => "KILL",
-            SignalKind::Cont => "CONT",
-            SignalKind::Hup => "HUP",
-            SignalKind::Int => "INT",
-            SignalKind::Usr1 => "USR1",
-            SignalKind::Usr2 => "USR2",
-        }
-    }
-
-    /// Parse a signal name, case-insensitively, with or without a `SIG` prefix.
-    pub fn parse(s: &str) -> Option<SignalKind> {
-        let up: String = alloc::string::ToString::to_string(&s)
-            .trim_start_matches("SIG")
-            .to_ascii_uppercase();
-        Some(match up.as_str() {
-            "TERM" => SignalKind::Term,
-            "KILL" => SignalKind::Kill,
-            "CONT" => SignalKind::Cont,
-            "HUP" => SignalKind::Hup,
-            "INT" => SignalKind::Int,
-            "USR1" => SignalKind::Usr1,
-            "USR2" => SignalKind::Usr2,
-            _ => return None,
-        })
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -160,21 +101,9 @@ impl SignalKind {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub enum LogLevel {
-    Debug,
     Info,
     Warn,
     Error,
-}
-
-impl LogLevel {
-    pub const fn name(self) -> &'static str {
-        match self {
-            LogLevel::Debug => "debug",
-            LogLevel::Info => "info",
-            LogLevel::Warn => "warn",
-            LogLevel::Error => "error",
-        }
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -202,16 +131,6 @@ impl ServiceKind {
             ServiceKind::Target => "target",
             ServiceKind::Console => "console",
         }
-    }
-
-    pub fn parse(s: &str) -> Option<ServiceKind> {
-        Some(match s {
-            "process" => ServiceKind::Process,
-            "script" => ServiceKind::Script,
-            "target" => ServiceKind::Target,
-            "console" => ServiceKind::Console,
-            _ => return None,
-        })
     }
 
     /// Targets never fork, so readiness and restart policy are meaningless.
@@ -471,11 +390,6 @@ impl Bucket {
         }
     }
 
-    /// Tokens currently available, for `zctl status` output and tests.
-    pub fn tokens(&self) -> u32 {
-        self.tokens
-    }
-
     /// Forget the attempt history. `zctl kick` uses this to give an operator
     /// explicit control back after a budget has been exhausted.
     pub fn reset(&mut self, budget: &Budget, now_ms: u64) {
@@ -506,11 +420,6 @@ pub struct ServicePlan {
     pub kind: ServiceKind,
     /// Dependencies that must be `Running` before this service may start.
     pub required: Vec<Idx>,
-    /// Dependencies that are waited for but whose failure is not fatal.
-    pub optional: Vec<Idx>,
-    /// Reverse edges. Precomputed so `Exited` can find affected dependents
-    /// in O(1) instead of scanning every service's `required` list.
-    pub dependents: Vec<Idx>,
     pub restart: Restart,
     pub ready: Ready,
     /// Deadline for the process to exist and be confirmed alive.
@@ -531,8 +440,6 @@ pub struct ServicePlan {
     pub log: LogSink,
     /// `Some(uid, gid)` when the service drops privileges.
     pub run_as: Option<(u32, u32)>,
-    /// `ready = none` for targets, since they have no process to wait for.
-    pub is_critical: bool,
 }
 
 impl ServicePlan {
@@ -543,8 +450,6 @@ impl ServicePlan {
             name,
             kind: ServiceKind::Process,
             required: Vec::new(),
-            optional: Vec::new(),
-            dependents: Vec::new(),
             restart: Restart::default(),
             ready: Ready::default(),
             start_timeout_ms: 60_000,
@@ -553,17 +458,7 @@ impl ServicePlan {
             restart_budget: Budget::default(),
             log: LogSink::default(),
             run_as: None,
-            is_critical: true,
         }
-    }
-
-    /// True when every required dependency of `idx` is `Running`.
-    ///
-    /// This is the only readiness question the reconciler asks, and it is why
-    /// the frozen topological order is enough: no traversal, no recursion.
-    pub fn deps_satisfied(&self, idx: Idx, plan: &Plan, states: &[State]) -> bool {
-        let me = &plan.services[idx];
-        me.required.iter().all(|&d| states[d].is_up())
     }
 }
 
@@ -580,14 +475,6 @@ pub struct Plan {
 }
 
 impl Plan {
-    pub fn len(&self) -> usize {
-        self.services.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.services.is_empty()
-    }
-
     /// Look up a service by name. Linear, which is fine: the CLI does this
     /// once per invocation and the runtime keeps its own index.
     pub fn index_of(&self, name: &str) -> Option<Idx> {
@@ -693,13 +580,5 @@ mod tests {
         assert!(!Restart::OnFailure.wants_restart(Some(0)));
         assert!(Restart::OnFailure.wants_restart(None));
         assert!(Restart::Always.wants_restart(Some(0)));
-    }
-
-    #[test]
-    fn signal_parsing_is_case_and_prefix_insensitive() {
-        assert_eq!(SignalKind::parse("term"), Some(SignalKind::Term));
-        assert_eq!(SignalKind::parse("SIGKILL"), Some(SignalKind::Kill));
-        assert_eq!(SignalKind::parse("hup"), Some(SignalKind::Hup));
-        assert_eq!(SignalKind::parse("NOPE"), None);
     }
 }

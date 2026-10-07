@@ -11,7 +11,7 @@
 
 use alloc::string::String;
 
-use crate::types::{Idx, SignalKind, State};
+use crate::types::{Idx, SignalKind};
 
 pub use crate::types::LogLevel;
 
@@ -95,29 +95,6 @@ impl Action {
             Action::CascadeStop { idx, .. } => idx,
         }
     }
-
-    /// A short stable name, for logs and test failure messages.
-    pub const fn name(&self) -> &'static str {
-        match *self {
-            Action::Spawn(_) => "spawn",
-            Action::Signal { .. } => "signal",
-            Action::MarkReady(_) => "mark-ready",
-            Action::MarkDown { .. } => "mark-down",
-            Action::Log { .. } => "log",
-            Action::DepsChanged(_) => "deps-changed",
-            Action::CascadeStop { .. } => "cascade-stop",
-            Action::BudgetExhausted(_) => "budget-exhausted",
-            Action::GrantConsole(_) => "grant-console",
-            Action::RevokeConsole(_) => "revoke-console",
-            Action::Unpin(_) => "unpin",
-        }
-    }
-
-    /// True when the runtime must do something with file descriptors or
-    /// processes. Log-only actions are free to batch.
-    pub const fn needs_runtime(&self) -> bool {
-        !matches!(*self, Action::Log { .. } | Action::DepsChanged(_))
-    }
 }
 
 /// Convenience for building a log action without a `String` literal dance.
@@ -127,19 +104,6 @@ pub fn log(idx: Idx, level: LogLevel, message: impl Into<String>) -> Action {
         level,
         message: message.into(),
     }
-}
-
-/// A description of a service's state, for `zctl status` and logs.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct StatusLine {
-    pub idx: Idx,
-    pub name: alloc::string::String,
-    pub state: State,
-    pub desired: crate::types::Desired,
-    pub pid: Option<i32>,
-    pub restarts_used: u32,
-    pub restarts_available: u32,
-    pub uptime_ms: u64,
 }
 
 #[cfg(test)]
@@ -171,19 +135,5 @@ mod tests {
             assert_eq!(a.idx(), 7, "{a:?} reported the wrong index");
         }
         assert_eq!(actions.len(), 11, "a variant was added without a test case");
-    }
-
-    #[test]
-    fn log_and_deps_do_not_need_the_runtime() {
-        assert!(!log(0, LogLevel::Info, "x").needs_runtime());
-        assert!(!Action::DepsChanged(0).needs_runtime());
-        assert!(Action::Spawn(0).needs_runtime());
-        assert!(
-            Action::Signal {
-                idx: 0,
-                signal: SignalKind::Kill
-            }
-            .needs_runtime()
-        );
     }
 }

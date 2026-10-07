@@ -29,7 +29,7 @@ use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::RawFd;
 
-use zcore::{Idx, Ready, StrictReady};
+use zcore::{Ready, StrictReady};
 
 /// Re-run `ping` commands and retry `tcp` connects this often.
 ///
@@ -198,12 +198,6 @@ impl ReadyWait {
             ReadyWait::Tcp { .. } => "tcp",
         }
     }
-
-    /// The service this waiter was built for. Stored by the caller; this
-    /// accessor exists so call sites read uniformly.
-    pub fn for_service(idx: Idx) -> Idx {
-        idx
-    }
 }
 
 /// Drain a nonblocking notify read-end: any byte is readiness.
@@ -242,7 +236,7 @@ pub fn run_check(command: &str, timeout_ms: u64) -> io::Result<bool> {
             "ping command contains a NUL byte",
         )
     })?;
-    let envp = current_envp()?;
+    let envp = EnvBlock::capture()?;
     let argv = [
         sh.as_ptr(),
         dash_c.as_ptr(),
@@ -370,11 +364,6 @@ impl EnvBlock {
     }
 }
 
-/// Capture the current environment as raw parts for a pre-fork `execve`.
-fn current_envp() -> io::Result<EnvBlock> {
-    EnvBlock::capture()
-}
-
 /// Wait up to `timeout_ms` for `fd` to become readable.
 ///
 /// Returns `true` on readability (or hangup — for the wakeup-pipe use, a dead
@@ -413,6 +402,22 @@ fn poll_readable(fd: RawFd, timeout_ms: u64) -> io::Result<bool> {
 /// writable socket after a nonblocking connect means "finished", not
 /// "succeeded".
 pub fn probe_tcp(port: u16) -> io::Result<bool> {
+    let fd = new_probe_socket()?;
+    let ok = probe_tcp_connect(fd, port);
+    // SAFETY: `fd` is ours, opened two lines up.
+    unsafe {
+        libc::close(fd);
+    }
+    ok
+}
+
+/// A nonblocking, close-on-exec loopback probe socket.
+///
+/// Linux takes `SOCK_CLOEXEC | SOCK_NONBLOCK` atomically; Apple/BSD targets
+/// have neither flag, so the plain socket is flagged afterwards with the same
+/// `zrt::sys` setters the spawn path uses — same guarantees, two syscalls.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn new_probe_socket() -> io::Result<RawFd> {
     // SAFETY: `socket` takes three ints; `SOCK_STREAM | SOCK_CLOEXEC |
     // SOCK_NONBLOCK` on `AF_INET` is the canonical loopback-probe form.
     let fd = unsafe {
@@ -425,17 +430,51 @@ pub fn probe_tcp(port: u16) -> io::Result<bool> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    let ok = probe_tcp_connect(fd, port);
-    // SAFETY: `fd` is ours, opened two lines up.
-    unsafe {
-        libc::close(fd);
+    Ok(fd)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn new_probe_socket() -> io::Result<RawFd> {
+    // SAFETY: `socket` takes three ints; no flags exist here, so the fd is
+    // flagged below before it can leak anywhere.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
     }
-    ok
+    if let Err(e) = zrt::sys::set_cloexec(fd, true).and(zrt::sys::set_nonblocking(fd, true)) {
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    Ok(fd)
 }
 
 fn probe_tcp_connect(fd: RawFd, port: u16) -> io::Result<bool> {
     let ip: u32 = u32::from_be_bytes([127, 0, 0, 1]);
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )))]
     let addr = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: port.to_be(),
+        sin_addr: libc::in_addr { s_addr: ip.to_be() },
+        sin_zero: [0; 8],
+    };
+    // BSD-derived kernels carry the struct length in its first byte; Linux
+    // has no such field. The length is the size of the whole struct, which
+    // is also what `connect` is handed below.
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    let addr = libc::sockaddr_in {
+        sin_len: core::mem::size_of::<libc::sockaddr_in>() as u8,
         sin_family: libc::AF_INET as libc::sa_family_t,
         sin_port: port.to_be(),
         sin_addr: libc::in_addr { s_addr: ip.to_be() },
@@ -510,13 +549,25 @@ mod tests {
         port
     }
 
+    /// A port that is genuinely closed *right now*: bind-and-drop hands back a
+    /// port the OS may immediately reassign (ephemeral collision on a busy
+    /// shared runner), so keep the ones the probe itself confirms dark.
+    fn confirmed_closed_port() -> u16 {
+        for _ in 0..20 {
+            let port = tcp_closed_port();
+            if !probe_tcp(port).expect("probe runs") {
+                return port;
+            }
+        }
+        panic!("no genuinely closed port in 20 tries; the runner is out of ports");
+    }
+
     #[test]
     fn none_is_ready_at_once_and_needs_nothing() {
         let mut w = ReadyWait::None;
         assert!(w.check(0).expect("none is ready"));
         assert!(w.poll_need(0).is_idle());
         assert_eq!(w.name(), "none");
-        assert_eq!(ReadyWait::for_service(7), 7);
     }
 
     #[test]
@@ -595,7 +646,7 @@ mod tests {
 
     #[test]
     fn tcp_probe_reports_a_closed_port_as_not_ready() {
-        let port = tcp_closed_port();
+        let port = confirmed_closed_port();
         assert!(!probe_tcp(port).expect("probe runs"));
         let mut w = ReadyWait::Tcp {
             port,
@@ -606,8 +657,8 @@ mod tests {
 
     #[test]
     fn ping_true_is_ready_and_false_is_not() {
-        assert!(run_check("/bin/true", 5_000).expect("probe runs"));
-        assert!(!run_check("/bin/false", 5_000).expect("probe runs"));
+        assert!(run_check(crate::testutil::true_bin(), 5_000).expect("probe runs"));
+        assert!(!run_check(crate::testutil::false_bin(), 5_000).expect("probe runs"));
         assert!(!run_check("exit 3", 5_000).expect("nonzero is not ready"));
     }
 

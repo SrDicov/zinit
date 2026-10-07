@@ -5,8 +5,7 @@
 //! a decision that must be made **once**, at load, and never revisited:
 //!
 //! * names become [`Idx`],
-//! * required and optional edges become index lists,
-//! * reverse edges (`dependents`) are precomputed,
+//! * required edges become index lists,
 //! * a total order over the services is computed and stored twice - forward for
 //!   starting, reversed for stopping,
 //! * every policy the operator wrote (`restart`, `ready`, `log`, `run_as`,
@@ -24,15 +23,19 @@
 //! 2. `order_up` is a permutation of `0..services.len()`.
 //! 3. For every `i` and every `d` in `services[i].required`, `pos(d) < pos(i)`.
 //! 4. `order_down` is the exact reverse of `order_up`.
-//! 5. `dependents` is the exact inverse of `required`: for every `i` and every
-//!    `d` in `required[i]`, `i` is in `dependents[d]` - and nothing else is.
-//! 6. The result is a pure function of the input *set*. The same services in
+//! 5. The result is a pure function of the input *set*. The same services in
 //!    any input order produce byte-identical plans.
 //!
-//! Invariants 3 to 6 are the reason `dependents` is precomputed here and not in
-//! the runtime: a `Plan` that is immutable is a `Plan` whose reverse edges can
-//! be trusted, and "who depends on me" becomes a field read instead of a scan
-//! over every service's dependency list.
+//! Invariants 3 to 5 are the reason the order is computed here and not in the
+//! runtime: a `Plan` that is immutable is a `Plan` whose edges can be trusted,
+//! and "am I allowed to start" becomes an array comparison instead of a walk.
+//!
+//! There is deliberately no `dependents` reverse-edge list. Nothing in `zcore`
+//! ever asked "who depends on me": `deps_satisfied` walks `required` forward,
+//! one service at a time, and the cascade walks `order_up`/`order_down`
+//! topologically. It used to be built here, handed to the runtime, and never
+//! read once. `ponytail: precomputed inverse edges, drop for good unless a
+//! caller needs O(1) dependents; the counting pass was 35 lines of freeze`.
 //!
 //! # Algorithm choice: Kahn, iteratively, with a heap
 //!
@@ -191,42 +194,6 @@ fn freeze(graph: &Graph, findings: &mut Vec<Diagnostic>) -> core::result::Result
         }
         services.push(service_plan(graph, i, findings));
     }
-
-    // Reverse edges, built by counting: two passes, no per-node allocation and
-    // no sorting. `dependents[d]` receives every `i` that requires `d`; because
-    // `i` is pushed in ascending order each list is already sorted, and because
-    // `i` is pushed exactly once there are no duplicates.
-    let mut counts: Vec<usize> = vec![0; n];
-    for sp in &services {
-        for &d in &sp.required {
-            // Every index came out of this same graph, so this cannot be out of
-            // range. Asserted rather than checked: a real check here would be a
-            // branch in the hottest loop of the freeze, guarding an invariant
-            // that is established three lines above.
-            debug_assert!(d < n, "required edge points outside the plan");
-            counts[d] += 1;
-        }
-    }
-    let mut dependents: Vec<Vec<Idx>> = Vec::with_capacity(n);
-    for c in counts {
-        dependents.push(Vec::with_capacity(c));
-    }
-    for (i, sp) in services.iter().enumerate() {
-        for &d in &sp.required {
-            dependents[d].push(i);
-        }
-    }
-    // Hand each service its own list. `zip` moves them in order and stops at
-    // the shorter side, so a count mismatch shows up as the assertion below
-    // rather than as a panic or, worse, as a plan with a missing reverse edge.
-    let mut zip = services.iter_mut().zip(dependents);
-    for (sp, list) in &mut zip {
-        sp.dependents = list;
-    }
-    debug_assert!(
-        zip.next().is_none(),
-        "exactly one dependents list per service"
-    );
 
     Ok(Plan {
         services,
@@ -462,14 +429,10 @@ fn service_plan(graph: &Graph, i: Idx, findings: &mut Vec<Diagnostic>) -> Servic
     // Copy the edge lists out first, so the borrow of `graph` ends before the
     // owned `ServicePlan` is built.
     let required: Vec<Idx> = graph.required_of(i).to_vec();
-    let optional: Vec<Idx> = graph.optional_of(i).to_vec();
 
     let mut sp = ServicePlan::new(d.name.clone());
     sp.kind = d.kind;
     sp.required = required;
-    sp.optional = optional;
-    // Filled in by the counting pass in `freeze`, once the whole graph is known.
-    sp.dependents = Vec::new();
     sp.restart = d.restart.policy;
     sp.ready = d.ready.into_ready();
     sp.start_timeout_ms = timeout_or(d.start_timeout_ms, DEFAULT_START_TIMEOUT_MS);
@@ -478,7 +441,6 @@ fn service_plan(graph: &Graph, i: Idx, findings: &mut Vec<Diagnostic>) -> Servic
     sp.restart_budget = d.restart.budget;
     sp.log = log_of(d);
     sp.run_as = d.run_as.map(|r| (r.uid, r.gid));
-    sp.is_critical = d.is_critical;
 
     // A target has no process, so it has no handshake to wait for. Forcing
     // `Ready::None` here is what lets the runtime treat targets uniformly
@@ -561,7 +523,7 @@ fn default_log_path(name: &str) -> String {
 /// Test-only on purpose. These invariants are the module's contract with the
 /// runtime, and the strongest available statement of that contract is a
 /// function the production build does not carry: every success-path test calls
-/// it, and it checks the six numbered properties at the top of this file
+/// it, and it checks the numbered properties at the top of this file
 /// directly rather than trusting the code that claims to establish them.
 ///
 /// Written to be linear. The obvious formulation - `order_up.iter().position()`
@@ -596,34 +558,6 @@ fn assert_invariants(plan: &Plan) {
                 pos[d] < pos[i],
                 "{} must start before {}",
                 plan.services[d].name,
-                sp.name
-            );
-            assert!(
-                plan.services[d].dependents.contains(&i),
-                "{} must appear in the dependents of {}",
-                sp.name,
-                plan.services[d].name
-            );
-        }
-        for &o in &sp.optional {
-            assert!(o < n, "{} waits on a foreign index {o}", sp.name);
-        }
-    }
-
-    // dependents is the exact inverse of required, both directions - which is
-    // the property the runtime actually reads.
-    for (d, sp) in plan.services.iter().enumerate() {
-        let mut sorted = true;
-        for w in sp.dependents.windows(2) {
-            sorted &= w[0] < w[1];
-        }
-        assert!(sorted, "the dependents of {} must be sorted", sp.name);
-        for &i in &sp.dependents {
-            assert!(i < n, "{} lists a foreign dependent {i}", sp.name);
-            assert!(
-                plan.services[i].required.contains(&d),
-                "{} must require {}",
-                plan.services[i].name,
                 sp.name
             );
         }
@@ -719,7 +653,7 @@ mod tests {
     use zcore::ServiceKind;
     use zcore::{Budget, MAX_SERVICES, Restart, StrictReady};
 
-    use crate::value::{Duration, LogSpec, ReadySpec, RestartSpec, RunAs};
+    use crate::value::{LogSpec, ReadySpec, RestartSpec, RunAs};
 
     fn desc(name: &str) -> ServiceDesc {
         let mut d = ServiceDesc::new(String::from(name));
@@ -777,8 +711,8 @@ mod tests {
     #[test]
     fn an_empty_description_set_freezes_to_an_empty_plan() {
         let p = plan_of(vec![]);
-        assert!(p.is_empty());
-        assert_eq!(p.len(), 0);
+        assert_eq!(p.services.len(), 0);
+        assert_eq!(p.services.len(), 0);
         assert!(p.order_up.is_empty());
         assert!(p.order_down.is_empty());
     }
@@ -786,7 +720,7 @@ mod tests {
     #[test]
     fn a_lone_service_is_its_own_order() {
         let p = plan_of(vec![desc("sshd")]);
-        assert_eq!(p.len(), 1);
+        assert_eq!(p.services.len(), 1);
         assert_eq!(p.order_up, vec![0]);
         assert_eq!(p.order_down, vec![0]);
         assert_eq!(p.services[0].name, "sshd");
@@ -845,10 +779,6 @@ mod tests {
             .map(|&i| p.services[i].name.as_str())
             .collect();
         assert_eq!(names, ["a", "b", "c", "d"]);
-        assert_eq!(p.services[p.index_of("a").unwrap()].dependents, vec![1, 2]);
-        assert_eq!(p.services[p.index_of("b").unwrap()].dependents, vec![3]);
-        assert_eq!(p.services[p.index_of("c").unwrap()].dependents, vec![3]);
-        assert!(p.services[p.index_of("d").unwrap()].dependents.is_empty());
     }
 
     #[test]
@@ -918,20 +848,25 @@ mod tests {
         let p = plan_of(descs);
         assert_eq!(p.order_up, (0..N).collect::<Vec<Idx>>());
         // Reverse edges: service 0 is required by all the others.
-        assert_eq!(p.services[0].dependents.len(), N - 1);
-        assert_eq!(p.services[N - 1].dependents.len(), 0);
         assert_eq!(required_pairs(&p).len(), N * (N - 1) / 2);
     }
 
     #[test]
-    fn an_optional_edge_is_waited_for_but_never_blocks_the_order() {
+    fn an_optional_edge_orders_without_becoming_a_blocker() {
+        // The plan does not store optional edges: `Runtime::deps_satisfied`
+        // reads `required` only, which is exactly what makes `Optional` never
+        // block (DESIGN §4.1, invariant 5). The ordering still honours the
+        // optional edge, and that comes from the graph's indegree, not from the
+        // service's own edge list.
         let p = plan_of(vec![
             desc_with("a", ServiceKind::Process, &[], &[]),
             desc_with("b", ServiceKind::Process, &[], &["a"]),
         ]);
         let b = p.index_of("b").unwrap();
-        assert_eq!(p.services[b].optional, vec![0]);
-        assert!(p.services[b].required.is_empty());
+        assert!(
+            p.services[b].required.is_empty(),
+            "optional is not required"
+        );
         assert_eq!(p.order_up, vec![0, 1]);
     }
 
@@ -945,15 +880,13 @@ mod tests {
             desc_with("b", ServiceKind::Process, &[], &["a"]),
         ]);
         assert_eq!(p.order_up, vec![0, 1]);
-        assert!(p.services[0].optional.contains(&1));
-        assert!(p.services[1].optional.contains(&0));
     }
 
     #[test]
     fn an_unknown_optional_edge_disappears_from_the_plan() {
         let p = plan_of(vec![desc_with("b", ServiceKind::Process, &[], &["ghost"])]);
         assert!(
-            p.services[0].optional.is_empty(),
+            p.services[0].required.is_empty(),
             "a dangling edge is not an index"
         );
     }
@@ -982,7 +915,6 @@ mod tests {
         d.restart = RestartSpec::parse("always").expect("valid");
         d.start_timeout_ms = 12_345;
         d.stop_timeout_ms = 6_789;
-        d.is_critical = false;
         d.log = LogSpec::parse("syslog").expect("valid");
         d.run_as = Some(RunAs {
             uid: 1000,
@@ -998,7 +930,6 @@ mod tests {
         assert_eq!(sp.stop_timeout_ms, 6_789);
         assert_eq!(sp.log, LogSink::Syslog);
         assert_eq!(sp.run_as, Some((1000, 1001)));
-        assert!(!sp.is_critical);
         assert_eq!(sp.ready, Ready::Strict(StrictReady::Tcp(8443)));
     }
 
@@ -1093,13 +1024,11 @@ mod tests {
     }
 
     #[test]
-    fn the_restart_delay_reaches_the_budget_and_not_just_the_mirror() {
-        // `RestartSpec` carries `delay_ms` *and* `budget.delay_ms`. Freezing the
-        // wrong one is a bug that only shows up as a service that ignores its
-        // own `restart-delay`, so the whole pair is pinned here.
-        let spec = RestartSpec::parse("3 restarts per 10s")
-            .expect("valid")
-            .with_delay(Duration::from_millis(1500));
+    fn the_restart_delay_reaches_the_frozen_budget() {
+        // Freezing the wrong number is a bug that only shows up as a service
+        // that ignores its own `restart-delay`, so it is pinned here.
+        let mut spec = RestartSpec::parse("3 restarts per 10s").expect("valid");
+        spec.budget.delay_ms = 1500;
         assert_eq!(spec.budget.capacity, 3);
         assert_eq!(spec.budget.window_ms, 10_000);
         assert_eq!(spec.budget.delay_ms, 1500);
@@ -1501,7 +1430,7 @@ mod tests {
             })
             .collect();
         let p = build_plan(&at).expect("the cap is inclusive");
-        assert_eq!(p.len(), MAX_SERVICES);
+        assert_eq!(p.services.len(), MAX_SERVICES);
         assert_eq!(p.order_up.len(), MAX_SERVICES);
 
         let over: Vec<ServiceDesc> = (0..=MAX_SERVICES)

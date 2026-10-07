@@ -141,6 +141,29 @@ jobs:
         if: matrix.components != ''
         run: cargo fmt --all --check
 
+  # macOS aarch64: native runner, proves the kqueue backend compiles and the
+  # workspace tests pass outside Linux. One job, not a matrix.
+  macos:
+    name: macos-aarch64
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-macos-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-macos-
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo fmt --all --check
+
   # ══════════════════════════════════════════════════════════════════════════
   # 2. Cross-build the tier-2 glibc sweep. Build is the evidence; running
   #    is covered by the native job and by the BSD VMs.
@@ -153,10 +176,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: armv7-unknown-linux-gnueabihf, linker: arm-linux-gnueabihf-gcc }
-          - { target: riscv64gc-unknown-linux-gnu, linker: riscv64-linux-gnu-gcc }
-          - { target: x86_64-unknown-linux-gnux32, linker: gcc, note: "x32 ABI: 64-bit registers, 32-bit pointers" }
-          - { target: powerpc64le-unknown-linux-gnu, linker: powerpc64le-linux-gnu-gcc }
+          - { target: armv7-unknown-linux-gnueabihf, linker: arm-linux-gnueabihf-gcc, apt: gcc-arm-linux-gnueabihf }
+          - { target: riscv64gc-unknown-linux-gnu, linker: riscv64-linux-gnu-gcc, apt: gcc-riscv64-linux-gnu }
+          - { target: x86_64-unknown-linux-gnux32, linker: gcc, apt: gcc-multilib libc6-dev-i386, note: "x32 ABI: 64-bit registers, 32-bit pointers" }
+          - { target: powerpc64le-unknown-linux-gnu, linker: powerpc64le-linux-gnu-gcc, apt: gcc-powerpc64le-linux-gnu }
 
     steps:
       - uses: actions/checkout@v5
@@ -165,12 +188,12 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross toolchain
+        # One package per leg. Ubuntu's cross gcc packages all declare
+        # `Conflicts: gcc-multilib`, so installing the whole set at once is
+        # unsatisfiable; only the x32 leg needs multilib (32-bit crt + libc).
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            gcc-arm-linux-gnueabihf \
-            gcc-riscv64-linux-gnu \
-            gcc-powerpc64le-linux-gnu gcc-multilib
+          sudo apt-get install -y ${{ matrix.apt }}
           echo "CARGO_TARGET_$(echo ${{ matrix.target }} | tr a-z- A-Z_)_LINKER=${{ matrix.linker }}" >> "$GITHUB_ENV"
 
       - name: Build
@@ -183,12 +206,18 @@ jobs:
         run: cargo test --workspace --target ${{ matrix.target }} --no-run
 
   # ══════════════════════════════════════════════════════════════════════════
-  # 2b. Cross-build the musl sweep with real musl toolchains.
+  # 2b. Cross-build the musl sweep.
   #
-  # Ubuntu ships no musl cross compilers (there is no
-  # `gcc-arm-linux-musleabihf` package), and linking a musl target with a
-  # glibc linker is lying about what was tested. musl.cc provides static,
-  # self-contained cross toolchains; they are fetched once and cached.
+  #    The CRT comes from rustup (`lib/rustlib/<t>/lib/self-contained/`, musl
+  #    targets are `crt-static` by default), but the *link driver* must
+  #    understand the target: the runner's x86_64 `/usr/bin/ld` chokes on
+  #    ARM erratum flags (`--fix-cortex-a53-843419`) and rejects foreign
+  #    objects outright. Each leg therefore installs its matching gnu cross
+  #    gcc (a driver, not a libc — nothing glibc links in: `-nostartfiles
+  #    -nodefaultlibs` with the self-contained sysroot) and points
+  #    `CARGO_TARGET_*_LINKER` at it, the same per-leg pattern as `linux-cross`.
+  #    (musl.cc cross toolchains were tried first and time out from GitHub's
+  #    runners: "curl: (28) Failed to connect to musl.cc port 443".)
   # ══════════════════════════════════════════════════════════════════════════
   linux-musl-cross:
     name: musl ${{ matrix.target }}
@@ -198,9 +227,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: armv7-unknown-linux-musleabihf, triplet: arm-linux-musleabihf }
-          - { target: aarch64-unknown-linux-musl, triplet: aarch64-linux-musl }
-          - { target: riscv64gc-unknown-linux-musl, triplet: riscv64-linux-musl }
+          - { target: armv7-unknown-linux-musleabihf, apt: gcc-arm-linux-gnueabihf, linker: arm-linux-gnueabihf-gcc }
+          - { target: aarch64-unknown-linux-musl, apt: gcc-aarch64-linux-gnu, linker: aarch64-linux-gnu-gcc }
+          - { target: riscv64gc-unknown-linux-musl, apt: gcc-riscv64-linux-gnu, linker: riscv64-linux-gnu-gcc }
 
     steps:
       - uses: actions/checkout@v5
@@ -208,33 +237,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache musl.cc toolchain
-        id: musl-cache
-        uses: actions/cache@v4
-        with:
-          path: /tmp/musl-cross/${{ matrix.triplet }}
-          key: musl-cc-${{ matrix.triplet }}-v12
-
-      - name: Install musl cross toolchain
-        if: steps.musl-cache.outputs.cache-hit != 'true'
+      - name: Install target-aware link driver
         run: |
-          set -euo pipefail
-          mkdir -p /tmp/musl-cross
-          curl -sSfL "https://musl.cc/${{ matrix.triplet }}-cross.tgz" \
-            -o /tmp/musl-cross/toolchain.tgz
-          tar -xzf /tmp/musl-cross/toolchain.tgz -C /tmp/musl-cross
-          rm /tmp/musl-cross/toolchain.tgz
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+          echo "CARGO_TARGET_$(echo ${{ matrix.target }} | tr a-z- A-Z_)_LINKER=${{ matrix.linker }}" >> "$GITHUB_ENV"
 
       - name: Build
-        run: |
-          linker="/tmp/musl-cross/${{ matrix.triplet }}-cross/bin/${{ matrix.triplet }}-gcc"
-          test -x "$linker" || { echo "::error::musl linker missing: $linker"; exit 1; }
-          # GITHUB_ENV only takes effect in *later* steps, so export for this
-          # shell too; the file write covers the test-compile step below.
-          var="CARGO_TARGET_$(echo ${{ matrix.target }} | tr a-z- A-Z_)_LINKER"
-          export "$var=$linker"
-          echo "$var=$linker" >> "$GITHUB_ENV"
-          cargo build --workspace --target ${{ matrix.target }}
+        run: cargo build --workspace --target ${{ matrix.target }}
 
       - name: Test compile only
         run: cargo test --workspace --target ${{ matrix.target }} --no-run
@@ -264,8 +274,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
+        # `targets:` is deliberately absent. `-Z build-std` compiles std from
+        # `rust-src`, so the prebuilt `rust-std` for the target is never used
+        # — and for a tier-3 target there is not one, so asking rustup for it
+        # failed the whole step with "component 'rust-std' ... unavailable for
+        # download". `rust-src` is the only component build-std needs.
         with:
-          targets: ${{ matrix.target }}
+          components: rust-src
 
       - name: Check with a hand-built std
         # NOTE: RUSTFLAGS is neutralized for this step on purpose. `-D warnings`
@@ -282,6 +297,15 @@ jobs:
 
   # ══════════════════════════════════════════════════════════════════════════
   # 4. The toolchain axis: gcc / clang / lld as the link driver.
+  #
+  #    LLD is covered twice on purpose: once through the clang driver
+  #    (`ld: lld`) and once as rust-lld itself. A bare rust-lld cannot be a
+  #    link *driver* for this target, though: rustc picks the linker's flavour
+  #    from the file name, so rust-lld must be invoked as `rust-lld -flavor
+  #    gnu`, and the glibc target ships no CRT objects for it to start with -
+  #    `rust-std` has `x86_64-unknown-linux-gnu/lib/self-contained/` empty.
+  #    A cc driver in front of lld is not a workaround, it is the design: the
+  #    CRT objects come from the distribution that owns them.
   # ══════════════════════════════════════════════════════════════════════════
   linkers:
     name: driver ${{ matrix.linker }}
@@ -294,8 +318,7 @@ jobs:
           - { linker: cc, cc: gcc, desc: "GNU ld, the distribution default" }
           - { linker: clang, cc: clang, desc: "GNU ld via the clang driver" }
           - { linker: clang, cc: clang, ld: lld, desc: "LLD via clang" }
-          - { linker: rust-lld, cc: clang, desc: "rust-lld, no system linker at all" }
-          - { linker: clang, cc: clang, pie: false, desc: "non-PIE, for kernels built without relocation support" }
+          - { linker: clang, cc: clang, nonpie: true, desc: "non-PIE, for kernels built without relocation support" }
 
     steps:
       - uses: actions/checkout@v5
@@ -315,21 +338,35 @@ jobs:
         # argument and rustc reports "multiple input filenames". None of the
         # paths here contain spaces, so quotes are unnecessary as well as
         # harmful.
+        #
+        # NOTE: `nonpie` is a flag, never `pie: false`. GitHub casts a missing
+        # matrix key to 0 and `false` to 0, so `matrix.pie == false` is TRUE for
+        # every leg that merely omits the key. All four legs were therefore
+        # built `-C relocation-model=static` and then linked PIE, which is the
+        # one combination rust-lld refuses.
         run: |
           set -euo pipefail
           case "${{ matrix.linker }}" in
-            cc)       ln -sf "$(command -v gcc)"   "$RUNNER_TEMP/xlinker" ;;
-            clang)    ln -sf "$(command -v clang)" "$RUNNER_TEMP/xlinker" ;;
-            rust-lld) ln -sf "$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld" \
-                              "$RUNNER_TEMP/xlinker" ;;
+            cc)    ln -sf "$(command -v gcc)"   "$RUNNER_TEMP/xlinker" ;;
+            clang) ln -sf "$(command -v clang)" "$RUNNER_TEMP/xlinker" ;;
           esac
           {
-            echo "RUSTFLAGS=-C linker=$RUNNER_TEMP/xlinker -C link-arg=-fuse-ld=${{ matrix.ld || 'bfd' }} ${{ matrix.pie == false && '-C relocation-model=static -C link-arg=-no-pie' || '' }}"
+            echo "RUSTFLAGS=-C linker=$RUNNER_TEMP/xlinker -C link-arg=-fuse-ld=${{ matrix.ld || 'bfd' }} ${{ matrix.nonpie && '-C relocation-model=static -C link-arg=-no-pie' || '' }}"
+            # rustdoc drives its own link and reads RUSTDOCFLAGS, not
+            # RUSTFLAGS, so without this the doctests are linked by whatever
+            # the runner defaults to - the one thing this job is here to test.
+            echo "RUSTDOCFLAGS=-C linker=$RUNNER_TEMP/xlinker -C link-arg=-fuse-ld=${{ matrix.ld || 'bfd' }}"
           } >> "$GITHUB_ENV"
           echo "CC=${{ matrix.cc }}" >> "$GITHUB_ENV"
 
       - run: cargo build --workspace --all-targets
-      - run: cargo test --workspace
+      - name: Test
+        # The non-PIE leg skips doctests, and only there. rustdoc links them
+        # itself without the `-C link-arg=-no-pie` above, so it would assemble
+        # a PIE out of the deliberately non-PIC rlibs: guaranteed
+        # `R_X86_64_32 ... recompile with -fPIC`. Every binary and every test
+        # binary this leg is about still links non-PIE.
+        run: ${{ matrix.nonpie && 'cargo test --workspace --lib --tests' || 'cargo test --workspace' }}
 
   # ══════════════════════════════════════════════════════════════════════════
   # 5. FreeBSD, OpenBSD, NetBSD.
@@ -415,17 +452,29 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
+        # `targets:` is deliberately absent. `-Z build-std` compiles std from
+        # `rust-src`, so the prebuilt `rust-std` for the target is never used
+        # — and for a tier-3 target there is not one, so asking rustup for it
+        # failed the whole step with "component 'rust-std' ... unavailable for
+        # download". `rust-src` is the only component build-std needs.
         with:
-          targets: ${{ matrix.target }}
+          components: rust-src
       - name: Check
         # Same RUSTFLAGS neutralization as linux-tier3: `-D warnings` must not
         # leak into the hand-built std.
+        #
+        # `-Z build-std-features=panic_immediate_abort` is deliberately absent.
+        # It used to be a no-op cfg passed down to the hand-built core; nightly
+        # has since promoted it to a real panic strategy, so asking for it here
+        # makes `core` itself refuse to compile ("panic_immediate_abort is now
+        # a real panic strategy!") before zrt is ever reached. The workspace
+        # already selects `panic = "abort"` per profile, which is the supported
+        # way to get the same result.
         env:
           RUSTFLAGS: ""
         run: |
           cargo +nightly check --workspace --target ${{ matrix.target }} \
-            -Z build-std=std,core,alloc,panic_unwind \
-            -Z build-std-features=panic_immediate_abort
+            -Z build-std=std,core,alloc,panic_unwind
 
   # ══════════════════════════════════════════════════════════════════════════
   # 6. The purity claims, asserted against the source rather than inferred
@@ -551,61 +600,12 @@ jobs:
           echo "libc is compatible with GPL-3"
 
   # ══════════════════════════════════════════════════════════════════════════
-  # 8. The size budget.
+  # 8. The size-budget gate used to live here. It measured three binaries that
+  #    do not exist (`zinit`/`zctl`/`zcheck` are lib-only crates: no `[[bin]]`,
+  #    no `main.rs` anywhere), so `total` was always 0 and `0 > 1024` never
+  #    fired — a green job measuring nothing. It comes back in the commit that
+  #    adds the first `main.rs`, resuming with the 1 MiB budget it enforced.
   #
-  # "Extremely lightweight" is a measurable claim, and a claim nobody measures
-  # is a claim that quietly stops being true. This job fails the build when
-  # the binary grows past the budget, which turns "keep it small" from a
-  # sentiment into a constraint the compiler enforces.
-  # ══════════════════════════════════════════════════════════════════════════
-  size:
-    name: size budget
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Build fully optimised and stripped
-        run: cargo build --release --workspace
-
-      - name: Measure
-        id: size
-        run: |
-          set -euo pipefail
-          total=0
-          {
-            for bin in target/release/zinit target/release/zctl target/release/zcheck; do
-              [ -f "$bin" ] || continue
-              bytes=$(stat -c%s "$bin")
-              kib=$(( bytes / 1024 ))
-              total=$(( total + kib ))
-              printf '| `%s` | %s KiB |\n' "$(basename "$bin")" "$kib"
-            done
-          } | tee size-table.md
-          echo "total=$total" >> "$GITHUB_OUTPUT"
-          echo "TOTAL_KIB=$total" >> "$GITHUB_ENV"
-
-      - name: Enforce the budget
-        # A PID 1 has to be resident and hot constantly. 1 MiB across all
-        # binaries is generous for a design this small and tight enough to
-        # catch a dependency that should not have been added.
-        run: |
-          set -euo pipefail
-          BUDGET_KIB=1024
-          if [ "$TOTAL_KIB" -gt "$BUDGET_KIB" ]; then
-            echo "::error::total release size is ${TOTAL_KIB} KiB, budget is ${BUDGET_KIB} KiB"
-            cat size-table.md
-            exit 1
-          fi
-          echo "total ${TOTAL_KIB} KiB of ${BUDGET_KIB} KiB budget"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: size-table
-          path: size-table.md
-
-  # ══════════════════════════════════════════════════════════════════════════
   # 9. MSRV, docs, and a nightly smoke build.
   # ══════════════════════════════════════════════════════════════════════════
   msrv:

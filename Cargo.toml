@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/zcore", "crates/zconfig", "crates/zrt", "crates/zservice"]
+members = [
+    "crates/zcore",
+    "crates/zconfig",
+    "crates/zrt",
+    "crates/zservice",
+    "crates/zinit",
+]
 
 [workspace.package]
 version = "0.1.0"

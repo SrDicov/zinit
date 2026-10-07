@@ -16,6 +16,9 @@
 | `zctl` | CLI | ⏳ fase 3 | |
 | `zcheck` | `zinit check` — valida sin arrancar | ⏳ fase 3 | |
 
+Los crates son librerías: no hay `[[bin]]` ni `main.rs` en el árbol todavía, y por eso no
+existe ningún job de *size budget* que medir. Vuelve con el primer `main.rs`.
+
 Falta el pegamento: el reactor de `zrt` ya existe, pero aún no hay un `main()` que lo
 conecte con el reconciliador de `zcore` y ejecute los `Action`. Esa es la fase 1.
 
@@ -85,15 +88,9 @@ inmutable*. Eso elimina por construcción la clase de fallo "un bug aquí y no a
 
 ## Estructura
 
-| Crate | Qué es | Estado |
-|---|---|---|
-| `zcore` | Máquina de estados pura. Sin E/S, sin deps. | ✅ 49 tests |
-| `zconfig` | Parser de descripciones, grafo, plan congelado. | 🚧 integración |
-| `zrt` | `libc`: reactor ×3, señales, fork/exec, mount, cgroup, utmp | ⏳ fase 1 |
-| `zservice` | Ciclo de vida de un servicio, readiness, rlimits | ⏳ fase 1 |
-| `zctl` | CLI | ⏳ fase 3 |
-| `zcheck` | `zinit check` — valida sin arrancar | ⏳ fase 3 |
-| `zinit` | Binario: `--init` y `--sup` | ⏳ fase 1 |
+La tabla de arriba es el estado. Ésta es sólo el índice de módulos, y `zrt` no tiene
+`cgroup`, `utmp` ni nada más: son `capdetect`, `childproc`, `clock`, `reactor`, `report`,
+`signals`, `sys`.
 
 ## Compilar y testear
 
@@ -138,7 +135,8 @@ Del análisis de 32 000 líneas de runit y dinit (44 bugs confirmados):
 
 ## Licencia
 
-Apache-2.0.
+GPL-3.0-or-later (`Cargo.toml`, `LICENSE`). La única dependencia, `libc`, es MIT — compatible,
+y el job `licence` de CI falla el build si deja de serlo.
 
 ## Contribución
 

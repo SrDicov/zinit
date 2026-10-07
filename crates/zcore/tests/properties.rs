@@ -126,12 +126,6 @@ fn make_plan(spec: &[(&str, &[&str])], kind: &[ServiceKind]) -> Plan {
     assert_eq!(order.len(), n, "the test spec contains a cycle");
     plan.order_up = order.clone();
     plan.order_down = order.into_iter().rev().collect();
-    // Reverse edges.
-    for i in 0..n {
-        for d in plan.services[i].required.clone() {
-            plan.services[d].dependents.push(i);
-        }
-    }
     plan
 }
 
@@ -175,11 +169,10 @@ fn random_event(rng: &mut Rng, rt: &Runtime, plan: &Plan) -> Event {
             },
             _ => Event::BudgetExhausted(idx),
         },
-        State::Starting => match rng.below(5) {
+        State::Starting => match rng.below(4) {
             0 => Event::Ready(idx),
             1 => Event::ExecOk(idx),
-            2 => Event::Forked(idx),
-            3 => Event::StartTimeout(idx),
+            2 => Event::StartTimeout(idx),
             _ => Event::ReadyTimeout(idx),
         },
         State::Running => match rng.below(5) {
@@ -318,10 +311,11 @@ fn invariants_hold_under_arbitrary_event_streams() {
         ],
     );
 
+    let n = plan.services.len();
     for seed in 0..300u64 {
         let mut rng = Rng::new(seed * 2_654_435_761 + 17);
         let mut rt = Runtime::from_plan(&plan);
-        for i in 0..plan.len() {
+        for i in 0..n {
             rt.set_desired(i, Desired::Up);
         }
         let mut now = 0u64;
@@ -329,7 +323,7 @@ fn invariants_hold_under_arbitrary_event_streams() {
         for _ in 0..200 {
             now += rng.below(30) as u64;
             let ev = random_event(&mut rng, &rt, &plan);
-            let before_desired: Vec<Desired> = (0..plan.len()).map(|i| rt.get(i).desired).collect();
+            let before_desired: Vec<Desired> = (0..n).map(|i| rt.get(i).desired).collect();
 
             let t = apply(&ev, &mut rt, &plan, now);
 
@@ -381,7 +375,7 @@ fn reconciler_never_spawns_out_of_order() {
     for seed in 0..200u64 {
         let mut rng = Rng::new(seed ^ 0xDEAD_BEEF);
         let mut rt = Runtime::from_plan(&plan);
-        for i in 0..plan.len() {
+        for i in 0..plan.services.len() {
             rt.set_desired(i, Desired::Up);
         }
         let mut now = 0u64;
@@ -423,8 +417,9 @@ fn the_system_converges_when_nothing_interferes() {
         ],
     );
 
+    let n = plan.services.len();
     let mut rt = Runtime::from_plan(&plan);
-    for i in 0..plan.len() {
+    for i in 0..n {
         rt.set_desired(i, Desired::Up);
     }
     // The target has no process, so it must come up without any event.
@@ -435,7 +430,7 @@ fn the_system_converges_when_nothing_interferes() {
         now += 10;
         // A process service reports `Ready` as soon as it is `Starting`, which
         // is what a successful spawn looks like without a real process.
-        for i in 0..plan.len() {
+        for i in 0..n {
             if rt.state_at(i) == State::Stopped {
                 let tick = reconcile(&mut rt, &plan, now);
                 spawns += tick
@@ -454,19 +449,19 @@ fn the_system_converges_when_nothing_interferes() {
                 }
             }
         }
-        for i in 0..plan.len() {
+        for i in 0..n {
             if rt.state_at(i) == State::Starting && plan.services[i].kind.has_process() {
                 let _ = apply(&Event::Ready(i), &mut rt, &plan, now);
             }
         }
-        if rt.count_running() == plan.len() {
+        if rt.count_running() == n {
             break;
         }
     }
 
     assert_eq!(
         rt.count_running(),
-        plan.len(),
+        n,
         "the system never converged; state: {:?}",
         rt.snapshot(&plan)
     );
@@ -513,7 +508,7 @@ fn replays_are_deterministic() {
     let run = |seed: u64| -> (Vec<State>, Vec<Vec<Action>>) {
         let mut rng = Rng::new(seed);
         let mut rt = Runtime::from_plan(&plan);
-        for i in 0..plan.len() {
+        for i in 0..plan.services.len() {
             rt.set_desired(i, Desired::Up);
         }
         let mut now = 0u64;
@@ -652,7 +647,7 @@ fn logging_configuration_cannot_change_behaviour() {
     let run = |plan: &Plan| -> Vec<State> {
         let mut rng = Rng::new(4242);
         let mut rt = Runtime::from_plan(plan);
-        for i in 0..plan.len() {
+        for i in 0..plan.services.len() {
             rt.set_desired(i, Desired::Up);
         }
         let mut now = 0u64;

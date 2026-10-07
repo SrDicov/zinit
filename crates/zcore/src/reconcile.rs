@@ -24,7 +24,7 @@ use alloc::vec::Vec;
 
 use crate::action::{Action, LogLevel, log as log_action};
 use crate::runtime::Runtime;
-use crate::types::{Desired, Idx, Plan, Ready, Restart, SignalKind, State};
+use crate::types::{Desired, Idx, Plan, State};
 
 /// Result of one reconciliation pass.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -40,22 +40,6 @@ pub struct Tick {
 impl Tick {
     pub fn is_empty(&self) -> bool {
         self.actions.is_empty() && self.budget_exhausted.is_empty() && self.changed.is_empty()
-    }
-
-    /// Every action concerning one service. For assertions and for tests that
-    /// want to check per-service behaviour without filtering by hand.
-    pub fn for_service(&self, idx: Idx) -> impl Iterator<Item = &Action> {
-        self.actions.iter().filter(move |a| a.idx() == idx)
-    }
-
-    /// The signal kinds issued for one service, in order.
-    pub fn signals_for(&self, idx: Idx) -> Vec<SignalKind> {
-        self.for_service(idx)
-            .filter_map(|a| match *a {
-                Action::Signal { signal, .. } => Some(signal),
-                _ => None,
-            })
-            .collect()
     }
 }
 
@@ -236,17 +220,6 @@ pub fn due_events(runtime: &Runtime, plan: &Plan, now_ms: u64) -> Vec<crate::Eve
     out
 }
 
-/// Expose readiness policy as a small query, so the runtime and the tests agree
-/// on what "strict" means.
-pub fn readiness_gates_startup(ready: &Ready) -> bool {
-    matches!(ready, Ready::Strict(_))
-}
-
-/// True when the restart policy would immediately retry after `code`.
-pub fn restart_is_immediate(policy: Restart) -> bool {
-    matches!(policy, Restart::Always | Restart::OnFailure)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,22 +304,6 @@ mod tests {
         assert!(
             !t.actions.iter().any(|a| matches!(a, Action::Spawn(0))),
             "a target must never fork: {t:?}"
-        );
-    }
-
-    #[test]
-    fn an_optional_dep_that_is_down_does_not_block() {
-        let mut p = build(&[("opt", &[]), ("main", &[])]);
-        // Make "opt" optional for main.
-        let main = p.index_of("main").unwrap();
-        p.services[main].optional = vec![p.index_of("opt").unwrap()];
-        p.services[main].required.clear();
-        let mut rt = Runtime::from_plan(&p);
-        rt.set_desired(main, Desired::Up);
-        let t = reconcile(&mut rt, &p, 0);
-        assert!(
-            t.actions.iter().any(|a| matches!(a, Action::Spawn(_main))),
-            "main should start despite opt being down: {t:?}"
         );
     }
 

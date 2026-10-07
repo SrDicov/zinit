@@ -1,0 +1,43 @@
+name: security-advisories
+
+# CVE gate only. Licence lives in the `ci.yml` `licence` job and the
+# `forbid(unsafe_code)` scope check lives in the `ci.yml` `purity` job, so
+# repeating them here bought nothing but drift.
+#
+# `cargo deny` returns the day `deny.toml` exists, which needs an advisory-db
+# policy someone actually maintains — an unconfigured `if [ -f deny.toml ]`
+# stub never runs.
+on:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "crates/*/Cargo.toml"
+      - ".github/workflows/security-advisories.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/advisory-dbs
+            target
+          key: ${{ runner.os }}-audit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-audit-
+      - name: CVE audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit

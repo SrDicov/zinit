@@ -291,8 +291,11 @@ impl SignalSet {
 /// [`crate::childproc::fork_tracked`] safe to write.
 ///
 /// Note this is per-thread (`pthread_sigmask`), not per-process: the
-/// supervisor is single-threaded by design, and a child that resets its own
-/// mask after `exec` is unaffected by what the parent blocked.
+/// supervisor is single-threaded by design. It is *not*, however, something a
+/// spawned child can ignore — `fork` copies the blocked set and `execve`
+/// preserves it, so every process forked from a supervisor that called this
+/// runs with all of it blocked unless it clears the mask itself, which
+/// `zservice::spawn`'s child path does as its very first step.
 pub fn block(set: SignalSet) -> io::Result<()> {
     let raw = set.to_sigset()?;
     // SAFETY: `raw` is a live, fully built `sigset_t` and `pthread_sigmask`
@@ -983,6 +986,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn signalfd_delivers_through_the_reactor() {
         // The whole point of the module, end to end: block a signal, raise it
         // on this thread, and have it come out of `wait` like any other event.
@@ -1012,6 +1016,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn a_burst_of_signals_is_coalesced_not_lost() {
         // Three `SIGUSR1` in a row must produce at least one delivery, and
         // the loop must not spin. This is the property the self-pipe can only

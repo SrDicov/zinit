@@ -724,9 +724,18 @@ impl Reactor for KqueueReactor {
 
     fn wait(&mut self, timeout_ms: Option<u64>) -> io::Result<Vec<ReadyEvent>> {
         let mut buf: [libc::kevent; MAX_EVENTS] = unsafe { core::mem::zeroed() };
-        let ts = timeout_ms.map(|ms| libc::timespec {
-            tv_sec: (ms / 1000) as libc::time_t,
-            tv_nsec: ((ms % 1000) * 1_000_000) as i64,
+        let ts = timeout_ms.map(|ms| {
+            // `tv_nsec` follows the platform `long`: 64 bits on macOS/aarch64,
+            // 32 on 32-bit BSDs. Computed wide, narrowed with `as _` at the
+            // field (immune to `unnecessary_cast`, like the ioctl request
+            // numbers in `sys.rs`). (`tv_sec` needs no such treatment:
+            // `time_t` is deprecated only on musl, which never compiles this
+            // BSD-only block.)
+            let nsecs = ((ms % 1000) * 1_000_000) as i64;
+            libc::timespec {
+                tv_sec: (ms / 1000) as libc::time_t,
+                tv_nsec: nsecs as _,
+            }
         });
         let ts_ptr = ts.as_ref().map_or(std::ptr::null(), |t| t as *const _);
         // SAFETY: `buf` is a live array of exactly MAX_EVENTS `kevent`s, and
@@ -774,9 +783,25 @@ impl Reactor for KqueueReactor {
         }
         // A single descriptor can be reported twice (once per filter). Merge,
         // so callers can rely on one event per descriptor per wait.
+        //
+        // The merge must *or* the directions, never keep the first event: the
+        // read and write knotes are separate entries and arrive in whatever
+        // order the kernel walks them, so keeping one silently drops half the
+        // readiness. A socket that comes back "writable only" cannot drain its
+        // own output, which is the exact loss `ReadyEvent`'s pair of booleans
+        // exists to prevent.
         out.sort_by_key(|e| e.fd);
-        out.dedup_by_key(|e| e.fd);
-        Ok(out)
+        let mut merged: Vec<ReadyEvent> = Vec::with_capacity(out.len());
+        for ev in out {
+            match merged.last_mut() {
+                Some(prev) if prev.fd == ev.fd => {
+                    prev.readable |= ev.readable;
+                    prev.writable |= ev.writable;
+                }
+                _ => merged.push(ev),
+            }
+        }
+        Ok(merged)
     }
 
     fn kind(&self) -> ReactorKind {

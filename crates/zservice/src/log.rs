@@ -53,11 +53,6 @@ impl LogHandle {
         self.fd
     }
 
-    /// The file path, if this sink is a file.
-    pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
-    }
-
     /// Close the sink. Best-effort by design: this runs on teardown paths
     /// where there is nothing useful to do with an `EBADF`.
     pub fn close(&mut self) {
@@ -89,7 +84,7 @@ impl Drop for LogHandle {
 pub fn open_sink(sink: &zcore::LogSink) -> io::Result<LogHandle> {
     match sink {
         zcore::LogSink::None => Ok(LogHandle {
-            fd: open_devnull(libc::O_WRONLY)?,
+            fd: open_devnull()?,
             path: None,
             max_bytes: u64::MAX,
             backups: 0,
@@ -145,7 +140,7 @@ pub fn write_line(h: &mut LogHandle, line: &[u8]) -> io::Result<()> {
             "log sink is closed",
         ));
     }
-    rotate_if_needed(h)?;
+    rotate(h)?;
     // Room for the newline without splitting the line across two writes.
     if line.len() < 4096 {
         let mut buf = [0u8; 4096];
@@ -163,7 +158,7 @@ pub fn write_line(h: &mut LogHandle, line: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Rotate now, unconditionally. Exposed for tests.
+/// Rotate when the file has reached `max_bytes`. No-op for `/dev/null`.
 ///
 /// Generations shift up (`.2` → `.3`, …, `.1` → `.2`), the live file becomes
 /// `.1`, and a fresh file is opened at the original path. Missing generations
@@ -171,25 +166,13 @@ pub fn write_line(h: &mut LogHandle, line: &[u8]) -> io::Result<()> {
 /// with the fd left open on the *original* path so the service keeps logging
 /// somewhere. With `backups == 0` the file is truncated in place instead —
 /// the size bound is still honoured, just without history.
-pub fn rotate_now(h: &mut LogHandle) -> io::Result<()> {
-    rotate_handle(h, true)
-}
-
-/// Rotate when the file has reached `max_bytes`. No-op for `/dev/null`.
-fn rotate_if_needed(h: &mut LogHandle) -> io::Result<()> {
-    rotate_handle(h, false)
-}
-
-fn rotate_handle(h: &mut LogHandle, force: bool) -> io::Result<()> {
+fn rotate(h: &mut LogHandle) -> io::Result<()> {
     let path = match &h.path {
         Some(p) => p.clone(),
         None => return Ok(()),
     };
-    if !force {
-        let size = fstat_size(h.fd)?;
-        if size < h.max_bytes {
-            return Ok(());
-        }
+    if fstat_size(h.fd)? < h.max_bytes {
+        return Ok(());
     }
     if h.backups == 0 {
         // No history: truncate in place. `ftruncate` on the open fd keeps the
@@ -286,10 +269,10 @@ fn open_append(path: &Path) -> io::Result<RawFd> {
     Ok(fd)
 }
 
-/// Open `/dev/null` with `flags` (`O_WRONLY` for sinks, `O_RDONLY` for stdin).
-fn open_devnull(flags: libc::c_int) -> io::Result<RawFd> {
+/// Open `/dev/null` for writing.
+fn open_devnull() -> io::Result<RawFd> {
     // SAFETY: static literal, NUL-terminated by construction; the fd is fresh.
-    let fd = unsafe { libc::open(c"/dev/null".as_ptr(), flags | libc::O_CLOEXEC) };
+    let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -403,7 +386,6 @@ mod tests {
     #[test]
     fn none_sink_discards_without_a_path() {
         let mut h = open_sink(&zcore::LogSink::None).expect("open");
-        assert!(h.path().is_none());
         write_line(&mut h, b"into the void").expect("write to /dev/null");
         h.close();
     }

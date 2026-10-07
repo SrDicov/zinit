@@ -562,11 +562,9 @@ impl Graph {
     /// Every service that declares `dep` as a required dependency.
     ///
     /// Linear per query, which is fine because it is a load-time diagnostic
-    /// helper: the reverse edges the runtime needs are precomputed once, into
-    /// `ServicePlan::dependents`, by [`crate::plan::build_plan`]. The
-    /// topological sort builds its own CSR reverse index rather than calling
-    /// this in a loop, because `V` calls to an `O(V)` function is the one
-    /// quadratic that a 4096-service boot would actually feel.
+    /// helper. The topological sort builds its own CSR reverse index rather
+    /// than calling this in a loop, because `V` calls to an `O(V)` function is
+    /// the one quadratic that a 4096-service boot would actually feel.
     pub fn dependents_of(&self, dep: Idx) -> Vec<Idx> {
         let mut out: Vec<Idx> = (0..self.len())
             .filter(|&i| self.required.of(i).contains(&dep))
