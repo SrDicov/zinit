@@ -861,6 +861,16 @@ fn child_step_fds(p: ChildPlan) -> bool {
     // literal, `dup2`, `close` — all async-signal-safe, no allocation, no
     // locks. Failure of any one aborts the spawn.
     unsafe {
+        // The notify read-end goes first, before anything is dup'd anywhere:
+        // a later `dup2` may legitimately reuse its number for a target
+        // (the targets are fixed low numbers, the sources are whatever was
+        // free), and closing it *after* such a reuse would amputate the very
+        // pipe just installed — a live child with a dead handshake, the one
+        // failure this function's ordering exists to prevent. The parent
+        // keeps its own copy; only this end dies here.
+        if p.notify_r >= 0 {
+            libc::close(p.notify_r);
+        }
         let null_r = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
         if null_r < 0 {
             return false;
@@ -899,9 +909,6 @@ fn child_step_fds(p: ChildPlan) -> bool {
             if fd != target {
                 libc::close(fd);
             }
-        }
-        if p.notify_r >= 0 {
-            libc::close(p.notify_r);
         }
         // The exec-error write-end stays open (CLOEXEC): a successful exec
         // closes it, which is the parent's success signal. Closed explicitly
