@@ -554,6 +554,13 @@ pub struct ServicePlan {
     /// Linux capabilities to drop from the bounding set, canonical names.
     /// Empty is undropped. Linux-only at spawn, like `seccomp`.
     pub drop_caps: Vec<String>,
+    /// Start on the first connection to a held socket. The supervisor
+    /// watches the bound listeners while the service is down; traffic sets
+    /// it up like an operator `start` (budget respected, no fork bomb).
+    pub on_demand: bool,
+    /// A private `/tmp` for this service (mount namespace plus tmpfs).
+    /// `false` shares the host's `/tmp`; Linux-only, refused off Linux.
+    pub private_tmp: bool,
     /// Start at boot. `false` (`enabled = no`) leaves `Desired` down until
     /// an operator says otherwise — the boot default, not a lock: `zctl
     /// start` still starts it. Reloads never flip a live desire; only a
@@ -583,6 +590,8 @@ impl ServicePlan {
             seccomp: None,
             drop_caps: Vec::new(),
             enabled: true,
+            on_demand: false,
+            private_tmp: false,
         }
     }
 }

@@ -450,6 +450,8 @@ fn service_plan(graph: &Graph, i: Idx, findings: &mut Vec<Diagnostic>) -> Servic
     });
     sp.drop_caps = d.drop_caps.clone();
     sp.enabled = d.enabled;
+    sp.on_demand = d.on_demand;
+    sp.private_tmp = d.private_tmp;
 
     // A target has no process, so it has no handshake to wait for. Forcing
     // `Ready::None` here is what lets the runtime treat targets uniformly
@@ -726,6 +728,24 @@ mod tests {
         let off = &p.services[p.index_of("off").expect("off")];
         assert!(on.enabled, "omitted means yes");
         assert!(!off.enabled);
+    }
+
+    #[test]
+    fn on_demand_travels_from_description_to_plan() {
+        let mut lazy = desc("lazy");
+        lazy.on_demand = true;
+        let p = plan_of(vec![desc("eager"), lazy]);
+        assert!(!p.services[p.index_of("eager").expect("eager")].on_demand);
+        assert!(p.services[p.index_of("lazy").expect("lazy")].on_demand);
+    }
+
+    #[test]
+    fn private_tmp_travels_from_description_to_plan() {
+        let mut jailed = desc("jailed");
+        jailed.private_tmp = true;
+        let p = plan_of(vec![desc("plain"), jailed]);
+        assert!(!p.services[p.index_of("plain").expect("plain")].private_tmp);
+        assert!(p.services[p.index_of("jailed").expect("jailed")].private_tmp);
     }
 
     #[test]

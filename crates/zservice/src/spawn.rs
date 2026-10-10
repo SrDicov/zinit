@@ -439,6 +439,20 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
     // confined.
     let cap_drops = resolve_cap_drops(ctx.service_name, &sp.drop_caps)?;
     let seccomp_filter = resolve_seccomp_filter(ctx.service_name, &sp.seccomp)?;
+    // A private `/tmp` is mount namespaces, a Linux concept: anywhere else
+    // a configured service refuses the spawn rather than running shared
+    // while believing itself isolated — the same fail-closed rule as the
+    // confinement above.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    if sp.private_tmp {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "service `{}`: private-tmp needs mount namespaces (Linux-only)",
+                ctx.service_name
+            ),
+        ));
+    }
 
     let cgroup_procs: Option<CString> = match ctx.cgroup {
         None => None,
@@ -551,6 +565,7 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
         rlimit_len: rlimits.len(),
         is_console: sp.kind == ServiceKind::Console,
         tty: tty_c.as_ref().map_or(core::ptr::null(), |c| c.as_ptr()),
+        private_tmp: sp.private_tmp,
         sigmask: &raw const empty_mask,
     };
 
@@ -693,6 +708,10 @@ struct ChildPlan {
     is_console: bool,
     /// Controlling terminal path, or null.
     tty: *const libc::c_char,
+    /// Private `/tmp`: mount namespace plus tmpfs, installed while still
+    /// privileged. Linux-only concept: the parent refuses it off Linux (see
+    /// the gate in `spawn`), so `true` is unreachable elsewhere.
+    private_tmp: bool,
     /// Empty signal mask, installed by the child before anything else.
     sigmask: *const libc::sigset_t,
 }
@@ -732,6 +751,11 @@ fn child_main(p: ChildPlan) -> ! {
     }
     if !child_step_cgroup(p) {
         child_fail(p.exec_w, CHILD_STEP_CGROUP);
+    }
+    // Mount isolation while still privileged: unsharing needs capabilities
+    // the uid drop below gives away, so this cannot move any later.
+    if !child_step_mount(p.private_tmp) {
+        child_fail(p.exec_w, CHILD_STEP_MOUNT);
     }
     if !child_step_ids(p) {
         child_fail(p.exec_w, CHILD_STEP_IDS);
@@ -811,6 +835,7 @@ const CHILD_STEP_CAPDROP: u32 = 8;
 const CHILD_STEP_CTTY: u32 = 9;
 const CHILD_STEP_SECCOMP: u32 = 10;
 const CHILD_STEP_EXECVE: u32 = 11;
+const CHILD_STEP_MOUNT: u32 = 12;
 
 /// New session and process group, before anything else.
 ///
@@ -1034,6 +1059,75 @@ fn pid_ascii(pid: i32) -> ([u8; 12], usize) {
         buf[i] = b'-';
     }
     (buf, buf.len() - i)
+}
+
+/// Enter a private mount namespace and hide the shared `/tmp`.
+///
+/// Unconfigured (`false`) is a no-op returning true on every platform, so
+/// the parent is the only gatekeeper off Linux. Configured: detach the
+/// namespace from host mount events (best effort — nested containers
+/// restrict propagation changes, and isolation holds without it), then
+/// mount a fresh `mode=1777` tmpfs over `/tmp`, which must succeed: its
+/// failure would genuinely share `/tmp`, so it fails the spawn. Open fds
+/// (the log, pipes) transcend the namespace change, so nothing opened
+/// earlier is disturbed.
+///
+/// The `#[allow]` documents a split, not a hiding: the `MS_*` constants
+/// are `c_ulong` on some targets and narrower integers on others, so the
+/// conversion is load-bearing on one side and redundant (rightly refused)
+/// on the other — the same pattern as the mount-flags cast in `zinit --init`
+/// and the capability cast in `child_step_capdrop`.
+#[allow(clippy::unnecessary_cast)]
+fn child_step_mount(private_tmp: bool) -> bool {
+    if !private_tmp {
+        return true;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // SAFETY: `unshare` takes flag ints; no pointers, no retained state.
+        if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+            return false;
+        }
+        // Detaching hides host mount events, but it is hardening, not the
+        // guarantee: nested containers restrict propagation changes
+        // (`EINVAL`), while the tmpfs below still isolates our files. So a
+        // failure here continues — fail-closed applies to the tmpfs mount,
+        // whose failure would genuinely share `/tmp`.
+        let detach = (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong;
+        // SAFETY: NULL-path `mount` takes ints and flags only.
+        let _ = unsafe {
+            libc::mount(
+                core::ptr::null(),
+                c"/".as_ptr(),
+                core::ptr::null(),
+                detach,
+                core::ptr::null(),
+            )
+        };
+        let tmpfs = (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong;
+        // SAFETY: static literals, NUL-terminated by construction; `mount`
+        // copies what it needs and retains nothing.
+        if unsafe {
+            libc::mount(
+                c"tmpfs".as_ptr(),
+                c"/tmp".as_ptr(),
+                c"tmpfs".as_ptr(),
+                tmpfs,
+                c"mode=1777".as_ptr().cast::<libc::c_void>(),
+            )
+        } != 0
+        {
+            return false;
+        }
+        true
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // Unreachable: the parent refuses a configured service off Linux,
+        // and failing closed beats running shared.
+        let _ = private_tmp;
+        false
+    }
 }
 
 /// The privilege drop: `setgroups`, `setresgid`, `setresuid`, verify-or-die.
@@ -1743,6 +1837,7 @@ mod tests {
                 9 => "ctty",
                 10 => "seccomp",
                 11 => "execve",
+                12 => "mount",
                 _ => "unknown-step",
             }
         }

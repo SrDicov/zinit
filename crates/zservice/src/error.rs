@@ -73,16 +73,6 @@ pub enum SpawnError {
         /// The offending directive value.
         key: String,
     },
-    /// `log = syslog` before the syslog sink exists.
-    ///
-    /// Routing those bytes to `/dev/null` would be silent log loss, and
-    /// routing them to a file would contradict the operator's explicit
-    /// choice. So the spawn is refused loudly until the sink is wired
-    /// (`DESIGN.md` §8.1: absence of capability is announced, never faked).
-    SyslogNotWired {
-        /// The service that asked for syslog.
-        name: String,
-    },
     /// A cgroup was requested on a platform without cgroup support.
     ///
     /// Returned — not silently ignored — so the supervisor can print the
@@ -116,10 +106,6 @@ impl core::fmt::Display for SpawnError {
                 f,
                 "unknown rlimit `{key}`: expected `nofile`, `nproc` or `as`"
             ),
-            SpawnError::SyslogNotWired { name } => write!(
-                f,
-                "service `{name}` asks for `log = syslog`, which is not wired yet; use `log = file`"
-            ),
             SpawnError::CgroupUnsupported { name } => write!(
                 f,
                 "service `{name}` asks for a cgroup on a platform without cgroup support"
@@ -145,9 +131,7 @@ impl From<SpawnError> for io::Error {
             SpawnError::UnknownService { .. } | SpawnError::NotFound { .. } => {
                 io::ErrorKind::NotFound
             }
-            SpawnError::SyslogNotWired { .. } | SpawnError::CgroupUnsupported { .. } => {
-                io::ErrorKind::Unsupported
-            }
+            SpawnError::CgroupUnsupported { .. } => io::ErrorKind::Unsupported,
         };
         io::Error::new(kind, e.to_string())
     }

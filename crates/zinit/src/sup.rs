@@ -70,6 +70,15 @@ const WAIT_CAP_MS: u64 = 1_000;
 /// restart bucket is a spin, and a spin is worse than a 20 Hz heartbeat.
 const MIN_RESTART_TICK_MS: u64 = 50;
 
+/// Longest a demand-start connection waits for its service.
+///
+/// A down `on-demand` service contributes no deadline of its own (nothing
+/// is due while it sleeps), so without this cap a connection arriving just
+/// after a pass would wait out the whole [`WAIT_CAP_MS`]. Polled, not
+/// reactor-driven: listeners are one set per service, not one fd, and the
+/// trigger only matters while down — a bounded heartbeat is the whole cost.
+const DEMAND_TICK_MS: u64 = 100;
+
 /// Run the supervisor: generators, layers, converge, never return.
 ///
 /// Every failure below is announced and reported as an `Err`, which is what
@@ -480,6 +489,12 @@ impl Sup {
                     deadline = deadline.min(last.saturating_add(secs.saturating_mul(1000)));
                 }
             }
+            // A down on-demand service is a connection away from work: cap
+            // the sleep so the trigger in `poll` sees traffic within
+            // `DEMAND_TICK_MS`, not within a whole idle cap.
+            if sp.on_demand && core.desired == Desired::Down && core.state == State::Stopped {
+                deadline = deadline.min(now.saturating_add(DEMAND_TICK_MS));
+            }
         }
         deadline.saturating_sub(now)
     }
@@ -707,6 +722,52 @@ impl Sup {
             // refuses.
             if let Some(warning) = self.slots[idx].svc.take_warning() {
                 announce_degradation(&warning);
+            }
+
+            // 5b. Demand-start: a stopped, unwanted service with
+            // `on-demand = yes` and a connection waiting on a held socket.
+            // Binding happens here and not only at spawn, so the trigger
+            // exists before the first start; a squatted port is announced
+            // once and retried silently. A hit wakes the service exactly
+            // like an operator `start` (up plus `kick`, budget respected),
+            // and the reconciler below spawns it on this same pass.
+            if self.plan.services[idx].on_demand
+                && self.runtime.get(idx).desired == Desired::Down
+                && self.runtime.state_at(idx) == State::Stopped
+            {
+                match self.slots[idx].svc.ensure_listeners(&self.plan) {
+                    Ok(()) => {
+                        self.slots[idx].svc.note_bind_result(true);
+                        let demand = match self.slots[idx].svc.poll_demand() {
+                            Ok(hit) => hit,
+                            Err(e) => {
+                                let name = self.name_of(idx);
+                                announce_degradation(&format!("{name}: demand poll: {e}"));
+                                false
+                            }
+                        };
+                        if demand {
+                            // Owned before mutating: `name_of` borrows the
+                            // whole supervisor, and the wake below mutates
+                            // it. Wakes are transitions, not a hot path, so
+                            // one allocation is noise.
+                            let name = self.name_of(idx).to_string();
+                            self.runtime.set_desired(idx, Desired::Up);
+                            kick(&mut self.runtime, &self.plan, idx, now);
+                            announce_degradation(&format!(
+                                "{name} woke on demand (incoming connection)"
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        if self.slots[idx].svc.note_bind_result(false) {
+                            let name = self.name_of(idx);
+                            announce_degradation(&format!(
+                                "{name}: cannot bind listen sockets ({e})"
+                            ));
+                        }
+                    }
+                }
             }
 
             // 6. A stop nobody asked the core for.
@@ -1274,9 +1335,9 @@ impl Sup {
         if let Err(e) = started {
             let errno = match e.raw_os_error() {
                 Some(code) => code,
-                // A refusal before any syscall — `NotFound`, `EmptyCommand`,
-                // `SyslogNotWired` — has no errno of its own, and `EIO` is the
-                // honest "no process exists".
+                // A refusal before any syscall — `NotFound`, `EmptyCommand` —
+                // has no errno of its own, and `EIO` is the honest
+                // "no process exists".
                 None => libc::EIO,
             };
             let name = self.name_of(idx);
@@ -1559,6 +1620,25 @@ fn is_executable(_meta: &std::fs::Metadata) -> bool {
     true
 }
 
+/// True when a spawn failed because the file is being written.
+///
+/// `ETXTBSY` is POSIX; the constant lives behind `cfg(unix)` because that
+/// is where `libc` exposes it. Elsewhere every spawn error is final.
+#[cfg(unix)]
+fn is_txtbsy(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ETXTBSY)
+}
+
+/// True when a spawn failed because the file is being written.
+///
+/// Non-Unix builds never retry: without the constant there is nothing to
+/// match, and retrying blindly would turn every missing interpreter into
+/// a 15 ms stall.
+#[cfg(not(unix))]
+fn is_txtbsy(_e: &io::Error) -> bool {
+    false
+}
+
 /// Run one generator to completion: `Ok(Some(text))` is stdout worth keeping,
 /// `Ok(None)` is silence worth nothing, `Err(msg)` is an announced skip.
 ///
@@ -1567,14 +1647,28 @@ fn is_executable(_meta: &std::fs::Metadata) -> bool {
 /// generator that hangs must cost 10 seconds, not the boot.
 fn run_one_generator(path: &Path) -> Result<Option<String>, String> {
     use std::process::{Command, Stdio};
-    let mut child = match Command::new(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => return Err(format!("cannot spawn ({e})")),
+    let mut child = {
+        let mut tries = 0;
+        loop {
+            match Command::new(path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => break child,
+                // The generator is being written right now (an editor
+                // saving mid-boot, or a writer racing the exec on
+                // overlayfs): a few milliseconds almost always settles
+                // it. Bounded — three tries, then the normal loud skip —
+                // and anything else fails on the first try.
+                Err(e) if is_txtbsy(&e) && tries < 3 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => return Err(format!("cannot spawn ({e})")),
+            }
+        }
     };
     let start = std::time::Instant::now();
     let budget = std::time::Duration::from_millis(GENERATOR_TIMEOUT_MS);
@@ -1842,6 +1936,12 @@ fn validate_merged(descs: &[ServiceDesc]) -> io::Result<()> {
         if desc.tty.is_some() && desc.kind != zcore::ServiceKind::Console {
             return Err(fatal(format!(
                 "{}: tty needs `type = console` (same file or drop-in)",
+                desc.source
+            )));
+        }
+        if desc.on_demand && desc.listens.is_empty() {
+            return Err(fatal(format!(
+                "{}: on-demand needs `listen`; a trigger with no socket never fires",
                 desc.source
             )));
         }

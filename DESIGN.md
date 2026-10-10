@@ -303,7 +303,8 @@ env        = PATH=/usr/bin:/bin SSH_LOG_LEVEL=INFO
 | `pid-file` | ruta | — | sólo `forking`; el pid real tras el doble fork |
 | `tty` | ruta absoluta | — | sólo `console`; sin ella el servicio corre como proceso (aviso, no fatal) |
 | `enabled` | `yes` \| `no` | `yes` | `no` deja `Desired` abajo hasta que un operador lo arranque |
-| `watchdog-sec` | segundos ≥1 | — | sólo con `ready = notify`; `WATCHDOG=1` por el fd 3 |
+| `on-demand` | `yes` \| `no` | `no` | con `listen`: la primera conexión arranca un servicio parado |
+| `private-tmp` | `yes` \| `no` | `no` | nombres de montaje + tmpfs en `/tmp`; Linux, si no ⇒ rechazo || `watchdog-sec` | segundos ≥1 | — | sólo con `ready = notify`; `WATCHDOG=1` por el fd 3 |
 | `listen` | `tcp:<puerto>[:<nombre>]` \| `unix:<ruta>`, repetible | — | pre-bind en 127.0.0.1; `$LISTEN_FDS/$LISTEN_PID/$LISTEN_FDNAMES` desde fd 3 |
 | `drop-capabilities` | nombres (`sys_admin`…) | — | irreversible (`PR_CAPBSET_DROP`); Linux, si no ⇒ el spawn se rechaza |
 | `syscall-filter` | `enforce` \| `errno` \| `off` | — | seccomp-bpf manual; Linux, si no ⇒ el spawn se rechaza |
@@ -364,6 +365,16 @@ central del diseño**: la corrección es el valor por defecto, la espera es el o
 
 También se honra `LISTEN_FDS`/`LISTEN_PID` (convención systemd) para socket activation, por
 compatibilidad con servicios existentes.
+
+### Arranque bajo demanda (`on-demand`)
+
+Un servicio `Down` con `on-demand = yes` y sockets retenidos arranca con la
+primera conexión: el supervisor sondea los listeners (cero `accept` — el
+servicio acepta tras nacer) y lo levanta como un `start` de operador
+(`Up` + `kick`, presupuesto respetado). Sin sockets es un error de carga;
+sin tráfico no gasta nada salvo un vistazo cada 100 ms. `enabled = no` +
+`on-demand = yes` es la combinación canónica: apagado en arranque,
+despierto con tráfico, dormido otra vez con `stop`.
 
 ---
 
@@ -564,6 +575,12 @@ enum LogSink {
   lo oldest se descarta. **20 líneas, sin estado, sin tabla de estados.**
 - Escritura: cada línea del hijo se escribe con un `write(2)` al fd. Sin buffer, sin
   `BufWriter` que pueda perder datos en un `SIGKILL`.
+- `log = syslog`: socket `AF_UNIX` datagrama conectado a `/dev/log`, heredado
+  como stdout/stderr — un `write(2)` es un datagrama. Sin formato `PRI`/`TAG`
+  (la atribución viaja en `SCM_CREDENTIALS` del kernel); una escritura
+  fallida reconecta una vez (un daemon reiniciado re-enlaza `/dev/log`,
+  huerfanando la conexión vieja) antes de fallar en voz alta; sin daemon,
+  degradación anunciada con el servicio a oscuras, nunca spawn rechazado.
 - `zctl catlog <svc>` — `tail -f` sobre el fichero. La integración con journald
   (`log-type = pipe` + `consumer-of`) es una **feature separada** para v2, no parte del núcleo.
 

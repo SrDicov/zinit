@@ -1,6 +1,29 @@
 # Changelog
 
 ## [Unreleased]
+### montajes privados (Fase D3)
+- `private-tmp = yes|no` (defecto `no`): `unshare` de montajes + tmpfs
+  `mode=1777` sobre `/tmp`, instalado en el hijo con privilegios aún
+  (tras cgroup, antes de ids); si el tmpfs falla se rechaza el spawn
+  (fail-closed; el detach de propagación es best-effort).
+  Linux-only (rechazo en padre fuera de Linux); sin privilegios +
+  activado = fallo ruidoso. Viaja a plan.
+### demand-start por sockets (Fase D2)
+- `on-demand = yes|no` (defecto `no`): un servicio parado y no deseado con
+  sockets retenidos arranca con la primera conexión — igual que un `start`
+  de operador (`Up` + `kick`, presupuesto respetado, sin bomba de forks).
+  Sin `listen` es error de carga. Sondeo `poll(2)` sin aceptar (el servicio
+  acepta tras nacer) + tope de 100 ms en `arm` (latencia acotada sin spin).
+  Bind perezoso con un solo aviso ante puerto ocupado. Viaja a plan.
+  Test de integración contra binario real (conexión TCP → `Running`).
+### syslog por datagrama (Fase D)
+- `log = syslog` cableado: socket `AF_UNIX` datagrama conectado a `/dev/log`
+  como stdout/stderr del hijo (un `write` = un datagrama; bloqueante, como
+  manda stdio POSIX). Sin formato `PRI`/`TAG` — la atribución viaja en
+  `SCM_CREDENTIALS`. El supervisor comparte el socket del handle y reconecta
+  una vez ante escritura fallida; sin daemon, degradación anunciada con el
+  servicio a oscuras, nunca rechazo. Desaparece
+  `SpawnError::SyslogNotWired` (y su test de rechazo).
 ### runit import + enable + service shim (Fase C)
 - `scripts/runsv-import.sh` (POSIX sh, dash/ash-clean): `runsvdir` →
   `<name>.conf`. `run` (ejecutable, cwd=dir) + `finish` plegado

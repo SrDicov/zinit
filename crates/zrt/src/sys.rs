@@ -322,6 +322,36 @@ pub fn set_nonblocking(fd: RawFd, on: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// True when any of `fds` is readable, without consuming anything.
+///
+/// Zero-timeout `poll(2)`: the demand-start trigger peeks at held listen
+/// sockets — a pending connection reads as readable on a listener — without
+/// accepting, because the service accepts after it spawns. Empty set is
+/// always false. POSIX.1-2001, on every target in scope; the only new
+/// syscall this phase adds, and it takes no flags, no timeout, no state.
+pub fn poll_readable(fds: &[RawFd]) -> io::Result<bool> {
+    if fds.is_empty() {
+        return Ok(false);
+    }
+    let mut pfds: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    // SAFETY: `pfds` is a live array of exactly `len` `pollfd`s; a zero
+    // timeout means the call never sleeps and the kernel writes only
+    // `revents`. `nfds_t` holds any slice this crate can build (listen sets
+    // are capped at 32 long before here).
+    let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(n > 0)
+}
+
 /// `socketpair(2)`, both ends `O_CLOEXEC` and `SOCK_NONBLOCK`.
 ///
 /// Used by tests and by the readiness handshake: a socket pair gives a
@@ -611,6 +641,45 @@ pub fn prctl_child_subreaper() -> io::Result<()> {
         io::ErrorKind::Unsupported,
         "child subreaper is Linux-only",
     ))
+}
+
+/// Connect a `SOCK_DGRAM` client to the socket at `path`.
+///
+/// Datagram twin of [`unix_connect`]: one `write(2)` is one message, which
+/// is exactly the syslog contract (`/dev/log`). Blocking and CLOEXEC, and
+/// deliberately *not* non-blocking: a log descriptor is inherited as a
+/// service's stdout/stderr, and POSIX stdio expects blocking fds — a
+/// non-blocking stdout would fail arbitrary programs with `EAGAIN` on
+/// their own output. The supervisor never polls this fd (writes to it go
+/// out on a fresh socket per message), so nothing deadlocks on it either.
+pub fn unix_dgram_connect(path: &Path) -> io::Result<RawFd> {
+    // SOCK_CLOEXEC is not universal (Apple lacks it), so the flag travels
+    // through `socket_flags()` like every other socket here, and CLOEXEC
+    // is finished explicitly below. Non-blocking is never set: see above.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | socket_flags(), 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `set_cloexec` is one `fcntl(F_SETFD)` on an owned fd.
+    if let Err(e) = set_cloexec(fd, true) {
+        let _ = close(fd);
+        return Err(e);
+    }
+    let (addr, len) = match unix_addr(path) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = close(fd);
+            return Err(e);
+        }
+    };
+    // SAFETY: `addr` is a live `sockaddr_un` of exactly `len` bytes;
+    // `connect` copies it and retains nothing.
+    if unsafe { libc::connect(fd, &raw const addr as *const libc::sockaddr, len) } != 0 {
+        let e = io::Error::last_os_error();
+        let _ = close(fd);
+        return Err(e);
+    }
+    Ok(fd)
 }
 
 /// Connect a `SOCK_STREAM` client to the socket at `path`.
@@ -1663,6 +1732,18 @@ mod tests {
         let path = PathBuf::from(long);
         assert!(unix_listener(&path).is_err());
         assert!(unix_connect(&path).is_err());
+        assert!(unix_dgram_connect(&path).is_err());
+    }
+
+    #[test]
+    fn dgram_connect_to_nothing_is_an_error() {
+        // No listener, no daemon: connecting must fail rather than hand out
+        // a socket that writes into the void. Deterministic everywhere —
+        // nothing to bind, no daemon needed.
+        let mut path = std::env::temp_dir();
+        path.push(format!("zinit-no-such-dgram-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(unix_dgram_connect(&path).is_err());
     }
 
     #[test]
@@ -1782,5 +1863,34 @@ mod tests {
         let _ = close(high);
         let _ = close(w);
         let _ = close(r);
+    }
+
+    #[test]
+    fn poll_readable_sees_a_waiting_connection() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("zinit-poll-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = unix_service_listen(&path).expect("bind");
+        assert!(!poll_readable(&[listener]).expect("poll"), "no client yet");
+        let client = unix_connect(&path).expect("connect");
+        // The connect completes asynchronously; the listener may need a
+        // moment to report it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if poll_readable(&[listener]).expect("poll") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "listener never turned readable"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Peeking consumes nothing: a second peek still sees it.
+        assert!(poll_readable(&[listener]).expect("peek again"));
+        assert!(!poll_readable(&[]).expect("empty"));
+        let _ = close(client);
+        let _ = close(listener);
+        let _ = std::fs::remove_file(&path);
     }
 }
