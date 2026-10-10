@@ -24,7 +24,7 @@ use alloc::vec::Vec;
 
 use crate::action::{Action, LogLevel, log as log_action};
 use crate::runtime::Runtime;
-use crate::types::{Desired, Idx, Plan, State};
+use crate::types::{Desired, Idx, Plan, ServiceKind, State};
 
 /// Result of one reconciliation pass.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -100,6 +100,12 @@ pub fn reconcile(runtime: &mut Runtime, plan: &Plan, now_ms: u64) -> Tick {
                 // `Up` - the operator still wants it - but the reconciler
                 // must leave it alone until `zctl kick` or `zctl start`.
                 if runtime.get(idx).restart_suppressed {
+                    continue;
+                }
+                // A oneshot that ran to completion is done, not dead.
+                // `Desired` stays `Up` so status tells the truth, but there
+                // is nothing to converge: only `kick` re-arms it.
+                if sp.kind == ServiceKind::Oneshot && runtime.get(idx).completed {
                     continue;
                 }
                 // A service that has never run is not subject to the restart
@@ -186,6 +192,22 @@ pub fn due_events(runtime: &Runtime, plan: &Plan, now_ms: u64) -> Vec<crate::Eve
     let mut out = Vec::new();
     for (idx, sp) in plan.services.iter().enumerate() {
         let st = runtime.get(idx);
+        // Watchdog first: a service that stopped checking in is hung, and a
+        // hung service's other deadlines are stale news next to that fact.
+        // Measured from the last ping, or from birth when none arrived yet.
+        // One event per service per pass: anything else still due is reported
+        // on the next pass, which is already coming.
+        if let Some(watchdog_sec) = sp.watchdog_sec {
+            let window_ms = watchdog_sec.saturating_mul(1000);
+            if window_ms > 0
+                && matches!(st.state, State::Running | State::Starting)
+                && now_ms.saturating_sub(st.last_watchdog_ms.or(st.started_at).unwrap_or(now_ms))
+                    >= window_ms
+            {
+                out.push(crate::Event::WatchdogExpired(idx));
+                continue;
+            }
+        }
         match st.state {
             State::Starting => {
                 // Ready deadline first: a service that became ready and then

@@ -66,6 +66,20 @@ pub enum Event {
     /// The service is pinned: a stop was requested but must not proceed.
     Pinned(Idx),
 
+    /// A `Forking` daemon's real pid, read from its pid file after the
+    /// direct child exited. The core swaps the recorded pid over: the fork it
+    /// knew is gone, the daemon is what is supervised from here on.
+    AdoptedPid { idx: Idx, pid: i32 },
+
+    /// The service wrote `WATCHDOG=1` to its notify fd: it is alive and
+    /// checking in. Refreshes the watchdog deadline, nothing else.
+    WatchdogPing(Idx),
+
+    /// `watchdog-sec` expired with no check-in. The runtime stops the service
+    /// (and, `Desired` unchanged, starts it again): a hung service is
+    /// restarted, not debated.
+    WatchdogExpired(Idx),
+
     /// An I/O operation the runtime performs on the service's behalf failed -
     /// opening its log, creating its cgroup, writing its pidfile. The service
     /// itself is unaffected; the runtime decides severity.
@@ -83,10 +97,13 @@ impl Event {
             | Event::StopTimeout(i)
             | Event::BudgetExhausted(i)
             | Event::Pinned(i)
+            | Event::WatchdogPing(i)
+            | Event::WatchdogExpired(i)
             | Event::OrphanReaped(i) => i,
             Event::SpawnFailed { idx, .. }
             | Event::Exited { idx, .. }
             | Event::Signalled { idx, .. }
+            | Event::AdoptedPid { idx, .. }
             | Event::DepLost { idx, .. }
             | Event::DepFailed { idx, .. }
             | Event::IoError { idx, .. } => idx,
@@ -109,6 +126,9 @@ impl Event {
             Event::DepFailed { .. } => "dep-failed",
             Event::BudgetExhausted(_) => "budget-exhausted",
             Event::Pinned(_) => "pinned",
+            Event::AdoptedPid { .. } => "adopted-pid",
+            Event::WatchdogPing(_) => "watchdog-ping",
+            Event::WatchdogExpired(_) => "watchdog-expired",
             Event::IoError { .. } => "io-error",
         }
     }
@@ -163,13 +183,16 @@ mod tests {
             Event::DepFailed { idx: 3, dep: 1 },
             Event::BudgetExhausted(3),
             Event::Pinned(3),
+            Event::AdoptedPid { idx: 3, pid: 42 },
+            Event::WatchdogPing(3),
+            Event::WatchdogExpired(3),
             Event::IoError { idx: 3, errno: 13 },
         ];
         for e in &events {
             assert_eq!(e.idx(), 3, "{e} reported the wrong index");
             assert!(!e.name().is_empty());
         }
-        assert_eq!(events.len(), 14, "a variant was added without a test case");
+        assert_eq!(events.len(), 17, "a variant was added without a test case");
     }
 
     #[test]

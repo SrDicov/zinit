@@ -74,7 +74,9 @@
 //!
 //! Exec success is reported out-of-band through the exec-error pipe: `EOF`
 //! means the image was replaced ([`zcore::Event::ExecOk`]), four bytes mean
-//! the errno of whatever failed ([`zcore::Event::SpawnFailed`]). See
+//! the errno of whatever failed ([`zcore::Event::SpawnFailed`]), followed by
+//! a second word naming the failing step (diagnostic only; production
+//! readers consume the errno and close). See
 //! [`ManagedService`](crate::service::ManagedService), which owns that pipe.
 
 use std::ffi::CString;
@@ -137,6 +139,31 @@ pub struct SpawnCtx<'a> {
     /// take over": a console spawn without one behaves as `process` (see the
     /// limitations section below).
     pub tty: Option<&'a Path>,
+    /// Pre-bound listen sockets as `(fd, logical name)`, owned by the caller.
+    ///
+    /// The supervisor binds these once and holds them across restarts; every
+    /// spawn only *lends* them to the child (dup'd onto 3.., with the names
+    /// in `$LISTEN_FDNAMES`). Empty for no socket activation. `spawn` copies
+    /// them high itself before the fork, so callers pass whatever numbers
+    /// they hold — no fd-number discipline is required of them.
+    pub listen: &'a [(RawFd, String)],
+}
+
+/// Cap on listen sockets per spawn. The child dups them onto 3.. one by one
+/// with no allocator to stage them in, which is only sound while no target
+/// can clobber a not-yet-moved source (`spawn` copies every source to 100+
+/// first). 32 is far past any sane service and keeps 3+32 < 100 with room to
+/// spare; past it the description is refused, not truncated — half a socket
+/// set is a service that binds the wrong half.
+pub const MAX_LISTEN_FDS: usize = 32;
+
+/// Descriptor the notify write-end lands on: 3 with no listeners, 3+N with.
+///
+/// Listen sockets take 3.. first — the `$LISTEN_FDS` contract fixes them
+/// there, starting at `SD_LISTEN_FDS_START` — so the notifier moves past
+/// them rather than colliding.
+fn notify_no(ctx: &SpawnCtx<'_>) -> u32 {
+    3 + ctx.listen.len() as u32
 }
 
 /// What the parent keeps after a successful fork.
@@ -163,6 +190,92 @@ pub struct Spawned {
     pub exec_fd: Option<RawFd>,
 }
 
+/// Resolve `drop-capabilities` names to numbers (Linux).
+///
+/// Empty stays empty on every platform. A non-empty list anywhere else
+/// refuses the spawn: capabilities are a Linux concept, and running the
+/// service undropped where the file says dropped would be more privilege
+/// than configured — the one outcome confinement must never produce.
+fn resolve_cap_drops(service_name: &str, caps: &[String]) -> io::Result<Vec<u32>> {
+    if caps.is_empty() {
+        return Ok(Vec::new());
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("service `{service_name}`: capability drops are Linux-only"),
+        ))
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut out = Vec::with_capacity(caps.len());
+        for cap in caps {
+            match zconfig::parse_capability(cap) {
+                Some(nr) => out.push(nr),
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("service `{service_name}`: unknown capability `{cap}`"),
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Assemble the seccomp filter for one spawn (Linux).
+///
+/// `None` policy means unconfined (empty program). Anything else resolves
+/// every allowed name against the verified per-arch table and builds the
+/// program; an unknown name, an unverified architecture, or an oversized
+/// list refuses the spawn rather than shipping a filter with a hole.
+fn resolve_seccomp_filter(
+    service_name: &str,
+    policy: &Option<zcore::SeccompPolicy>,
+) -> io::Result<Vec<zrt::seccomp::Insn>> {
+    let Some(policy) = policy else {
+        return Ok(Vec::new());
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // The policy cannot apply here; naming it keeps the signature honest
+        // on targets that refuse it.
+        let _ = policy;
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("service `{service_name}`: syscall filters are Linux-only"),
+        ))
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut numbers = Vec::with_capacity(policy.allow.len());
+        for name in &policy.allow {
+            match zrt::seccomp::syscall_nr(name) {
+                Some(nr) => numbers.push(nr),
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("service `{service_name}`: unknown syscall `{name}`"),
+                    ));
+                }
+            }
+        }
+        let action = match policy.action {
+            zcore::SeccompAction::Enforce => zrt::seccomp::OnViolation::Kill,
+            zcore::SeccompAction::Errno => zrt::seccomp::OnViolation::Errno,
+        };
+        match zrt::seccomp::build(&numbers, action) {
+            Some(filter) => Ok(filter),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("service `{service_name}`: no seccomp filter buildable here"),
+            )),
+        }
+    }
+}
+
 /// Fork+exec service `idx` of `plan`.
 ///
 /// Reads policy (kind, readiness, timeouts) from the frozen plan and
@@ -187,6 +300,13 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
     if ctx.command.trim().is_empty() {
         return Err(SpawnError::EmptyCommand {
             name: ctx.service_name.to_string(),
+        }
+        .into());
+    }
+    if ctx.listen.len() > MAX_LISTEN_FDS {
+        return Err(SpawnError::BadValue {
+            name: ctx.service_name.to_string(),
+            what: String::from("too many listen sockets"),
         }
         .into());
     }
@@ -242,7 +362,14 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
         }
         (words[0].clone(), words)
     };
-    let merged_env = merged_environment(ctx.env, wants_notify)?;
+    let merged_env = merged_environment(
+        ctx.env,
+        wants_notify.then_some(notify_no(ctx)),
+        &ctx.listen
+            .iter()
+            .map(|(_, n)| n.clone())
+            .collect::<Vec<_>>(),
+    )?;
     let path_env = path_of(&merged_env);
     let resolved = resolve_binary(&argv0, &path_env).ok_or_else(|| SpawnError::NotFound {
         name: ctx.service_name.to_string(),
@@ -305,6 +432,14 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
         )
     })?;
 
+    // Confinement, resolved before the fork. Names become numbers and the
+    // filter is assembled here, on the parent side, because the child may
+    // not allocate and must not parse. Anything unresolvable refuses the
+    // spawn: a half-confined service is a service that believes it is
+    // confined.
+    let cap_drops = resolve_cap_drops(ctx.service_name, &sp.drop_caps)?;
+    let seccomp_filter = resolve_seccomp_filter(ctx.service_name, &sp.seccomp)?;
+
     let cgroup_procs: Option<CString> = match ctx.cgroup {
         None => None,
         Some(slice) => {
@@ -345,6 +480,51 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
     // clears bits inside it. POSIX says it cannot fail.
     unsafe { libc::sigemptyset(&raw mut empty_mask) };
 
+    // Listen fd numbers, by value: the child dups them onto 3.. and must not
+    // touch the supervisor's (name, fd) pairs.
+    let listen_numbers: Vec<RawFd> = ctx.listen.iter().map(|(fd, _)| *fd).collect();
+    // High copies: dup targets below (3..) can never clobber a source this
+    // way, no matter what numbers the caller holds. Copied here — not by the
+    // caller — so the guarantee holds for every spawn, including direct ones
+    // that never went through `ensure_listeners`. Copy, not move (see
+    // `dup_high`): the caller's originals stay open and owned by the caller;
+    // these copies die in the parent right after the fork.
+    let mut parked: Vec<RawFd> = Vec::with_capacity(listen_numbers.len());
+    for fd in &listen_numbers {
+        match zrt::sys::dup_high(*fd) {
+            Ok(high) => parked.push(high),
+            Err(e) => {
+                for high in parked {
+                    let _ = zrt::sys::close_quietly(high);
+                }
+                cleanup_failed_spawn(log_fd, notify_r, notify_w, exec_r, exec_w);
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "service `{}`: cannot stage listen sockets ({e})",
+                        ctx.service_name
+                    ),
+                ));
+            }
+        }
+    }
+    // The `LISTEN_PID=` digit field the child fills with its own pid (see
+    // `child_step_listen_pid`). Found by prefix; an entry the operator
+    // smuggled in with the wrong shape is ignored rather than patched.
+    // Plain bytes: the child writes ASCII digits, which need no signedness.
+    let mut listen_pid_digits: *mut u8 = core::ptr::null_mut();
+    if !ctx.listen.is_empty() {
+        for c in &env_c {
+            let bytes = c.as_bytes();
+            if bytes.len() == 11 + 10 && bytes.starts_with(b"LISTEN_PID=") {
+                // SAFETY: `c` is alive in this frame (inherited across the
+                // fork); offset 11 is the first of exactly 10 digit bytes.
+                listen_pid_digits = unsafe { c.as_ptr().add(11) as *mut u8 };
+                break;
+            }
+        }
+    }
+
     let plan_child = ChildPlan {
         path: path_c.as_ptr(),
         argv: argv_ptrs.as_ptr(),
@@ -352,6 +532,14 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
         log_fd,
         notify_w,
         notify_r,
+        notify_no: notify_no(ctx) as libc::c_int,
+        listen_fds: parked.as_ptr(),
+        listen_len: parked.len(),
+        listen_pid_digits,
+        cap_drops: cap_drops.as_ptr(),
+        cap_len: cap_drops.len(),
+        seccomp_filter: seccomp_filter.as_ptr(),
+        seccomp_len: seccomp_filter.len(),
         exec_w,
         cgroup_procs: cgroup_procs
             .as_ref()
@@ -372,11 +560,20 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let e = io::Error::last_os_error();
+        for high in parked {
+            let _ = zrt::sys::close_quietly(high);
+        }
         cleanup_failed_spawn(log_fd, notify_r, notify_w, exec_r, exec_w);
         return Err(e);
     }
     if pid == 0 {
         child_main(plan_child);
+    }
+    // The high copies served their one purpose (surviving the fork with
+    // numbers nothing can collide with). The child holds its dups; the
+    // caller's originals stay with the caller.
+    for high in parked {
+        let _ = zrt::sys::close_quietly(high);
     }
 
     // ── parent ──────────────────────────────────────────────────────────
@@ -442,10 +639,41 @@ struct ChildPlan {
     envp: *const *const libc::c_char,
     /// Log fd, dup'd onto 1 and 2.
     log_fd: RawFd,
-    /// Notify write-end, dup'd onto 3 (`-1` when no notify handshake).
+    /// Notify write-end, dup'd onto `notify_no` (`-1` when no handshake).
     notify_w: RawFd,
     /// Notify read-end, closed in the child (`-1` when none).
     notify_r: RawFd,
+    /// Descriptor the notify write-end lands on: 3 with no listeners, 3+N
+    /// with N listeners (which take 3.. first, per the `$LISTEN_FDS`
+    /// contract).
+    notify_no: libc::c_int,
+    /// Listen fds to hand over, dup'd onto 3.. in order. Every source is
+    /// copied high by `spawn` itself right before the fork (see `dup_high`),
+    /// so no target below 100 (`MAX_LISTEN_FDS` caps the count) can clobber
+    /// a not-yet-moved source, whatever numbers the caller holds. Copies,
+    /// never moves: the caller's descriptors stay open.
+    listen_fds: *const RawFd,
+    /// How many `listen_fds` points at.
+    listen_len: usize,
+    /// Digit field of the `LISTEN_PID=` env entry, filled with our own pid
+    /// before `execve` (null when no listeners: no placeholder was built).
+    /// Plain bytes (`*mut u8`), not `c_char`: the values written are ASCII
+    /// digits either way, and a `c_char` field would need a conversion cast
+    /// that is a no-op (rightly refused) on unsigned-char platforms.
+    listen_pid_digits: *mut u8,
+    /// Capability numbers to drop from the bounding set. Linux-only concept:
+    /// the parent refuses a non-empty list off Linux (see `resolve_cap_drops`
+    /// and `child_step_capdrop`, which consult the length on every target so
+    /// the fields stay live everywhere).
+    cap_drops: *const u32,
+    /// How many `cap_drops` points at.
+    cap_len: usize,
+    /// Assembled seccomp program (Linux). Empty (`len == 0`) is unconfined;
+    /// off Linux the parent refuses a configured filter, so empty is also
+    /// all that can arrive there.
+    seccomp_filter: *const zrt::seccomp::Insn,
+    /// How many `seccomp_filter` points at.
+    seccomp_len: usize,
     /// Exec-error write-end. CLOEXEC: a successful exec closes it, which is
     /// exactly the parent's "it worked" signal.
     exec_w: RawFd,
@@ -488,29 +716,43 @@ fn child_main(p: ChildPlan) -> ! {
     // Zero: let `setpgid` pick, which means "my own pid", the group the
     // supervisor will later signal with `kill(-pid)`.
     if !child_step_sigmask(p) {
-        child_fail(p.exec_w);
+        child_fail(p.exec_w, CHILD_STEP_SIGMASK);
     }
     if !child_step_session(0) {
-        child_fail(p.exec_w);
+        child_fail(p.exec_w, CHILD_STEP_SESSION);
     }
     if !child_step_fds(p) {
-        child_fail(p.exec_w);
+        child_fail(p.exec_w, CHILD_STEP_FDS);
     }
     if !child_step_chdir() {
-        child_fail(p.exec_w);
+        child_fail(p.exec_w, CHILD_STEP_CHDIR);
     }
     if !child_step_rlimits(p) {
-        child_fail(p.exec_w);
+        child_fail(p.exec_w, CHILD_STEP_RLIMITS);
     }
     if !child_step_cgroup(p) {
-        child_fail(p.exec_w);
+        child_fail(p.exec_w, CHILD_STEP_CGROUP);
     }
     if !child_step_ids(p) {
-        child_fail(p.exec_w);
+        child_fail(p.exec_w, CHILD_STEP_IDS);
+    }
+    if !child_step_capdrop(p) {
+        child_fail(p.exec_w, CHILD_STEP_CAPDROP);
     }
     child_step_no_new_privs();
     if !child_step_ctty(p) {
-        child_fail(p.exec_w);
+        child_fail(p.exec_w, CHILD_STEP_CTTY);
+    }
+    // Last: our own pid into the `LISTEN_PID=` digit field, so daemons that
+    // check it (`sd_listen_fds`) accept the descriptors below. Past this
+    // point the child only execs; nothing may allocate, so a fixed field —
+    // not a formatted string — is the whole trick.
+    child_step_listen_pid(p);
+    // Last of all: the filter. Everything after the install — including a
+    // failing `execve`'s own error report — runs *under* it, which is why
+    // the pid write above and the tty handover earlier both precede it.
+    if !child_step_seccomp(p) {
+        child_fail(p.exec_w, CHILD_STEP_SECCOMP);
     }
     // SAFETY: `path` is a NUL-terminated string prepared before the fork;
     // `argv`/`envp` are NUL-terminated pointer arrays to NUL-terminated
@@ -520,7 +762,7 @@ fn child_main(p: ChildPlan) -> ! {
         libc::execve(p.path, p.argv.cast_mut(), p.envp.cast_mut());
     }
     // Only reached on failure. The errno is from `execve` itself.
-    child_fail(p.exec_w);
+    child_fail(p.exec_w, CHILD_STEP_EXECVE);
 }
 
 /// Report the current errno to the parent, then `_exit(127)`.
@@ -528,17 +770,24 @@ fn child_main(p: ChildPlan) -> ! {
 /// 127 is the universal "cannot execute" status (the shell convention): the
 /// supervisor reaps an ordinary `Exited(127)`, and the reconciler spends
 /// budget on it like any other failed start. Never silent, never special.
-fn child_fail(exec_w: RawFd) -> ! {
+///
+/// Eight bytes go down the pipe: the errno first, then the failing step
+/// (see `CHILD_STEP_*`). Production readers (`poll_exec`) consume the first
+/// four and close — the step word is diagnostic only, discarded with the
+/// close — while tests drain all eight to name the culprit.
+fn child_fail(exec_w: RawFd, step: u32) -> ! {
     let errno = io::Error::last_os_error()
         .raw_os_error()
         .unwrap_or(libc::EINVAL) as u32;
     if exec_w >= 0 {
-        let bytes = errno.to_le_bytes();
-        // SAFETY: one `write(2)` of four bytes to a pipe; partial writes are
-        // irrelevant — the parent treats "any bytes" as failure and reads the
-        // first four. Best effort: the return is ignored.
+        let mut msg = [0u8; 8];
+        msg[..4].copy_from_slice(&errno.to_le_bytes());
+        msg[4..].copy_from_slice(&step.to_le_bytes());
+        // SAFETY: one `write(2)` of eight bytes to a pipe — far below
+        // `PIPE_BUF`, so atomic; partial writes are irrelevant, the parent
+        // treats "any bytes" as failure. Best effort: the return is ignored.
         unsafe {
-            libc::write(exec_w, bytes.as_ptr().cast::<libc::c_void>(), bytes.len());
+            libc::write(exec_w, msg.as_ptr().cast::<libc::c_void>(), msg.len());
             libc::close(exec_w);
         }
     }
@@ -546,6 +795,22 @@ fn child_fail(exec_w: RawFd) -> ! {
     // flushes nothing — the double-flush-safe exit for a forked child.
     unsafe { libc::_exit(127) };
 }
+
+/// Failing-step tags for the exec-error pipe's second word.
+///
+/// Numbers, not names: the child may not allocate or format. Order follows
+/// `child_main`.
+const CHILD_STEP_SIGMASK: u32 = 1;
+const CHILD_STEP_SESSION: u32 = 2;
+const CHILD_STEP_FDS: u32 = 3;
+const CHILD_STEP_CHDIR: u32 = 4;
+const CHILD_STEP_RLIMITS: u32 = 5;
+const CHILD_STEP_CGROUP: u32 = 6;
+const CHILD_STEP_IDS: u32 = 7;
+const CHILD_STEP_CAPDROP: u32 = 8;
+const CHILD_STEP_CTTY: u32 = 9;
+const CHILD_STEP_SECCOMP: u32 = 10;
+const CHILD_STEP_EXECVE: u32 = 11;
 
 /// New session and process group, before anything else.
 ///
@@ -602,18 +867,36 @@ fn child_step_session(pgid_want: i32) -> bool {
     }
 }
 
-/// Install the fd contract: `/dev/null` → 0, log → 1,2, notify → 3.
+/// Install the fd contract: `/dev/null` → 0, log → 1,2, notify → `notify_no`,
+/// listen sockets → 3...
 ///
 /// Runs before any privilege-affecting step so the interface promise is in
 /// place regardless of what fails later (and a later failure `_exit`s, so a
 /// half-installed stdio is never observed by anyone but the dying child).
-/// Originals are closed: the only fds crossing the `exec` are 0, 1, 2 and
-/// possibly 3 — everything the supervisor holds stays `CLOEXEC` on its side.
+/// Originals are closed: the only fds crossing the `exec` are 0, 1, 2, the
+/// listeners and possibly the notifier — everything the supervisor holds
+/// stays `CLOEXEC` on its side.
+///
+/// The listen handover is single-phase and safe by construction: every
+/// source is copied to 100+ (see `SpawnCtx::listen`) while every target is
+/// below it (`MAX_LISTEN_FDS` caps the count), so no `dup2` target can ever
+/// clobber a not-yet-moved source. `dup2` onto an already-correct number is
+/// a no-op success, and the matching close is skipped with it.
 fn child_step_fds(p: ChildPlan) -> bool {
     // SAFETY: every call below is a raw syscall on ints. `open` of a static
     // literal, `dup2`, `close` — all async-signal-safe, no allocation, no
     // locks. Failure of any one aborts the spawn.
     unsafe {
+        // The notify read-end goes first, before anything is dup'd anywhere:
+        // a later `dup2` may legitimately reuse its number for a target
+        // (the targets are fixed low numbers, the sources are whatever was
+        // free), and closing it *after* such a reuse would amputate the very
+        // pipe just installed — a live child with a dead handshake, the one
+        // failure this function's ordering exists to prevent. The parent
+        // keeps its own copy; only this end dies here.
+        if p.notify_r >= 0 {
+            libc::close(p.notify_r);
+        }
         let null_r = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
         if null_r < 0 {
             return false;
@@ -634,15 +917,24 @@ fn child_step_fds(p: ChildPlan) -> bool {
             libc::close(p.log_fd);
         }
         if p.notify_w >= 0 {
-            if libc::dup2(p.notify_w, 3) < 0 {
+            if libc::dup2(p.notify_w, p.notify_no) < 0 {
                 return false;
             }
-            if p.notify_w != 3 {
+            if p.notify_w != p.notify_no {
                 libc::close(p.notify_w);
             }
         }
-        if p.notify_r >= 0 {
-            libc::close(p.notify_r);
+        for i in 0..p.listen_len {
+            // SAFETY: `listen_fds` points at `listen_len` parent-prepared
+            // ints; the loop bounds the reads.
+            let fd = *p.listen_fds.add(i);
+            let target = 3 + i as libc::c_int;
+            if libc::dup2(fd, target) < 0 {
+                return false;
+            }
+            if fd != target {
+                libc::close(fd);
+            }
         }
         // The exec-error write-end stays open (CLOEXEC): a successful exec
         // closes it, which is the parent's success signal. Closed explicitly
@@ -809,6 +1101,52 @@ fn child_step_no_new_privs() {
     }
 }
 
+/// Drop capabilities from the bounding set.
+///
+/// Runs right after the uid drop: reducing our own bounding set needs no
+/// privilege, and everything after this point runs with exactly the
+/// capabilities the operator allowed. Irreversible by design — once dropped
+/// from the bounding set, a capability cannot be regained, even across a
+/// setuid `execve`. Failure fails the spawn: running with *more* privilege
+/// than configured is the one outcome this step must never produce.
+///
+/// The length is consulted on every platform so the fields stay live
+/// everywhere; only Linux acts on them (off Linux the parent refuses a
+/// non-empty list, so the loop below is unreachable there).
+// `cap as c_ulong` is a real conversion on LP64 and the identity on ILP32,
+// where the cast is redundant and rightly refused. The allow documents the
+// split rather than hiding it — same pattern as the mount-flags cast in
+// `zinit --init`.
+#[allow(clippy::unnecessary_cast)]
+fn child_step_capdrop(p: ChildPlan) -> bool {
+    if p.cap_len == 0 {
+        return true;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // `PR_CAPBSET_DROP` is 24 (linux/prctl.h); defined here so a missing
+        // binding is impossible by construction, like the seccomp constants.
+        const PR_CAPBSET_DROP: libc::c_int = 24;
+        for i in 0..p.cap_len {
+            // SAFETY: `cap_drops` points at `cap_len` parent-prepared numbers;
+            // the loop bounds the reads. `prctl` retains nothing.
+            let cap: u32 = unsafe { *p.cap_drops.add(i) };
+            if unsafe { libc::prctl(PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) } != 0 {
+                return false;
+            }
+        }
+        true
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // Unreachable in practice (see above): a non-empty list cannot arrive
+        // here, and failing closed beats running unconfined. Reading the
+        // pointer keeps the field live on targets that never act on it.
+        let _ = p.cap_drops;
+        false
+    }
+}
+
 /// Take over the controlling terminal for `console` services.
 ///
 /// Only when a tty path was supplied; without one the service runs
@@ -836,6 +1174,70 @@ fn child_step_ctty(p: ChildPlan) -> bool {
         libc::close(fd);
         true
     }
+}
+
+/// Write our own pid into the `LISTEN_PID=` digit field, as plain decimal.
+///
+/// The parent built the environment before the fork — when our pid did not
+/// exist yet — and left a fixed 10-digit field for exactly this. The digits
+/// go in from the left with a fresh NUL right after them, so the entry reads
+/// as plain decimal (`18477`, not `0000018477`): ten digits hold any `u32`
+/// pid, and the parent's terminator sits exactly where a 10-digit pid needs
+/// it. `getpid` here is infallible and the field cannot overflow, so this
+/// step cannot fail: there is no `bool` to return and no errno to report.
+/// A null field (no listeners) is a no-op.
+fn child_step_listen_pid(p: ChildPlan) {
+    if p.listen_pid_digits.is_null() {
+        return;
+    }
+    // SAFETY: the field is 10 parent-prepared bytes in this frame's inherited
+    // copy, plus the parent's terminator right after them. `getpid` takes
+    // nothing and retains nothing; only plain integer arithmetic below.
+    unsafe {
+        let mut pid = libc::getpid();
+        let digits = p.listen_pid_digits;
+        if pid <= 0 {
+            // Unreachable in practice (`getpid` is always positive); a `0`
+            // keeps the entry valid rather than leaving ten stale zeroes.
+            *digits = b'0';
+            *digits.add(1) = 0;
+            return;
+        }
+        let mut rev = [0u8; 10];
+        let mut len = 0usize;
+        while pid > 0 && len < 10 {
+            rev[len] = b'0' + (pid % 10) as u8;
+            pid /= 10;
+            len += 1;
+        }
+        let mut i = 0;
+        while i < len {
+            *digits.add(i) = rev[len - 1 - i];
+            i += 1;
+        }
+        *digits.add(len) = 0;
+    }
+}
+
+/// Install the seccomp-bpf filter: the last thing before `execve`.
+///
+/// Last on purpose. Everything after the install — including a failing
+/// `execve`'s own error report — runs *under* the filter, and the filter
+/// deliberately allows almost nothing past this point (not even `getpid`,
+/// which is why the pid write above precedes it, and not the `open`/`ioctl`
+/// the tty handover needed, which is why that precedes it too). A service
+/// that needs a call the filter forbids dies loudly (killed or `EPERM`, per
+/// the configured action) instead of escaping it. An empty program is
+/// unconfined and always succeeds.
+fn child_step_seccomp(p: ChildPlan) -> bool {
+    if p.seccomp_len == 0 {
+        return true;
+    }
+    // SAFETY: `seccomp_filter` points at `seccomp_len` parent-assembled
+    // instructions in this frame's inherited copy; `install` copies the
+    // program into the kernel and retains nothing.
+    unsafe { zrt::seccomp::install(core::slice::from_raw_parts(p.seccomp_filter, p.seccomp_len)) }
+        .is_ok()
 }
 
 /// Resolve `argv[0]` to an executable path, searching `PATH` when needed.
@@ -878,12 +1280,17 @@ fn is_executable(path: &Path) -> bool {
 /// The supervisor's environment overlaid with the service's.
 ///
 /// Order: inherit everything, then apply `overlay` left-to-right (last
-/// binding wins, mirroring what `execve` consumers observe), then pin
-/// `ZINIT_NOTIFY_FD=3` when the handshake needs it. Values are expanded
+/// binding wins, mirroring what `execve` consumers observe), then pin the
+/// supervisor-owned variables: `ZINIT_NOTIFY_FD` when the handshake needs
+/// it, and the `LISTEN_*` trio when sockets are passed down. Pinning
+/// overwrites a service-supplied value on purpose — the numbers describe
+/// descriptors this spawn created, and a service file that sets them by hand
+/// describes descriptors that do not exist. Values are expanded
 /// ([`expand_env_value`]) against the inherited environment.
 fn merged_environment(
     overlay: &[(String, String)],
-    wants_notify: bool,
+    notify_no: Option<u32>,
+    listen_names: &[String],
 ) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     for (k, v) in std::env::vars_os() {
@@ -909,17 +1316,31 @@ fn merged_environment(
             None => pairs.push((k.as_bytes().to_vec(), expanded.into_bytes())),
         }
     }
-    if wants_notify {
-        match pairs
-            .iter_mut()
-            .rev()
-            .find(|(k, _)| k == b"ZINIT_NOTIFY_FD")
-        {
-            Some(slot) => slot.1 = b"3".to_vec(),
-            None => pairs.push((b"ZINIT_NOTIFY_FD".to_vec(), b"3".to_vec())),
-        }
+    if let Some(no) = notify_no {
+        pin(&mut pairs, "ZINIT_NOTIFY_FD", no.to_string().as_bytes());
+    }
+    if !listen_names.is_empty() {
+        pin(
+            &mut pairs,
+            "LISTEN_FDS",
+            listen_names.len().to_string().as_bytes(),
+        );
+        pin(&mut pairs, "LISTEN_PID", b"0000000000");
+        let joined = listen_names.join(":");
+        pin(&mut pairs, "LISTEN_FDNAMES", joined.as_bytes());
     }
     Ok(pairs)
+}
+
+/// Set `key` to `value`, replacing any binding the service (or the
+/// supervisor's own environment) already gave it. Last binding wins at
+/// `execve`, and these keys describe this spawn's descriptors — inheriting
+/// or overlaying them would point the service at someone else's fds.
+fn pin(pairs: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &str, value: &[u8]) {
+    match pairs.iter_mut().rev().find(|(k, _)| k == key.as_bytes()) {
+        Some(slot) => slot.1 = value.to_vec(),
+        None => pairs.push((key.as_bytes().to_vec(), value.to_vec())),
+    }
 }
 
 /// `PATH` from a merged environment, with the conventional fallback.
@@ -1050,6 +1471,7 @@ mod tests {
             log,
             service_name: "test",
             tty: None,
+            listen: &[],
         }
     }
 
@@ -1281,5 +1703,145 @@ mod tests {
             // The digits are right-aligned at the end of the buffer.
             assert_eq!(&buf[buf.len() - len..], want.as_bytes(), "pid {n}");
         }
+    }
+
+    /// Drain the exec-error pipe for a failure message: eight bytes are
+    /// `errno` + failing step (see `CHILD_STEP_*`); EOF is a clean exec.
+    fn exec_verdict(exec: RawFd) -> String {
+        fn step_name(step: u32) -> &'static str {
+            match step {
+                1 => "sigmask",
+                2 => "session",
+                3 => "fds",
+                4 => "chdir",
+                5 => "rlimits",
+                6 => "cgroup",
+                7 => "ids",
+                8 => "capdrop",
+                9 => "ctty",
+                10 => "seccomp",
+                11 => "execve",
+                _ => "unknown-step",
+            }
+        }
+        let mut ebuf = [0u8; 8];
+        let mut egot = 0;
+        loop {
+            match zrt::sys::read(exec, &mut ebuf[egot..]) {
+                Ok(0) if egot == 0 => break String::from("exec ok"),
+                Ok(0) => {
+                    break format!("exec pipe truncated after {egot} bytes");
+                }
+                Ok(n) => {
+                    egot += n;
+                    if egot >= 8 {
+                        let errno = u32::from_le_bytes(ebuf[..4].try_into().expect("slice"));
+                        let step = u32::from_le_bytes(ebuf[4..].try_into().expect("slice"));
+                        break format!("exec failed at {}: errno {errno}", step_name(step));
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    break String::from("exec undecided yet");
+                }
+                Err(e) => panic!("exec pipe read: {e}"),
+            }
+        }
+    }
+
+    /// Listen sockets arrive on fd 3.. with names and the child's own pid in
+    /// the environment — the whole activation contract, asserted from inside
+    /// a real (script) child.
+    #[test]
+    fn listen_sockets_arrive_with_names_and_pid() {
+        let plan = script_plan("lst");
+        let log = LogSink::None;
+        let (a, b) = zrt::sys::socketpair().expect("socketpair");
+        let listen = [(a, String::from("test"))];
+        let probe = "test \"$LISTEN_FDS\" = 1 && test \"$LISTEN_FDNAMES\" = test";
+        let probe_pid = "test \"$LISTEN_PID\" = $$";
+        let cmd = format!("{probe} && {probe_pid}");
+        let c = SpawnCtx {
+            listen: &listen,
+            ..ctx(&cmd, &[], &log)
+        };
+        let s = spawn(&plan, 0, &c).expect("spawn");
+        // Ours to close: the child holds its own dups, and `reap` only
+        // releases what `Spawned` owns (the listen set outlives one start).
+        let _ = zrt::sys::close_quietly(a);
+        let _ = zrt::sys::close_quietly(b);
+        // The exec verdict, drained for the failure message: `Exited(127)`
+        // below means the child path failed before `execve` (with its step
+        // and errno here), not that the script's probes failed.
+        let exec_verdict = exec_verdict(s.exec_fd.expect("exec pipe"));
+        assert_eq!(
+            reap(&s),
+            zrt::sys::ExitStatus::Exited(0),
+            "exec verdict was: {exec_verdict}"
+        );
+    }
+
+    /// A notify handshake and a listen socket share the child without
+    /// colliding: listeners take 3.., the notifier moves past them.
+    #[test]
+    fn notify_moves_past_listen_sockets() {
+        let mut sp = ServicePlan::new(String::from("both"));
+        sp.kind = ServiceKind::Script;
+        sp.ready = zcore::Ready::Notify;
+        sp.log = LogSink::None;
+        let plan = plan_with(sp);
+        let log = LogSink::None;
+        let (a, b) = zrt::sys::socketpair().expect("socketpair");
+        let listen = [(a, String::from("sock"))];
+        let c = SpawnCtx {
+            listen: &listen,
+            ..ctx(
+                "test \"$ZINIT_NOTIFY_FD\" = 4 && echo READY=1 >&$ZINIT_NOTIFY_FD",
+                &[],
+                &log,
+            )
+        };
+        let s = spawn(&plan, 0, &c).expect("spawn");
+        assert!(s.notify_fd.is_some());
+        let _ = zrt::sys::close_quietly(a);
+        let _ = zrt::sys::close_quietly(b);
+        // The exec verdict first: a child that never exec'd (missing shell,
+        // dead binary) reports here, not on the notify pipe. EOF means the
+        // image was replaced; eight bytes mean step + errno; WouldBlock means
+        // the child has not decided yet and the notify drain below is the
+        // verdict that counts.
+        let exec_verdict = exec_verdict(s.exec_fd.expect("exec pipe"));
+        // The child wrote READY=1 to fd 4; drain it from our read end like
+        // the supervisor's readiness poll would, with a deadline instead of
+        // a single optimistic read — the child may not have run yet.
+        let notify = s.notify_fd.expect("pipe");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut buf = [0u8; 16];
+        let mut got = 0;
+        let mut saw_eof = false;
+        let mut timed_out = false;
+        while got < 8 {
+            match zrt::sys::read(notify, &mut buf[got..]) {
+                Ok(0) => {
+                    saw_eof = true;
+                    break;
+                }
+                Ok(n) => got += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() > deadline {
+                        timed_out = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("notify read: {e}"),
+            }
+        }
+        assert!(
+            buf[..got].starts_with(b"READY=1"),
+            "notify on moved fd: got={got} eof={saw_eof} timeout={timed_out} exec=[{exec_verdict}] bytes={:?}",
+            &buf[..got]
+        );
+        let _ = zrt::sys::kill_process(s.pid, zrt::signals::Signal::Kill);
+        let _ = reap(&s);
     }
 }

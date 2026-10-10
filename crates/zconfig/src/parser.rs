@@ -102,12 +102,13 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use zcore::ServiceKind;
+use zcore::{SeccompAction, ServiceKind};
 
 use crate::desc::{ServiceDesc, validate_service_name};
 use crate::diagnostic::{Diagnostic, DiagnosticBag, Span};
 use crate::value::{
-    LogSpec, ReadySpec, ReadySpecKind, RestartSpec, RunAs, ValueError, parse_duration, parse_u64,
+    LogSpec, ReadySpec, ReadySpecKind, RestartSpec, RunAs, ValueError, parse_capability,
+    parse_duration, parse_listen, parse_u64,
 };
 
 /// Longest single line the parser will look at, in bytes.
@@ -175,6 +176,18 @@ pub enum Directive {
     RlimitNproc,
     /// Soft limit on address space, in bytes.
     RlimitAs,
+    /// Path of the pid file, for `type = forking` only.
+    PidFile,
+    /// Watchdog budget in whole seconds; needs `ready = notify`.
+    WatchdogSec,
+    /// `tcp:<port>[:<name>]` or `unix:<path>`, repeatable and accumulating.
+    Listen,
+    /// Space-separated Linux capability names to drop from the bounding set.
+    DropCapabilities,
+    /// `enforce` | `errno` | `off`: what a seccomp violation does.
+    SyscallFilter,
+    /// Space-separated syscall names to allow past the filter.
+    SyscallAllow,
 }
 
 impl Directive {
@@ -199,6 +212,12 @@ impl Directive {
             Directive::RlimitNofile => "rlimit-nofile",
             Directive::RlimitNproc => "rlimit-nproc",
             Directive::RlimitAs => "rlimit-as",
+            Directive::PidFile => "pid-file",
+            Directive::WatchdogSec => "watchdog-sec",
+            Directive::Listen => "listen",
+            Directive::DropCapabilities => "drop-capabilities",
+            Directive::SyscallFilter => "syscall-filter",
+            Directive::SyscallAllow => "syscall-allow",
         }
     }
 
@@ -210,7 +229,7 @@ impl Directive {
     /// hidden property of the service *name* would be a policy nobody could
     /// read off the file. The alternative, refusing to model it at all, means
     /// the runtime has to hardcode the same list somewhere less visible.
-    pub const ALL: [Directive; 18] = [
+    pub const ALL: [Directive; 24] = [
         Directive::Command,
         Directive::Type,
         Directive::Depends,
@@ -229,6 +248,12 @@ impl Directive {
         Directive::RlimitNofile,
         Directive::RlimitNproc,
         Directive::RlimitAs,
+        Directive::PidFile,
+        Directive::WatchdogSec,
+        Directive::Listen,
+        Directive::DropCapabilities,
+        Directive::SyscallFilter,
+        Directive::SyscallAllow,
     ];
 
     /// Match a raw key, applying the case and `-`/`_` normalisation.
@@ -255,12 +280,12 @@ impl Directive {
     /// Whether repeating this directive is an accumulation rather than a
     /// contradiction.
     ///
-    /// Exactly one directive, and it is the one whose *entire purpose* is to
-    /// be written more than once. Anything else that is repeated has two
-    /// values fighting over one field, and "which one won" is a question
-    /// nobody can answer by reading the file.
+    /// Exactly two directives, and both are ones whose *entire purpose* is to
+    /// be written more than once: `env` bindings and `listen` sockets. Anything
+    /// else that is repeated has two values fighting over one field, and
+    /// "which one won" is a question nobody can answer by reading the file.
     pub const fn accumulates(self) -> bool {
-        matches!(self, Directive::Env)
+        matches!(self, Directive::Env | Directive::Listen)
     }
 }
 
@@ -610,9 +635,7 @@ pub fn parse_service_with_diagnostics(name: &str, text: &str) -> Result<ParsedSe
                         directive.name(),
                         first.line
                     ),
-                    String::from(
-                        "each directive may appear once; `env` is the only one that repeats",
-                    ),
+                    String::from("each directive may appear once; only `env` and `listen` repeat"),
                 ));
             }
         }
@@ -661,7 +684,7 @@ pub fn parse_service_with_diagnostics(name: &str, text: &str) -> Result<ParsedSe
                         return Err(bad_value(
                             directive,
                             value_span,
-                            "write `process`, `script`, `target` or `console`; `script` runs the command through a shell and `target` starts no process at all",
+                            "write one of: process script target console oneshot forking",
                         ));
                     }
                 };
@@ -747,6 +770,81 @@ pub fn parse_service_with_diagnostics(name: &str, text: &str) -> Result<ParsedSe
                 };
                 desc.env.push((k, v));
             }
+            Directive::Listen => {
+                match parse_listen(value) {
+                    Ok(addr) => desc.listens.push(addr),
+                    Err(e) => return Err(ParseError::from_value(e.into(), value_span)),
+                };
+            }
+            Directive::DropCapabilities => {
+                let mut caps = Vec::new();
+                for word in value.split_whitespace() {
+                    if parse_capability(word).is_none() {
+                        return Err(bad_value(
+                            directive,
+                            value_span,
+                            "write Linux capability names; `CAP_` prefix and case are ignored",
+                        ));
+                    }
+                    // Canonical spelling (lowercase, no prefix), so
+                    // `CAP_SYS_ADMIN` and `sys_admin` in two layers merge
+                    // instead of doubling the drop.
+                    let lower = word.to_ascii_lowercase();
+                    let norm = lower.strip_prefix("cap_").unwrap_or(&lower);
+                    caps.push(norm.to_owned());
+                }
+                if caps.is_empty() {
+                    return Err(bad_value(
+                        directive,
+                        value_span,
+                        "name at least one capability to drop",
+                    ));
+                }
+                desc.drop_caps = caps;
+            }
+            Directive::SyscallFilter => {
+                // Explicit `off` assigns `None` rather than skipping the arm:
+                // a drop-in that says `off` over a base that says `enforce`
+                // must win, and only a recorded presence makes that work.
+                match value {
+                    "enforce" => desc.syscall_filter = Some(SeccompAction::Enforce),
+                    "errno" => desc.syscall_filter = Some(SeccompAction::Errno),
+                    "off" => desc.syscall_filter = None,
+                    _ => {
+                        return Err(bad_value(
+                            directive,
+                            value_span,
+                            "write `enforce`, `errno` or `off`",
+                        ));
+                    }
+                }
+            }
+            Directive::SyscallAllow => {
+                let mut names = Vec::new();
+                for word in value.split_whitespace() {
+                    if word.is_empty()
+                        || !word
+                            .as_bytes()
+                            .iter()
+                            .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                    {
+                        return Err(bad_value(
+                            directive,
+                            value_span,
+                            "write syscall names; numbers are arch-specific",
+                        ));
+                    }
+                    names.push(word.to_owned());
+                }
+                if names.is_empty() {
+                    return Err(bad_value(
+                        directive,
+                        value_span,
+                        "name at least one syscall to allow",
+                    ));
+                }
+                desc.syscall_allow = names;
+            }
             Directive::Log => {
                 desc.log = match LogSpec::parse(value) {
                     Ok(l) => l,
@@ -786,7 +884,36 @@ pub fn parse_service_with_diagnostics(name: &str, text: &str) -> Result<ParsedSe
                 };
                 desc.rlimits.push((key.to_owned(), number));
             }
+            Directive::PidFile => {
+                desc.pid_file = Some(value.to_owned());
+            }
+            Directive::WatchdogSec => {
+                let secs = match parse_u64(value).ok() {
+                    Some(n) => n,
+                    None => {
+                        return Err(bad_value(
+                            directive,
+                            value_span,
+                            "write whole seconds with no sign and no decimals, e.g. `30`",
+                        ));
+                    }
+                };
+                if secs == 0 {
+                    return Err(bad_value(
+                        directive,
+                        value_span,
+                        "a zero-second watchdog kills every start; omit it to disable",
+                    ));
+                }
+                desc.watchdog_sec = Some(secs);
+            }
         }
+        // One hook for every arm: each one above either applied its
+        // directive or returned an error, so reaching here means "this file
+        // said this directive". Drop-in merging reads these marks; without
+        // them a default the parser filled in would be indistinguishable from
+        // an explicit choice.
+        desc.mark_explicit(directive);
     }
 
     // ── whole-file checks ──────────────────────────────────────────────────
@@ -808,6 +935,58 @@ pub fn parse_service_with_diagnostics(name: &str, text: &str) -> Result<ParsedSe
                 return Err(virtual_directive_error(directive, desc.kind, span));
             }
         }
+    }
+
+    // A `pid-file` on anything but a forking daemon is a path nobody will
+    // ever read: only the adoption logic follows it, and it only runs for
+    // `Forking`. Stored and ignored would be a lie in the file, so it is an
+    // error in the file. Drop-ins restating `type = forking` alongside it
+    // pass; the merged cross-layer case is caught again at load.
+    if desc.is_explicit(Directive::PidFile) && desc.kind != ServiceKind::Forking {
+        let span = span_of(&seen, Directive::PidFile).unwrap_or(Span::point(1, 1));
+        return Err(bad_value(
+            Directive::PidFile,
+            span,
+            "pid-file needs `type = forking` in the same file, drop-ins included",
+        ));
+    }
+    // Sockets nobody spawns for bind nowhere: same shape as `pid-file`, for
+    // every kind without a process.
+    if desc.is_explicit(Directive::Listen) && !desc.kind.has_process() {
+        let span = span_of(&seen, Directive::Listen).unwrap_or(Span::point(1, 1));
+        return Err(bad_value(
+            Directive::Listen,
+            span,
+            "listen needs a process; a target never spawns to receive sockets",
+        ));
+    }
+    // A watchdog nobody can feed is a kill timer: pings arrive on the notify
+    // fd, so without `ready = notify` the first expiry would murder a healthy
+    // service — and a target has no process at all, so its expiry would fire
+    // on a service that cannot even be stopped. Refused here rather than
+    // regretted in production.
+    if desc.watchdog_sec.is_some()
+        && (desc.is_virtual() || desc.ready.kind != ReadySpecKind::Notify)
+    {
+        let span = span_of(&seen, Directive::WatchdogSec).unwrap_or(Span::point(1, 1));
+        return Err(bad_value(
+            Directive::WatchdogSec,
+            span,
+            "watchdog-sec needs a process with `ready = notify`: pings arrive on the notify fd",
+        ));
+    }
+
+    // An allow-list with no filter is a dead list: nothing reads it, so a
+    // typo in `syscall-filter` would silently unconfine the service. The
+    // reverse (a filter with an empty list) is meaningful — the tightest
+    // possible confinement — and stays legal.
+    if desc.syscall_filter.is_none() && !desc.syscall_allow.is_empty() {
+        let span = span_of(&seen, Directive::SyscallAllow).unwrap_or(Span::point(1, 1));
+        return Err(bad_value(
+            Directive::SyscallAllow,
+            span,
+            "syscall-allow needs a filter; allowed names alone confine nothing",
+        ));
     }
 
     // A missing `command` is not an error here: descriptions can be layered (a
@@ -960,6 +1139,8 @@ fn parse_kind(value: &str) -> Option<ServiceKind> {
         ServiceKind::Script,
         ServiceKind::Target,
         ServiceKind::Console,
+        ServiceKind::Oneshot,
+        ServiceKind::Forking,
     ]
     .into_iter()
     .find(|&kind| value.eq_ignore_ascii_case(kind.name()))
@@ -1836,6 +2017,7 @@ rlimit-nofile = 8192
             );
         }
         assert!(Directive::Env.accumulates());
+        assert!(Directive::Listen.accumulates());
     }
 
     /// A value `d` accepts, for the duplicate test above.
@@ -1856,6 +2038,12 @@ rlimit-nofile = 8192
             Directive::Critical => "no",
             Directive::Cgroup => "web",
             Directive::RlimitNofile | Directive::RlimitNproc | Directive::RlimitAs => "1",
+            Directive::PidFile => "/run/x.pid",
+            Directive::WatchdogSec => "30",
+            Directive::Listen => "tcp:8080",
+            Directive::DropCapabilities => "sys_admin",
+            Directive::SyscallFilter => "enforce",
+            Directive::SyscallAllow => "read",
             Directive::Env => "A=1",
         }
     }
@@ -2906,5 +3094,154 @@ rlimit-nofile = 8192
         *rng ^= *rng >> 7;
         *rng ^= *rng << 17;
         *rng
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_directive_tests {
+    use super::*;
+    use alloc::vec;
+
+    fn parsed(text: &str) -> ServiceDesc {
+        parse_service("svc", text).expect("test fixture must parse")
+    }
+
+    #[test]
+    fn new_kinds_parse_case_insensitively() {
+        let task = "type = oneshot\ncommand = /bin/task\n";
+        assert_eq!(parsed(task).kind, ServiceKind::Oneshot);
+        let daemon = "type = FORKING\ncommand = /bin/daemon\npid-file = /run/d.pid\n";
+        assert_eq!(parsed(daemon).kind, ServiceKind::Forking);
+    }
+
+    #[test]
+    fn pid_file_and_watchdog_land_on_the_description() {
+        let text = "type = forking\ncommand = /bin/daemon\npid-file = /run/d.pid\n";
+        let text2 = "ready = notify\nwatchdog-sec = 30\n";
+        let d = parsed(&format!("{text}{text2}"));
+        assert_eq!(d.pid_file.as_deref(), Some("/run/d.pid"));
+        assert_eq!(d.watchdog_sec, Some(30));
+    }
+
+    #[test]
+    fn pid_file_elsewhere_is_refused() {
+        for kind in ["process", "script", "oneshot", "console", "target"] {
+            let text = format!("type = {kind}\ncommand = /bin/x\npid-file = /run/x.pid\n");
+            let e = parse_service("svc", &text).expect_err("pid-file must be forking-only");
+            assert!(e.message.contains("pid-file"), "wrong error: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn watchdog_without_notify_is_refused() {
+        for ready in ["none", "ping:/bin/check", "tcp:80"] {
+            let text = format!("command = /bin/x\nready = {ready}\nwatchdog-sec = 30\n");
+            let e = parse_service("svc", &text).expect_err("watchdog needs notify");
+            assert!(e.message.contains("watchdog"), "wrong error: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn watchdog_zero_is_refused() {
+        let e = parse_service(
+            "svc",
+            "command = /bin/x\nready = notify\nwatchdog-sec = 0\n",
+        )
+        .expect_err("zero watchdog must not parse");
+        assert!(
+            e.message.contains("watchdog-sec"),
+            "wrong error: {}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn watchdog_on_a_target_is_refused() {
+        let e = parse_service("svc", "type = target\nwatchdog-sec = 30\n")
+            .expect_err("a target cannot be watched");
+        assert!(e.message.contains("watchdog"), "wrong error: {}", e.message);
+    }
+
+    #[test]
+    fn listen_accumulates_and_parses() {
+        let d = parsed("command = /bin/x\nlisten = tcp:80\nlisten = unix:/run/x.sock\n");
+        assert_eq!(d.listens.len(), 2);
+        assert_eq!(d.listens[0].name, "tcp:80");
+    }
+
+    #[test]
+    fn confinement_directives_parse() {
+        let base = "command = /bin/x\nready = notify\n";
+        let caps = "drop-capabilities = sys_admin CAP_CHOWN\n";
+        let filter = "syscall-filter = enforce\nsyscall-allow = read write\n";
+        let d = parsed(&format!("{base}{caps}{filter}"));
+        assert_eq!(
+            d.drop_caps,
+            vec![String::from("sys_admin"), String::from("chown")]
+        );
+        assert_eq!(d.syscall_filter, Some(SeccompAction::Enforce));
+        assert_eq!(
+            d.syscall_allow,
+            vec![String::from("read"), String::from("write")]
+        );
+    }
+
+    #[test]
+    fn confinement_refusals_are_loud() {
+        let e = parse_service(
+            "svc",
+            "command = /bin/x\ndrop-capabilities = sys_admin nope\n",
+        )
+        .expect_err("unknown capability");
+        assert!(
+            e.message.contains("drop-capabilities"),
+            "wrong error: {}",
+            e.message
+        );
+        let e = parse_service("svc", "command = /bin/x\nsyscall-filter = strict\n")
+            .expect_err("unknown filter action");
+        assert!(
+            e.message.contains("syscall-filter"),
+            "wrong error: {}",
+            e.message
+        );
+        let e = parse_service("svc", "command = /bin/x\nsyscall-allow = read\n")
+            .expect_err("allow list without a filter");
+        assert!(
+            e.message.contains("syscall-allow"),
+            "wrong error: {}",
+            e.message
+        );
+        let bad_allow = "command = /bin/x\nsyscall-filter = enforce\n";
+        let bad_allow = format!("{bad_allow}syscall-allow = read(2)\n");
+        let e = parse_service("svc", &bad_allow).expect_err("malformed syscall name");
+        assert!(
+            e.message.contains("syscall-allow"),
+            "wrong error: {}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn syscall_filter_off_clears_explicitly() {
+        let mut base = parsed("command = /bin/x\nsyscall-filter = enforce\nsyscall-allow = read\n");
+        let over = parsed("command = /bin/x\nsyscall-filter = off\n");
+        base.overlay_onto(over);
+        assert_eq!(base.syscall_filter, None);
+        // ...while an overlay that never mentions it keeps the base's.
+        let mut base2 = parsed("command = /bin/x\nsyscall-filter = errno\n");
+        let over2 = parsed("command = /bin/x\n");
+        base2.overlay_onto(over2);
+        assert_eq!(base2.syscall_filter, Some(SeccompAction::Errno));
+    }
+
+    #[test]
+    fn new_directives_are_single_valued() {
+        let e = parse_service(
+            "svc",
+            "command = /bin/x\nwatchdog-sec = 10\nwatchdog-sec = 20\n",
+        )
+        .expect_err("duplicate watchdog-sec");
+        assert_eq!(e.code, "E005");
     }
 }

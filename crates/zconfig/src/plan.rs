@@ -441,6 +441,14 @@ fn service_plan(graph: &Graph, i: Idx, findings: &mut Vec<Diagnostic>) -> Servic
     sp.restart_budget = d.restart.budget;
     sp.log = log_of(d);
     sp.run_as = d.run_as.map(|r| (r.uid, r.gid));
+    sp.pid_file = d.pid_file.clone();
+    sp.watchdog_sec = d.watchdog_sec;
+    sp.listens = d.listens.clone();
+    sp.seccomp = d.syscall_filter.map(|action| zcore::SeccompPolicy {
+        action,
+        allow: d.syscall_allow.clone(),
+    });
+    sp.drop_caps = d.drop_caps.clone();
 
     // A target has no process, so it has no handshake to wait for. Forcing
     // `Ready::None` here is what lets the runtime treat targets uniformly

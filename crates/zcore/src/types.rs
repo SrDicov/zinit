@@ -121,6 +121,18 @@ pub enum ServiceKind {
     Target,
     /// Owns the controlling terminal.
     Console,
+    /// Run once to a clean exit. Success is terminal: the service is marked
+    /// `completed`, dependents treat it as satisfied, and only an explicit
+    /// `kick` (or `start`) runs it again. A non-zero exit follows the restart
+    /// policy like any other crash — completion beats the policy, failure
+    /// obeys it.
+    Oneshot,
+    /// Legacy double-forking daemon. The direct child is expected to exit
+    /// promptly; the real pid is read from `pid_file` and adopted. An adopted
+    /// process is always signalled by pid, never by group: the supervisor
+    /// cannot prove the daemon made its own group, and signalling a group it
+    /// never owned is how a supervisor kills itself.
+    Forking,
 }
 
 impl ServiceKind {
@@ -130,6 +142,8 @@ impl ServiceKind {
             ServiceKind::Script => "script",
             ServiceKind::Target => "target",
             ServiceKind::Console => "console",
+            ServiceKind::Oneshot => "oneshot",
+            ServiceKind::Forking => "forking",
         }
     }
 
@@ -137,7 +151,11 @@ impl ServiceKind {
     pub const fn has_process(self) -> bool {
         matches!(
             self,
-            ServiceKind::Process | ServiceKind::Script | ServiceKind::Console
+            ServiceKind::Process
+                | ServiceKind::Script
+                | ServiceKind::Console
+                | ServiceKind::Oneshot
+                | ServiceKind::Forking
         )
     }
 }
@@ -259,6 +277,58 @@ impl Default for LogSink {
             backups: 3,
         }
     }
+}
+
+/// Where a service listens before it starts (socket activation).
+///
+/// The supervisor binds these once, holds them across restarts, and passes
+/// the descriptors down at every spawn through `$LISTEN_FDS` /
+/// `$LISTEN_PID` / `$LISTEN_FDNAMES`, starting at fd 3. `TcpPort` binds
+/// 127.0.0.1 only: the safe default, and the same loopback the `tcp`
+/// readiness probe dials, so `ready = tcp:<port>` and `listen = tcp:<port>`
+/// agree with each other out of the box. A public bind needs an explicit
+/// address grammar that does not exist yet — the parser, not this type, is
+/// where that refusal lives.
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub enum ListenSpec {
+    /// TCP on loopback, this port (1-65535; 0 is refused at parse).
+    TcpPort(u16),
+    /// Unix stream socket at this path.
+    UnixPath(String),
+}
+
+/// One bound socket plus its logical name for `$LISTEN_FDNAMES`.
+///
+/// The name defaults to the spec text when the directive omits it; it may
+/// not contain whitespace or `:` (the names travel colon-joined), which the
+/// parser enforces.
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub struct ListenAddr {
+    /// Where to listen.
+    pub spec: ListenSpec,
+    /// Logical name for `$LISTEN_FDNAMES`.
+    pub name: String,
+}
+
+/// What a seccomp violation does to the service.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum SeccompAction {
+    /// Kill the process (`SECCOMP_RET_KILL_PROCESS`). Fail-closed.
+    Enforce,
+    /// Fail the call with `EPERM` (`SECCOMP_RET_ERRNO`). The service limps on.
+    Errno,
+}
+
+/// A seccomp-bpf filter request: the action plus the user-allowed syscall
+/// names on top of the always-allowed baseline. Names resolve to numbers at
+/// spawn time, on a verified per-arch table — an unresolvable name refuses
+/// the spawn rather than shipping a filter with a hole.
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub struct SeccompPolicy {
+    /// What a violation does.
+    pub action: SeccompAction,
+    /// Extra allowed syscall names beyond the baseline.
+    pub allow: Vec<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -440,6 +510,28 @@ pub struct ServicePlan {
     pub log: LogSink,
     /// `Some(uid, gid)` when the service drops privileges.
     pub run_as: Option<(u32, u32)>,
+    /// Path of the pid file a `Forking` daemon writes: its real pid after the
+    /// double fork, read by the supervisor and adopted. `None` for every
+    /// other kind — the parser refuses `pid-file` elsewhere rather than
+    /// storing a path nobody will read.
+    pub pid_file: Option<String>,
+    /// Watchdog budget in seconds: the service must write `WATCHDOG=1` to its
+    /// notify fd at least this often, or it is stopped (and, `Desired`
+    /// unchanged, started again). `None` disables the watchdog. Only
+    /// meaningful with `ready = notify`; the parser refuses the combination
+    /// that could never be fed.
+    pub watchdog_sec: Option<u64>,
+    /// Sockets to pre-bind and pass down (socket activation). Empty means
+    /// none; `listen` is the only accumulating directive besides `env`, so
+    /// several lines — and drop-ins — each add one socket.
+    pub listens: Vec<ListenAddr>,
+    /// Seccomp-bpf confinement (`syscall-filter` + `syscall-allow`). `None`
+    /// is unconfined. Linux-only at spawn; elsewhere a configured filter
+    /// refuses the spawn rather than running it unconfined and quiet.
+    pub seccomp: Option<SeccompPolicy>,
+    /// Linux capabilities to drop from the bounding set, canonical names.
+    /// Empty is undropped. Linux-only at spawn, like `seccomp`.
+    pub drop_caps: Vec<String>,
 }
 
 impl ServicePlan {
@@ -458,6 +550,11 @@ impl ServicePlan {
             restart_budget: Budget::default(),
             log: LogSink::default(),
             run_as: None,
+            pid_file: None,
+            watchdog_sec: None,
+            listens: Vec::new(),
+            seccomp: None,
+            drop_caps: Vec::new(),
         }
     }
 }

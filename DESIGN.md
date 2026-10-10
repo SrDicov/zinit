@@ -299,6 +299,13 @@ env        = PATH=/usr/bin:/bin SSH_LOG_LEVEL=INFO
 | `log` | `none` \| `file` \| `syslog` | `file` | destino `/var/log/zinit/<svc>.log` |
 | `rlimit-nofile` \| `rlimit-nproc` \| `rlimit-as` | número | — | sólo donde exista |
 | `cgroup` | ruta bajo `zinit.slice` | — | Linux; elsewhere ⇒ aviso |
+| `type` += | `oneshot` \| `forking` | — | `oneshot` = éxito terminal; `forking` = adopta vía `pid-file` |
+| `pid-file` | ruta | — | sólo `forking`; el pid real tras el doble fork |
+| `watchdog-sec` | segundos ≥1 | — | sólo con `ready = notify`; `WATCHDOG=1` por el fd 3 |
+| `listen` | `tcp:<puerto>[:<nombre>]` \| `unix:<ruta>`, repetible | — | pre-bind en 127.0.0.1; `$LISTEN_FDS/$LISTEN_PID/$LISTEN_FDNAMES` desde fd 3 |
+| `drop-capabilities` | nombres (`sys_admin`…) | — | irreversible (`PR_CAPBSET_DROP`); Linux, si no ⇒ el spawn se rechaza |
+| `syscall-filter` | `enforce` \| `errno` \| `off` | — | seccomp-bpf manual; Linux, si no ⇒ el spawn se rechaza |
+| `syscall-allow` | nombres (`read`…) | — | sobre la base implícita; sin `syscall-filter` ⇒ error |
 
 **Dos operadores, tres separadores, cero anidamiento.** `=`, `:` y `#`. Si el parser necesita
 más de 300 líneas, se ha designing mal.
@@ -353,16 +360,23 @@ compatibilidad con servicios existentes.
 **NDJSON sobre UNIX socket. Delimitado por `\n`. Sin prefijos de longitud. Sin buffer circular.**
 
 ```
-zinit 1
-→ C {id} status
-← R {id} 0 sshd running pid=421 up 4m12s restarts=2/5
+→ C {id} status sshd
+← R {id} 0 sshd running desired=up pid=421 up=4m12s restarts=2/5
 → C {id} stop sshd
-← R {id} 0
-→ C {id} stop sshd --wait=false
-← R {id} 0
-→ C {id} restart all
-← E {id} 2 dependency cycle: a -> b -> a
+← R {id} 0 down
+→ C {id} reload-all
+← R {id} 0 12 services
+→ C {id} stop missing
+← E {id} 3 unknown service `missing`
 ```
+
+Congelado en v1 (`crates/zinit/src/ctl.rs`): `C {id} <verbo> [nombre]` por línea;
+verbos `status | list | start | stop | restart | kick | reload-all | version | help`;
+códigos `1` trama inválida, `2` comando/aridad desconocidos, `3` servicio
+desconocido, `4` no aplicable, `5` recarga fallida. Sin apretón inicial
+`zinit <n>`, sin `--wait`, sin `restart all`: un verbo por servicio, una línea
+por trama. El resto de la lista de capacidades (`enable`, `console`,
+`log-level`, `shutdown`, `catlog`, `wait`…) llega con su fase, no antes.
 
 - **Texto**: conducible con `socat`/`nc`. Un bug de protocolo se depura sin herramientas.
 - **Delimitado por `\n`**: no hay longitud que validar, ni `chklen`, ni desincronización
@@ -617,7 +631,7 @@ zinit/
 │   ├── zconfig/               # parser de descripciones, el grafo, el plan, el validador
 │   ├── zrt/                   # libc: reactor×3, señales, fork/exec, mount, cgroup, utmp
 │   ├── zservice/              # un servicio: ciclo de vida, readiness, rlimits, spawn
-│   ├── zctl/                  # CLI
+│   ├── zctl/                  # CLI: una trama dentro, una línea fuera (implementado)
 │   ├── zcheck/                # zinit check — valida sin arrancar (mismo parser, no puede divergir)
 │   └── zinit/                 # binario: `--init` (PID 1) y `--sup` (supervisor)
 └── docs/

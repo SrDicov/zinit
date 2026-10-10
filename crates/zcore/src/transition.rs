@@ -28,7 +28,7 @@ use crate::action::{Action, log};
 use crate::event::Event;
 use crate::reconcile::should_restart;
 use crate::runtime::{Runtime, ServiceState};
-use crate::types::{Desired, Idx, LogLevel, Plan, Restart, SignalKind, State};
+use crate::types::{Desired, Idx, LogLevel, Plan, Restart, ServiceKind, SignalKind, State};
 
 /// Outcome of applying one event.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -292,6 +292,71 @@ pub fn apply(event: &Event, runtime: &mut Runtime, plan: &Plan, now_ms: u64) -> 
             }
         }
 
+        // ── Adoption (forking daemons) ─────────────────────────────────────
+        Event::AdoptedPid { pid, .. } => {
+            // Only a `Starting` forking service can adopt: anything else is a
+            // late or confused report, ignored like any other.
+            if runtime.state_at(idx) != State::Starting {
+                return Transition::quiet();
+            }
+            if sp.kind != ServiceKind::Forking {
+                return Transition::quiet();
+            }
+            {
+                let s = runtime.get_mut(idx);
+                s.pid = Some(pid);
+                s.pgid = Some(pid);
+            }
+            // No signal, no log: the daemon is simply being watched from here
+            // on. `changed` re-runs the invariant check, because a pid swap
+            // is exactly the kind of bookkeeping worth re-proving.
+            Transition {
+                actions: Vec::new(),
+                changed: true,
+            }
+        }
+
+        // ── Watchdog ───────────────────────────────────────────────────────
+        Event::WatchdogPing(_) => {
+            // Only a live service can check in. A late ping for a dead one is
+            // ignored, like every other late event.
+            if !matches!(runtime.state_at(idx), State::Running | State::Starting) {
+                return Transition::quiet();
+            }
+            runtime.get_mut(idx).last_watchdog_ms = Some(now_ms);
+            Transition::quiet()
+        }
+
+        Event::WatchdogExpired(_) => {
+            if !matches!(runtime.state_at(idx), State::Running | State::Starting) {
+                return Transition::quiet();
+            }
+            // A hung service is stopped and — `Desired` untouched — started
+            // again: the same shape as a start timeout (TERM now, the stop
+            // timeout below escalates to KILL, the reconciler respawns), with
+            // its own log line so the reason is never ambiguous.
+            let mut actions = alloc::vec![
+                log(idx, LogLevel::Error, "watchdog expired; stopping"),
+                Action::Signal {
+                    idx,
+                    signal: SignalKind::Term
+                },
+            ];
+            let s = runtime.get_mut(idx);
+            s.state = State::Stopping;
+            s.term_sent_at = Some(now_ms);
+            s.stop_due_at = Some(now_ms.saturating_add(sp.stop_timeout_ms));
+            s.start_due_at = None;
+            s.ready_due_at = None;
+            s.failed_starts = s.failed_starts.saturating_add(1);
+            actions.push(mark_down(runtime, idx, now_ms, true));
+            actions.push(Action::DepsChanged(idx));
+            Transition {
+                actions,
+                changed: true,
+            }
+        }
+
         Event::IoError { errno, .. } => Transition::single(log(
             idx,
             LogLevel::Warn,
@@ -367,8 +432,40 @@ fn handle_death(
         }
     }
 
+    // A oneshot that exited cleanly is done — not crashed, not stopped, done.
+    // Completion beats the restart policy by design: the policy governs
+    // failures, and a clean oneshot exit is not one. `Desired` stays `Up` so
+    // status tells the truth (wanted, finished, quiet); the reconciler will
+    // not start it again until `kick` or an explicit `start` re-arms it; and
+    // dependents treat it as satisfied through `deps_satisfied`.
+    //
+    // Recorded whether or not the death was requested: a oneshot that ran to
+    // the end did so even if an operator asked it to stop halfway. The
+    // stopping path below still applies (a requested stop stays a clean
+    // stop), it just also remembers the work got done.
+    if sp.kind == ServiceKind::Oneshot && code == Some(0) {
+        let s = runtime.get_mut(idx);
+        s.completed = true;
+        s.failed_starts = 0;
+    }
+
     if was_stopping {
         // We asked for this. Not a failure; do not log at error, do not restart.
+        actions.push(Action::MarkDown {
+            idx,
+            unexpected: false,
+        });
+        actions.push(Action::DepsChanged(idx));
+        return Transition {
+            actions,
+            changed: true,
+        };
+    }
+
+    if sp.kind == ServiceKind::Oneshot && code == Some(0) {
+        // Recorded above; reported here. A clean finish is information, not
+        // failure: info level, a clean `MarkDown`, and no budget touched.
+        actions.push(log(idx, LogLevel::Info, "completed"));
         actions.push(Action::MarkDown {
             idx,
             unexpected: false,
@@ -449,15 +546,21 @@ fn mark_down(runtime: &mut Runtime, idx: Idx, now_ms: u64, unexpected: bool) -> 
 /// the policy refused to retry becomes eligible again. Deliberately
 /// asymmetric: nothing in the runtime can do this implicitly, so "the service
 /// is not coming back" is always a decision someone made and can undo.
+///
+/// A completed oneshot is the second thing this clears: finishing is as
+/// terminal as suppression, and re-running a finished task takes the same
+/// explicit operator decision as retrying a refused one.
 pub fn kick(runtime: &mut Runtime, plan: &Plan, idx: Idx, now_ms: u64) -> bool {
     if idx >= runtime.len() || !plan.services[idx].kind.has_process() {
         return false;
     }
     let s = runtime.get_mut(idx);
-    if !s.restart_suppressed {
+    let completed_oneshot = plan.services[idx].kind == ServiceKind::Oneshot && s.completed;
+    if !s.restart_suppressed && !completed_oneshot {
         return false;
     }
     s.restart_suppressed = false;
+    s.completed = false;
     s.failed_starts = 0;
     s.last_exit = None;
     s.bucket.reset(&plan.services[idx].restart_budget, now_ms);
@@ -484,6 +587,11 @@ pub fn arm_start_deadlines(runtime: &mut Runtime, plan: &Plan, idx: Idx, now_ms:
     } else {
         None
     };
+    // Checked in since birth: a watchdog measures from the last ping, and a
+    // service that never pinged is measured from here (see `due_events`).
+    // Set unconditionally — readers only consult it when the plan configures
+    // a watchdog, so the field is meaningless elsewhere either way.
+    s.last_watchdog_ms = Some(now_ms);
 }
 
 #[cfg(test)]
@@ -744,5 +852,242 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::RevokeConsole(0)))
         );
+    }
+
+    mod lifecycle_tests {
+        use super::*;
+
+        use crate::reconcile::{due_events, reconcile};
+        use crate::types::ServiceKind;
+
+        fn oneshot_plan() -> Plan {
+            let mut desc = ServicePlan::new(String::from("task"));
+            desc.kind = ServiceKind::Oneshot;
+            desc.ready = Ready::None;
+            super::plan1(desc)
+        }
+
+        fn running_up() -> ServiceState {
+            let mut s = ServiceState::wanted_up();
+            s.state = State::Running;
+            s.pid = Some(100);
+            s.pgid = Some(100);
+            s.started_at = Some(0);
+            s
+        }
+
+        #[test]
+        fn oneshot_clean_exit_completes_and_never_respawns() {
+            let p = oneshot_plan();
+            let mut rt = Runtime::from_plan(&p);
+            *rt.get_mut(0) = running_up();
+
+            let t = apply(&Event::Exited { idx: 0, code: 0 }, &mut rt, &p, 10);
+            assert!(t.changed);
+            assert!(
+                rt.get(0).completed,
+                "a clean oneshot exit is done, not dead"
+            );
+            assert_eq!(rt.state_at(0), State::Stopped);
+            assert!(
+                t.actions.iter().any(|a| matches!(
+                    a,
+                    Action::MarkDown {
+                        unexpected: false,
+                        ..
+                    }
+                )),
+                "completion is a clean stop, not a crash"
+            );
+            assert!(
+                !t.actions.iter().any(|a| matches!(a, Action::Signal { .. })),
+                "nothing left to signal"
+            );
+
+            // The reconciler sees worklessness, not divergence.
+            let tick = reconcile(&mut rt, &p, 10);
+            assert!(
+                !tick.actions.iter().any(|a| matches!(a, Action::Spawn(0))),
+                "a completed oneshot must not spawn again"
+            );
+            assert!(rt.check_invariants(&p).is_empty());
+        }
+
+        #[test]
+        fn oneshot_completion_beats_an_always_policy() {
+            let mut desc = ServicePlan::new(String::from("task"));
+            desc.kind = ServiceKind::Oneshot;
+            desc.ready = Ready::None;
+            desc.restart = crate::types::Restart::Always;
+            let p = super::plan1(desc);
+            let mut rt = Runtime::from_plan(&p);
+            *rt.get_mut(0) = running_up();
+
+            let _ = apply(&Event::Exited { idx: 0, code: 0 }, &mut rt, &p, 10);
+            assert!(rt.get(0).completed);
+            assert_eq!(rt.get(0).restarts, 0, "completion spends no restarts");
+        }
+
+        #[test]
+        fn oneshot_failure_follows_the_policy() {
+            let p = oneshot_plan();
+            let mut rt = Runtime::from_plan(&p);
+            *rt.get_mut(0) = running_up();
+
+            let _ = apply(&Event::Exited { idx: 0, code: 1 }, &mut rt, &p, 10);
+            assert!(!rt.get(0).completed, "a failure is not a finish");
+            // OnFailure + non-zero exit restarts (budgeted, via the reconciler).
+            let tick = reconcile(&mut rt, &p, 10);
+            assert!(tick.actions.iter().any(|a| matches!(a, Action::Spawn(0))));
+        }
+
+        #[test]
+        fn kick_rearms_a_completed_oneshot_and_nothing_else() {
+            let p = oneshot_plan();
+            let mut rt = Runtime::from_plan(&p);
+            *rt.get_mut(0) = running_up();
+            let _ = apply(&Event::Exited { idx: 0, code: 0 }, &mut rt, &p, 10);
+            assert!(kick(&mut rt, &p, 0, 10), "kick must re-arm completion");
+            assert!(!rt.get(0).completed);
+            assert!(!kick(&mut rt, &p, 0, 10), "nothing left to clear");
+            // And re-armed means respawnable again.
+            let tick = reconcile(&mut rt, &p, 10);
+            assert!(tick.actions.iter().any(|a| matches!(a, Action::Spawn(0))));
+        }
+
+        #[test]
+        fn a_completed_oneshot_satisfies_its_dependents() {
+            let mut task = ServicePlan::new(String::from("task"));
+            task.kind = ServiceKind::Oneshot;
+            task.ready = Ready::None;
+            let svc = ServicePlan::new(String::from("svc"));
+            let mut p = Plan::default();
+            p.services.push(task);
+            p.services.push(svc);
+            p.services[1].required = alloc::vec![0];
+            p.order_up = alloc::vec![0, 1];
+            p.order_down = alloc::vec![1, 0];
+            let mut rt = Runtime::from_plan(&p);
+            rt.set_desired(0, Desired::Up);
+            rt.set_desired(1, Desired::Up);
+            *rt.get_mut(0) = running_up();
+
+            assert!(
+                rt.deps_satisfied(1, &p),
+                "a running task satisfies while it lives"
+            );
+            let _ = apply(&Event::Exited { idx: 0, code: 0 }, &mut rt, &p, 10);
+            assert!(rt.get(0).completed);
+            assert!(
+                rt.deps_satisfied(1, &p),
+                "a finished task satisfies without a process"
+            );
+            assert!(rt.check_invariants(&p).is_empty());
+        }
+
+        #[test]
+        fn completion_on_any_other_kind_is_an_invariant_violation() {
+            let p = super::plan1(ServicePlan::new(String::from("a")));
+            let mut rt = Runtime::from_plan(&p);
+            rt.get_mut(0).completed = true;
+            assert_eq!(rt.check_invariants(&p), alloc::vec![0]);
+        }
+
+        #[test]
+        fn watchdog_expiry_stops_a_silent_service() {
+            let mut desc = ServicePlan::new(String::from("w"));
+            desc.ready = Ready::Notify;
+            desc.watchdog_sec = Some(10);
+            let p = super::plan1(desc);
+            let mut rt = Runtime::from_plan(&p);
+            *rt.get_mut(0) = running_up();
+
+            // Measured from birth while no ping arrived.
+            let due = due_events(&rt, &p, 9_999);
+            assert!(due.is_empty());
+            let due = due_events(&rt, &p, 10_000);
+            assert_eq!(due.len(), 1);
+            assert!(matches!(due[0], Event::WatchdogExpired(0)));
+
+            let t = apply(&due[0], &mut rt, &p, 10_000);
+            // The same shape as a start timeout: the wedged process is TERM'd
+            // best-effort and the slot goes Stopped, so the reconciler starts
+            // over. `mark_down` clears the pid the TERM is still aimed at — the
+            // signal was already emitted above, and the reap will report the
+            // death whenever it actually happens.
+            assert_eq!(rt.state_at(0), State::Stopped);
+            assert!(t.actions.iter().any(|a| matches!(
+                a,
+                Action::Signal {
+                    signal: SignalKind::Term,
+                    ..
+                }
+            )));
+            assert!(rt.check_invariants(&p).is_empty());
+        }
+
+        #[test]
+        fn watchdog_pings_postpone_expiry() {
+            let mut desc = ServicePlan::new(String::from("w"));
+            desc.ready = Ready::Notify;
+            desc.watchdog_sec = Some(10);
+            let p = super::plan1(desc);
+            let mut rt = Runtime::from_plan(&p);
+            *rt.get_mut(0) = running_up();
+
+            let _ = apply(&Event::WatchdogPing(0), &mut rt, &p, 9_000);
+            assert!(due_events(&rt, &p, 18_999).is_empty());
+            assert_eq!(due_events(&rt, &p, 19_000).len(), 1);
+        }
+
+        #[test]
+        fn watchdog_pings_from_the_dead_are_ignored() {
+            let mut desc = ServicePlan::new(String::from("w"));
+            desc.ready = Ready::Notify;
+            desc.watchdog_sec = Some(10);
+            let p = super::plan1(desc);
+            let mut rt = Runtime::from_plan(&p);
+            rt.set_desired(0, Desired::Up);
+
+            let t = apply(&Event::WatchdogPing(0), &mut rt, &p, 5);
+            assert!(!t.changed);
+            assert!(rt.get(0).last_watchdog_ms.is_none());
+        }
+
+        #[test]
+        fn adoption_swaps_the_fork_pid_for_the_daemon() {
+            let mut desc = ServicePlan::new(String::from("d"));
+            desc.kind = ServiceKind::Forking;
+            desc.ready = Ready::None;
+            let p = super::plan1(desc);
+            let mut rt = Runtime::from_plan(&p);
+            let mut s = super::starting();
+            // The plan has `ready = none`: no handshake, so no ready
+            // deadline. (`starting()` arms one; carrying it here would fail
+            // the invariant before the adoption is even applied.)
+            s.ready_due_at = None;
+            *rt.get_mut(0) = s;
+
+            let t = apply(&Event::AdoptedPid { idx: 0, pid: 77 }, &mut rt, &p, 5);
+            assert!(t.changed);
+            assert_eq!(rt.get(0).pid, Some(77));
+            assert_eq!(rt.get(0).pgid, Some(77));
+            assert_eq!(rt.state_at(0), State::Starting);
+            assert!(rt.check_invariants(&p).is_empty());
+        }
+
+        #[test]
+        fn adoption_is_meaningless_elsewhere() {
+            let p = super::plan1(ServicePlan::new(String::from("a")));
+            let mut rt = Runtime::from_plan(&p);
+            // Not starting: quiet.
+            let t = apply(&Event::AdoptedPid { idx: 0, pid: 77 }, &mut rt, &p, 5);
+            assert!(!t.changed);
+            // Starting but not forking: quiet.
+            *rt.get_mut(0) = super::starting();
+            let t = apply(&Event::AdoptedPid { idx: 0, pid: 77 }, &mut rt, &p, 5);
+            assert!(!t.changed);
+            assert_eq!(rt.get(0).pid, Some(100));
+        }
     }
 }

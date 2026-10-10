@@ -168,7 +168,13 @@ impl ReadyWait {
     pub fn check(&mut self, now_ms: u64) -> io::Result<bool> {
         match self {
             ReadyWait::None => Ok(true),
-            ReadyWait::Notify { fd } => check_notify(*fd),
+            // One-shot classification without cross-call memory: a throwaway
+            // buffer reads what is readable right now (see `drain_notify` for
+            // the rules). The supervisor's own path keeps the buffer across
+            // polls so a line split in two still parses as one line; this
+            // shape exists for probes and tests, where only readiness —
+            // never the watchdog bit — is observable.
+            ReadyWait::Notify { fd } => Ok(drain_notify(*fd, &mut Vec::new())?.0),
             ReadyWait::Ping {
                 command,
                 next_due_ms,
@@ -200,21 +206,69 @@ impl ReadyWait {
     }
 }
 
-/// Drain a nonblocking notify read-end: any byte is readiness.
+/// Past this much buffered-but-unparsed notify input, stop parsing and report
+/// readiness. A service spewing megabytes at fd 3 is alive by any definition;
+/// hanging the boot (or the heap) on its output would be worse than believing
+/// it. The buffer is cleared when this fires, so the next round starts clean.
+const NOTIFY_BUFFER_MAX: usize = 4096;
+
+/// Read one round from a notify pipe into `pending`, classifying complete
+/// lines and returning `(ready, watchdog)`.
 ///
-/// Reads until `EAGAIN`: a half-written line still counts (the writer wrote,
-/// which is the handshake — line discipline is the service's business, and
-/// waiting for a newline the service never sends would hang the boot on a
-/// technicality). `EOF` (closed without writing) is `Ok(false)`: the verdict
-/// on that child belongs to the reaper, not to this probe.
-fn check_notify(fd: RawFd) -> io::Result<bool> {
-    let mut buf = [0u8; 64];
-    match zrt::sys::read(fd, &mut buf) {
-        Ok(0) => Ok(false),
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
-        Err(e) => Err(e),
+/// `pending` keeps the trailing partial line across calls, so a `WATCHDOG=1`
+/// split across two polls is still recognised as one line. Reads until
+/// `EAGAIN`; `EOF` with no content is `(false, false)` — a closed pipe
+/// without a word is the reaper's business, not the probe's.
+pub(crate) fn drain_notify(fd: RawFd, pending: &mut Vec<u8>) -> io::Result<(bool, bool)> {
+    loop {
+        let mut chunk = [0u8; 512];
+        match zrt::sys::read(fd, &mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                pending.extend_from_slice(&chunk[..n]);
+                if pending.len() > NOTIFY_BUFFER_MAX {
+                    // Fail open (see above), and start clean.
+                    pending.clear();
+                    return Ok((true, false));
+                }
+                if n < chunk.len() {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e),
+        }
     }
+    let mut ready = false;
+    let mut watchdog = false;
+    // Complete lines only; the trailing partial stays buffered — unless it
+    // is the *only* thing there, in which case the legacy rule applies.
+    let mut start = 0;
+    let mut saw_newline = false;
+    while let Some(rel) = pending[start..].iter().position(|&b| b == b'\n') {
+        saw_newline = true;
+        let mut line = &pending[start..start + rel];
+        if line.ends_with(b"\r") {
+            line = &line[..line.len() - 1];
+        }
+        if line == b"READY=1" {
+            ready = true;
+        } else if line == b"WATCHDOG=1" {
+            watchdog = true;
+        } else if !line.iter().all(|b| b.is_ascii_whitespace()) {
+            ready = true;
+        }
+        start += rel + 1;
+    }
+    pending.drain(..start);
+    if !saw_newline && !pending.is_empty() && pending.iter().any(|b| !b.is_ascii_whitespace()) {
+        // No complete line yet, but bytes: the legacy any-byte rule. The
+        // bytes stay buffered — if they grow into a framed line, the line
+        // rule above will classify it then.
+        ready = true;
+    }
+    Ok((ready, watchdog))
 }
 
 /// Run `command` via `/bin/sh -c` and report whether it exits 0.
@@ -627,6 +681,50 @@ mod tests {
         let mut waiter = ReadyWait::Notify { fd: r };
         assert!(!waiter.check(0).expect("eof is not readiness"));
         let _ = zrt::sys::close(r);
+    }
+
+    /// A lone `WATCHDOG=1` line feeds the watchdog and readies nothing; a
+    /// `READY=1` line readies; unknown lines keep the legacy any-byte rule.
+    #[test]
+    fn notify_lines_multiplex_ready_and_watchdog() {
+        let (r, w) = zrt::sys::pipe2(true).expect("pipe");
+        zrt::sys::set_nonblocking(r, true).expect("nonblock");
+        let mut pending = Vec::new();
+        zrt::sys::write(w, b"WATCHDOG=1\n").expect("ping");
+        assert_eq!(
+            drain_notify(r, &mut pending).expect("drain"),
+            (false, true),
+            "a check-in is not readiness"
+        );
+        zrt::sys::write(w, b"READY=1\n").expect("ready");
+        assert_eq!(drain_notify(r, &mut pending).expect("drain"), (true, false));
+        zrt::sys::write(w, b"anything-at-all\n").expect("legacy");
+        assert!(
+            drain_notify(r, &mut pending).expect("drain").0,
+            "unframed output keeps the old any-byte rule"
+        );
+        let _ = zrt::sys::close(r);
+        let _ = zrt::sys::close(w);
+    }
+
+    /// A line split across two polls still parses as one line: the trailing
+    /// partial stays buffered instead of tripping the legacy rule.
+    #[test]
+    fn notify_partial_line_survives_across_polls() {
+        let (r, w) = zrt::sys::pipe2(true).expect("pipe");
+        zrt::sys::set_nonblocking(r, true).expect("nonblock");
+        let mut pending = Vec::new();
+        zrt::sys::write(w, b"WATCHDOG=").expect("first half");
+        // A bare partial with no newline yet reads as legacy-ready (documented
+        // limitation: only newline-terminated lines are framed), but the bytes
+        // stay buffered for the second half...
+        let _ = drain_notify(r, &mut pending).expect("drain");
+        zrt::sys::write(w, b"1\n").expect("second half");
+        // ...and now the framed line classifies, with nothing left over.
+        assert_eq!(drain_notify(r, &mut pending).expect("drain"), (false, true));
+        assert!(pending.is_empty());
+        let _ = zrt::sys::close(r);
+        let _ = zrt::sys::close(w);
     }
 
     #[test]

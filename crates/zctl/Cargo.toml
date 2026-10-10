@@ -1,0 +1,23 @@
+[package]
+name = "zctl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "zinit control client: speaks the C4 line protocol to the supervisor"
+
+[dependencies]
+# INTENTIONALLY EMPTY.
+#
+# `zctl` is a CLI shim over a text protocol: it formats one line, reads one
+# line back, and prints it. Anything it depended on would be more code than
+# the program. (It is also the one crate allowed to print: the purity job's
+# print ban covers the PID-1 path, and `zctl` is not on it.)
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "zctl"
+path = "src/main.rs"

@@ -54,7 +54,7 @@ use core::fmt;
 // the root also carries `Runtime`, `reconcile` and friends, and naming the
 // module makes it obvious at a glance that the only thing crossing the crate
 // boundary from `zcore` is a handful of `no_std` data types.
-use zcore::types::{Budget, LogSink, Ready, Restart, StrictReady};
+use zcore::types::{Budget, ListenAddr, ListenSpec, LogSink, Ready, Restart, StrictReady};
 
 use crate::diagnostic::{Diagnostic, Span};
 
@@ -1158,12 +1158,223 @@ impl fmt::Display for LogError<'_> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Listen
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A `listen` value that names no listenable thing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ListenError<'a> {
+    /// Empty value.
+    Empty,
+    /// Neither `tcp` nor `unix`.
+    UnknownKind { value: &'a str, kind: &'a str },
+    /// `tcp:` with nothing after it.
+    EmptyPort { value: &'a str },
+    /// `tcp:` with a non-numeric port.
+    PortNotNumeric { value: &'a str, port: &'a str },
+    /// `tcp:0`: port 0 listens nowhere, and a `listen = tcp:0` is far more
+    /// often an unfilled variable than a real intent.
+    PortZero { value: &'a str },
+    /// Port past 65535.
+    PortTooLarge { value: &'a str, port: &'a str },
+    /// `unix:` with nothing after it.
+    EmptyPath { value: &'a str },
+    /// A `:name` that carries whitespace or another colon (names travel
+    /// colon-joined in `$LISTEN_FDNAMES`, so either would corrupt the framing).
+    BadName { value: &'a str, name: &'a str },
+}
+
+impl fmt::Display for ListenError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ListenError::Empty => {
+                write!(
+                    f,
+                    "listen needs a value: `tcp:<port>[:<name>]` or `unix:<path>`"
+                )
+            }
+            ListenError::UnknownKind { kind, .. } => {
+                write!(f, "unknown listen kind `{kind}`: write `tcp` or `unix`")
+            }
+            ListenError::EmptyPort { .. } => {
+                write!(f, "tcp listen needs a port: `tcp:<port>[:<name>]`")
+            }
+            ListenError::PortNotNumeric { port, .. } => {
+                write!(f, "port `{port}` is not a number: ports are 1-65535")
+            }
+            ListenError::PortZero { .. } => {
+                write!(f, "port 0 listens nowhere: name the real port")
+            }
+            ListenError::PortTooLarge { port, .. } => {
+                write!(f, "port `{port}` is past 65535")
+            }
+            ListenError::EmptyPath { .. } => {
+                write!(f, "unix listen needs a path: `unix:<path>`")
+            }
+            ListenError::BadName { name, .. } => {
+                write!(f, "listen name `{name}` must not carry whitespace or `:`")
+            }
+        }
+    }
+}
+
+/// Parse `tcp:<port>[:<name>]` or `unix:<path>` into a [`ListenAddr`].
+///
+/// A free function rather than a method: `ListenAddr` lives in `zcore` (pure
+/// data, no parsing), and an inherent impl here would break the orphan rule.
+/// The name defaults to the spec text (`tcp:8080`, the path) and travels
+/// in `$LISTEN_FDNAMES`. A unix path is never split for a name: `:` is a
+/// legal filename character, and carving a name out of a path would
+/// silently bind somewhere else. An explicit empty name (`tcp:80:`) takes
+/// the default — harmless, and not worth a variant.
+pub fn parse_listen(input: &str) -> Result<ListenAddr, ListenError<'_>> {
+    let (head, tail) = split_surplus(input, b':');
+    match head {
+        "tcp" => {
+            let (port_s, name) = split_surplus(tail, b':');
+            if port_s.is_empty() {
+                return Err(ListenError::EmptyPort { value: input });
+            }
+            if !all_digits(port_s) {
+                return Err(ListenError::PortNotNumeric {
+                    value: input,
+                    port: port_s,
+                });
+            }
+            let port = match parse_u64(port_s) {
+                Ok(p) => p,
+                // It is a number, just not one that fits anywhere near a port.
+                Err(DurationError::NumberTooLarge { .. }) => {
+                    return Err(ListenError::PortTooLarge {
+                        value: input,
+                        port: port_s,
+                    });
+                }
+                Err(_) => {
+                    return Err(ListenError::PortNotNumeric {
+                        value: input,
+                        port: port_s,
+                    });
+                }
+            };
+            if port == 0 {
+                return Err(ListenError::PortZero { value: input });
+            }
+            if port > u64::from(u16::MAX) {
+                return Err(ListenError::PortTooLarge {
+                    value: input,
+                    port: port_s,
+                });
+            }
+            let name = listen_name(input, name, format!("tcp:{port}"))?;
+            Ok(ListenAddr {
+                spec: ListenSpec::TcpPort(port as u16),
+                name,
+            })
+        }
+        "unix" => {
+            if tail.is_empty() {
+                return Err(ListenError::EmptyPath { value: input });
+            }
+            Ok(ListenAddr {
+                spec: ListenSpec::UnixPath(tail.to_string()),
+                name: tail.to_string(),
+            })
+        }
+        "" => Err(ListenError::Empty),
+        other => Err(ListenError::UnknownKind {
+            value: input,
+            kind: other,
+        }),
+    }
+}
+
+/// Resolve a `tcp` name against its default: empty takes the default, anything
+/// carrying framing characters is refused rather than smuggled into
+/// `$LISTEN_FDNAMES`.
+fn listen_name<'a>(
+    input: &'a str,
+    name: &'a str,
+    default: String,
+) -> Result<String, ListenError<'a>> {
+    if name.is_empty() {
+        return Ok(default);
+    }
+    if name
+        .as_bytes()
+        .iter()
+        .any(|b| b.is_ascii_whitespace() || *b == b':')
+    {
+        return Err(ListenError::BadName { value: input, name });
+    }
+    Ok(name.to_string())
+}
+
+/// Resolve a Linux capability name to its number.
+///
+/// Accepts lowercase with underscores (`sys_admin`), with an optional `cap_`
+/// prefix in any case (`CAP_SYS_ADMIN`). The numbers are stable across
+/// architectures (linux/capability.h), which is what makes parse-time
+/// validation sound — unlike syscall numbers, these do not move per arch.
+pub fn parse_capability(input: &str) -> Option<u32> {
+    let lower = input.to_ascii_lowercase();
+    let name = lower.strip_prefix("cap_").unwrap_or(&lower);
+    // The full set through CAP_CHECKPOINT_RESTORE (39). A name outside it is
+    // either a typo or a kernel newer than this table, and both are refusals
+    // upstream — never a silently skipped drop.
+    Some(match name {
+        "chown" => 0,
+        "dac_override" => 1,
+        "dac_read_search" => 2,
+        "fowner" => 3,
+        "fsetid" => 4,
+        "kill" => 5,
+        "setgid" => 6,
+        "setuid" => 7,
+        "setpcap" => 8,
+        "linux_immutable" => 9,
+        "net_bind_service" => 10,
+        "net_broadcast" => 11,
+        "net_admin" => 12,
+        "net_raw" => 13,
+        "ipc_lock" => 14,
+        "ipc_owner" => 15,
+        "sys_module" => 16,
+        "sys_rawio" => 17,
+        "sys_chroot" => 18,
+        "sys_ptrace" => 19,
+        "sys_pacct" => 20,
+        "sys_admin" => 21,
+        "sys_boot" => 22,
+        "sys_nice" => 23,
+        "sys_resource" => 24,
+        "sys_time" => 25,
+        "sys_tty_config" => 26,
+        "mknod" => 27,
+        "lease" => 28,
+        "audit_write" => 29,
+        "audit_control" => 30,
+        "setfcap" => 31,
+        "mac_override" => 32,
+        "mac_admin" => 33,
+        "syslog" => 34,
+        "wake_alarm" => 35,
+        "block_suspend" => 36,
+        "audit_read" => 37,
+        "perfmon" => 38,
+        "bpf" => 39,
+        "checkpoint_restore" => 40,
+        _ => return None,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ValueError
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Any failure to turn text into a directive value.
 ///
-/// One enum over five parsers, because every one of them ends up in the same
+/// One enum over six parsers, because every one of them ends up in the same
 /// place — a `Diagnostic` in a `DiagnosticBag` — and because a caller that
 /// wants to report "bad value on line 12" should not have to know which of the
 /// five grammars it came from. The variants keep the detail, so a caller that
@@ -1180,6 +1391,8 @@ pub enum ValueError<'a> {
     RunAs(RunAsError<'a>),
     /// A `log` directive.
     Log(LogError<'a>),
+    /// A `listen` directive.
+    Listen(ListenError<'a>),
 }
 
 impl<'a> ValueError<'a> {
@@ -1209,6 +1422,7 @@ impl<'a> ValueError<'a> {
     /// | `E320`-`E323` | `restart` / `restart-budget`       |
     /// | `E330`-`E334` | `user`                            |
     /// | `E340`-`E344` | `log`                              |
+    /// | `E350`-`E357` | `listen`                           |
     ///
     /// `parser.rs` owns `E0xx` and `desc.rs` owns the `W0xx` warnings.
     ///
@@ -1248,6 +1462,14 @@ impl<'a> ValueError<'a> {
             ValueError::Log(LogError::EmptyPath { .. }) => "E342",
             ValueError::Log(LogError::InvalidLimit { .. }) => "E343",
             ValueError::Log(LogError::TooManyBackups { .. }) => "E344",
+            ValueError::Listen(ListenError::Empty) => "E350",
+            ValueError::Listen(ListenError::UnknownKind { .. }) => "E351",
+            ValueError::Listen(ListenError::EmptyPort { .. }) => "E352",
+            ValueError::Listen(ListenError::PortNotNumeric { .. }) => "E353",
+            ValueError::Listen(ListenError::PortZero { .. }) => "E354",
+            ValueError::Listen(ListenError::PortTooLarge { .. }) => "E355",
+            ValueError::Listen(ListenError::EmptyPath { .. }) => "E356",
+            ValueError::Listen(ListenError::BadName { .. }) => "E357",
         }
     }
 
@@ -1278,6 +1500,12 @@ impl<'a> ValueError<'a> {
             ValueError::Log(LogError::UnexpectedArgument { .. }) => Some(String::from(
                 "`log = none` and `log = syslog` take nothing after the colon",
             )),
+            ValueError::Listen(ListenError::PortZero { .. }) => Some(String::from(
+                "if the port comes from the environment, no probe can work yet",
+            )),
+            ValueError::Listen(ListenError::PortTooLarge { .. }) => {
+                Some(String::from("a TCP port is 1-65535"))
+            }
             _ => None,
         }
     }
@@ -1291,6 +1519,7 @@ impl fmt::Display for ValueError<'_> {
             ValueError::Restart(e) => e.fmt(f),
             ValueError::RunAs(e) => e.fmt(f),
             ValueError::Log(e) => e.fmt(f),
+            ValueError::Listen(e) => e.fmt(f),
         }
     }
 }
@@ -1314,6 +1543,7 @@ lift_into_value_error!(ReadyError => Ready);
 lift_into_value_error!(RestartError => Restart);
 lift_into_value_error!(RunAsError => RunAs);
 lift_into_value_error!(LogError => Log);
+lift_into_value_error!(ListenError => Listen);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Byte scanners
@@ -2002,6 +2232,8 @@ mod tests {
                 .to_string(),
             RunAs::try_parse("1000 users").unwrap_err().to_string(),
             LogSpec::parse("stderr").unwrap_err().to_string(),
+            parse_listen("blah").unwrap_err().to_string(),
+            parse_listen("tcp:0").unwrap_err().to_string(),
         ];
         for m in messages {
             assert!(m.len() > 20, "message is not actionable: {m}");
@@ -2359,6 +2591,77 @@ mod tests {
         ));
     }
 
+    // ── Listen ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn listen_tcp_and_unix_parse_with_default_names() {
+        let a = parse_listen("tcp:8080").unwrap();
+        assert_eq!(a.spec, ListenSpec::TcpPort(8080));
+        assert_eq!(a.name, "tcp:8080");
+        let b = parse_listen("tcp:80:http").unwrap();
+        assert_eq!(b.spec, ListenSpec::TcpPort(80));
+        assert_eq!(b.name, "http");
+        let c = parse_listen("unix:/run/app.sock").unwrap();
+        assert_eq!(c.spec, ListenSpec::UnixPath("/run/app.sock".to_string()));
+        // A colon inside a unix path is a filename character, not a name
+        // separator: splitting it would silently bind somewhere else.
+        let d = parse_listen("unix:/run/we:ird.sock").unwrap();
+        assert_eq!(d.spec, ListenSpec::UnixPath("/run/we:ird.sock".to_string()));
+    }
+
+    #[test]
+    fn listen_refusals_are_loud() {
+        for bad in [
+            "",
+            "blah",
+            "tcp:",
+            "tcp:http",
+            "tcp:0",
+            "tcp:65536",
+            "unix:",
+        ] {
+            assert!(parse_listen(bad).is_err(), "{bad:?} must not parse");
+        }
+        assert!(matches!(
+            parse_listen("tcp:80:has space"),
+            Err(ListenError::BadName { .. })
+        ));
+        assert!(matches!(
+            parse_listen("tcp:80:a:b"),
+            Err(ListenError::BadName { .. })
+        ));
+    }
+
+    // ── Capabilities ────────────────────────────────────────────────────
+
+    #[test]
+    fn capability_numbers_are_pinned() {
+        // Spot-checked against `capsh --decode` on the running kernel (every
+        // entry was verified that way when the table landed). A move here is
+        // a dropped wrong privilege, not a typo.
+        for (name, nr) in [
+            ("chown", 0),
+            ("net_bind_service", 10),
+            ("net_broadcast", 11),
+            ("sys_admin", 21),
+            ("setfcap", 31),
+            ("mac_override", 32),
+            ("bpf", 39),
+            ("checkpoint_restore", 40),
+        ] {
+            assert_eq!(parse_capability(name), Some(nr), "{name} moved?");
+        }
+    }
+
+    #[test]
+    fn capability_names_accept_prefix_and_case() {
+        assert_eq!(parse_capability("CAP_SYS_ADMIN"), Some(21));
+        assert_eq!(parse_capability("cap_chown"), Some(0));
+        assert_eq!(parse_capability("Sys_Time"), Some(25));
+        assert_eq!(parse_capability("no_such_cap"), None);
+        assert_eq!(parse_capability(""), None);
+    }
+
     // ── Diagnostics ─────────────────────────────────────────────────────────
 
     /// Every single variant, in both directions: no kind shares a code with
@@ -2449,6 +2752,17 @@ mod tests {
                 LogSpec::parse("file:/l.log:1024/256")
                     .unwrap_err()
                     .to_string()
+            ),
+            ("E350", parse_listen("").unwrap_err().to_string()),
+            ("E351", parse_listen("udp:53").unwrap_err().to_string()),
+            ("E352", parse_listen("tcp:").unwrap_err().to_string()),
+            ("E353", parse_listen("tcp:http").unwrap_err().to_string()),
+            ("E354", parse_listen("tcp:0").unwrap_err().to_string()),
+            ("E355", parse_listen("tcp:65536").unwrap_err().to_string()),
+            ("E356", parse_listen("unix:").unwrap_err().to_string()),
+            (
+                "E357",
+                parse_listen("tcp:80:has space").unwrap_err().to_string()
             ),
         ];
         for (code, message) in &all {

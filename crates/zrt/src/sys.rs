@@ -382,6 +382,481 @@ fn finish_socket_fd(fd: RawFd) -> io::Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Local control sockets (AF_UNIX, SOCK_STREAM)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a `sockaddr_un` for `path`, refusing overlong paths here.
+///
+/// A path that does not fit `sun_path` cannot be addressed, and the kernel
+/// reports that unevenly across platforms (`ENAMETOOLONG` on some, silent
+/// truncation to the wrong file on others). Failing here, with the path in
+/// the error, is the portable behaviour.
+fn unix_addr(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+    // SAFETY: a zeroed `sockaddr_un` is a valid value (zero family, empty
+    // path); every field is written before any use below.
+    let mut addr: libc::sockaddr_un = unsafe { core::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_os_str().as_bytes();
+    // An interior NUL would truncate the address at the kernel boundary, so
+    // `bind` would serve a path this function never named. Refused here.
+    if bytes.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("socket path contains an interior NUL: {}", path.display()),
+        ));
+    }
+    // `sun_path` is NUL-terminated, so the path must leave one byte free.
+    // The field size differs per platform (108 on Linux, 104 on the BSDs and
+    // macOS); measuring the actual field keeps this correct everywhere.
+    let room = addr.sun_path.len() - 1;
+    if bytes.len() > room {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "socket path too long ({} bytes, max {room}): {}",
+                bytes.len(),
+                path.display()
+            ),
+        ));
+    }
+    // SAFETY: `bytes.len() <= room < sun_path.len()`, so the copy stays
+    // inside the field; the trailing NUL comes from the `zeroed` above.
+    // `.cast()` rather than `as`: `sun_path` is `c_char`, signed on some
+    // platforms and unsigned on others, and an `as` cast would be a no-op
+    // (rightly refused) where they coincide.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            addr.sun_path.as_mut_ptr().cast::<u8>(),
+            bytes.len(),
+        );
+    }
+    // Length is the fixed header plus the used path bytes plus the NUL, so no
+    // platform padding the kernel would ignore is ever sent.
+    let len = (core::mem::size_of::<libc::sockaddr_un>() - addr.sun_path.len() + bytes.len() + 1)
+        as libc::socklen_t;
+    Ok((addr, len))
+}
+
+/// Remove the file at `path`, ignoring every outcome.
+///
+/// Only used for stale control-socket files before `bind`: the supervisor is
+/// a singleton, so a leftover socket from a crashed run is dead by definition.
+/// A live listener would fail the `bind` below with `EADDRINUSE` — but only
+/// if nobody unlinked its path first, which is why this stays best-effort and
+/// the `bind` error is always the verdict that counts.
+fn unlink_quiet(path: &Path) {
+    if let Ok(c) = CString::new(path.as_os_str().as_bytes()) {
+        // SAFETY: `c` is NUL-terminated; `unlink` retains nothing.
+        unsafe {
+            libc::unlink(c.as_ptr());
+        }
+    }
+}
+
+/// A `SOCK_STREAM` `AF_UNIX` descriptor: CLOEXEC, non-blocking, unbound.
+fn unix_socket() -> io::Result<RawFd> {
+    let flags = libc::SOCK_STREAM | socket_flags();
+    // SAFETY: domain, type and protocol are plain ints. On success the kernel
+    // returns an owned descriptor; on failure -1 with errno set.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, flags, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if let Err(e) = finish_socket_fd(fd) {
+        let _ = close(fd);
+        return Err(e);
+    }
+    Ok(fd)
+}
+
+/// Bind a listening control socket at `path` (`DESIGN.md` §7, contract C4).
+///
+/// The socket file is `0600`: control access is root-only. The mode is
+/// applied to the path after `listen`; if the platform refuses that, the
+/// whole call fails rather than leaving a world-accessible init socket —
+/// the supervisor then runs without a control socket and says so, which is
+/// the degradation contract, not a silent exposure.
+pub fn unix_listener(path: &Path) -> io::Result<RawFd> {
+    let fd = unix_socket()?;
+    let (addr, len) = match unix_addr(path) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = close(fd);
+            return Err(e);
+        }
+    };
+    unlink_quiet(path);
+    // SAFETY: `addr` is a live `sockaddr_un` of exactly `len` bytes; `bind`
+    // copies it and retains nothing.
+    if unsafe { libc::bind(fd, &raw const addr as *const libc::sockaddr, len) } != 0 {
+        let e = io::Error::last_os_error();
+        let _ = close(fd);
+        return Err(e);
+    }
+    // SAFETY: `listen` takes ints only; the backlog is a hint.
+    if unsafe { libc::listen(fd, 64) } != 0 {
+        let e = io::Error::last_os_error();
+        let _ = close(fd);
+        unlink_quiet(path);
+        return Err(e);
+    }
+    // `unix_addr` already refused NUL paths, so this cannot fail in practice;
+    // failing closed rather than serving a socket with unknown permissions.
+    let c = match cpath(path) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = close(fd);
+            unlink_quiet(path);
+            return Err(e);
+        }
+    };
+    // SAFETY: `c` names the socket just bound; `chmod` retains nothing.
+    if unsafe { libc::chmod(c.as_ptr(), 0o600) } != 0 {
+        let e = io::Error::last_os_error();
+        let _ = close(fd);
+        unlink_quiet(path);
+        return Err(e);
+    }
+    Ok(fd)
+}
+
+/// Accept one connection from a [`unix_listener`].
+///
+/// Never blocks: the listener is non-blocking, so an empty queue reports
+/// `WouldBlock`, which is the caller's cue to stop draining.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+pub fn unix_accept(listener: RawFd) -> io::Result<RawFd> {
+    // SAFETY: NULL address arguments mean "no peer address wanted"; the flags
+    // are plain ints. Returns an owned descriptor or -1 with errno set.
+    let fd = unsafe {
+        libc::accept4(
+            listener,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(fd)
+    }
+}
+
+/// Accept one connection from a [`unix_listener`], for platforms without
+/// `accept4`.
+///
+/// The descriptor is finished afterwards instead of atomically. The window is
+/// harmless here for the same reason as the `pipe2` fallback: this process is
+/// single-threaded and never forks between the two calls.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)))]
+pub fn unix_accept(listener: RawFd) -> io::Result<RawFd> {
+    // SAFETY: as above, without flags.
+    let fd = unsafe { libc::accept(listener, core::ptr::null_mut(), core::ptr::null_mut()) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if let Err(e) = finish_socket_fd(fd) {
+        let _ = close(fd);
+        return Err(e);
+    }
+    Ok(fd)
+}
+
+/// `prctl(PR_SET_CHILD_SUBREAPER, 1)`: orphaned grandchildren reparent to us.
+///
+/// A `Forking` daemon's real process is a grandchild that outlives its
+/// parent. Without this flag the kernel reparents it to PID 1 and the
+/// supervisor can never `waitpid` it — it would be reduced to polling
+/// `kill(pid, 0)` with the pid-recycling race that implies. With the flag,
+/// the supervisor adopts the grandchild and reaps it like any other child,
+/// which is what makes pid-based tracking of adopted daemons sound.
+///
+/// Linux-only. Elsewhere the call cannot exist, and the supervisor falls
+/// back to pid liveness polling (documented at the call site, announced at
+/// boot — a degradation, never silence).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn prctl_child_subreaper() -> io::Result<()> {
+    // SAFETY: `PR_SET_CHILD_SUBREAPER` takes one int-like argument; the rest
+    // are ignored. It retains nothing and affects only reparenting targets.
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// `prctl(PR_SET_CHILD_SUBREAPER, 1)`: orphaned grandchildren reparent to us.
+///
+/// Linux-only; this platform has no subreaper, so the supervisor falls back
+/// to pid liveness polling for adopted daemons.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn prctl_child_subreaper() -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "child subreaper is Linux-only",
+    ))
+}
+
+/// Connect a `SOCK_STREAM` client to the socket at `path`.
+///
+/// Used by `zctl` and by the integration tests. The supervisor itself only
+/// ever listens; a supervisor that dials its own control socket is a
+/// topology bug, not a feature.
+pub fn unix_connect(path: &Path) -> io::Result<RawFd> {
+    let fd = unix_socket()?;
+    let (addr, len) = match unix_addr(path) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = close(fd);
+            return Err(e);
+        }
+    };
+    // SAFETY: `addr` is a live `sockaddr_un` of exactly `len` bytes;
+    // `connect` copies it and retains nothing.
+    if unsafe { libc::connect(fd, &raw const addr as *const libc::sockaddr, len) } != 0 {
+        let e = io::Error::last_os_error();
+        let _ = close(fd);
+        return Err(e);
+    }
+    Ok(fd)
+}
+
+/// Bind a TCP listener on 127.0.0.1 for socket activation.
+///
+/// Loopback only, by design: the same loopback the `tcp` readiness probe
+/// dials, so `ready = tcp:<port>` and `listen = tcp:<port>` agree out of the
+/// box — and a service file can never silently expose a port to the world.
+/// `SO_REUSEADDR` is set so a crash-loop rebinds without waiting out stale
+/// state. Backlog 128: bursts at boot are the norm, not the exception.
+pub fn tcp_listen(port: u16) -> io::Result<RawFd> {
+    // SAFETY: domain, type and protocol are plain ints. On success the kernel
+    // returns an owned descriptor; on failure -1 with errno set. The finish
+    // below gives it the same CLOEXEC + non-blocking properties every other
+    // socket in this module has, for the same reasons.
+    let tcp = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | socket_flags(), 0) };
+    if tcp < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if let Err(e) = finish_socket_fd(tcp) {
+        let _ = close(tcp);
+        return Err(e);
+    }
+    let one: libc::c_int = 1;
+    // SAFETY: `SOL_SOCKET`/`SO_REUSEADDR` take one int; the pointer is a live
+    // local and the length is exactly its size.
+    if unsafe {
+        libc::setsockopt(
+            tcp,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &raw const one as *const libc::c_void,
+            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    } != 0
+    {
+        let e = io::Error::last_os_error();
+        let _ = close(tcp);
+        return Err(e);
+    }
+    // SAFETY: zeroed `sockaddr_in` is valid; every field is written below.
+    let mut addr: libc::sockaddr_in = unsafe { core::mem::zeroed() };
+    addr.sin_family = libc::AF_INET as libc::sa_family_t;
+    addr.sin_port = port.to_be();
+    // 127.0.0.1 in wire order: `from_ne_bytes` lays the octets out exactly
+    // as written on every endianness, which is what `sin_addr` wants.
+    addr.sin_addr = libc::in_addr {
+        s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+    };
+    // SAFETY: `addr` is a live `sockaddr_in`; the length is exactly its size.
+    if unsafe {
+        libc::bind(
+            tcp,
+            &raw const addr as *const libc::sockaddr,
+            core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    } != 0
+    {
+        let e = io::Error::last_os_error();
+        let _ = close(tcp);
+        return Err(e);
+    }
+    // SAFETY: `listen` takes ints only.
+    if unsafe { libc::listen(tcp, 128) } != 0 {
+        let e = io::Error::last_os_error();
+        let _ = close(tcp);
+        return Err(e);
+    }
+    Ok(tcp)
+}
+
+/// Bind a Unix stream listener for socket activation.
+///
+/// Unlike the control socket, the mode is left to the umask: service sockets
+/// exist to be connected by clients, and `0600` here would lock out exactly
+/// the processes the service serves. A stale file from a crashed run is
+/// unlinked first, for the same singleton reason as the control socket.
+pub fn unix_service_listen(path: &Path) -> io::Result<RawFd> {
+    let fd = unix_socket()?;
+    let (addr, len) = match unix_addr(path) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = close(fd);
+            return Err(e);
+        }
+    };
+    unlink_quiet(path);
+    // SAFETY: `addr` is a live `sockaddr_un` of exactly `len` bytes.
+    if unsafe { libc::bind(fd, &raw const addr as *const libc::sockaddr, len) } != 0 {
+        let e = io::Error::last_os_error();
+        let _ = close(fd);
+        return Err(e);
+    }
+    // SAFETY: `listen` takes ints only.
+    if unsafe { libc::listen(fd, 128) } != 0 {
+        let e = io::Error::last_os_error();
+        let _ = close(fd);
+        unlink_quiet(path);
+        return Err(e);
+    }
+    Ok(fd)
+}
+
+/// Duplicate `fd` onto the first free descriptor ≥ 100, CLOEXEC.
+///
+/// The child hands listen sockets to fixed low targets (3..) with no
+/// allocator to park them in first; parking the sources high on the parent
+/// side is what makes that single-phase handover sound — no target below 100
+/// can clobber a source. The original number is closed: parking must not
+/// leave a low shadow of every descriptor behind.
+///
+/// Move semantics: only for descriptors owned by the caller of this function
+/// (the unit test below, historical bind-time parking). Per-spawn handover
+/// from descriptors the supervisor keeps must use [`dup_high`] instead:
+/// closing the supervisor's held socket there would hand the next spawn a
+/// dead number, and closing a test's number while sibling tests reuse numbers
+/// in parallel closes someone else's pipe.
+///
+/// Used only for listen sockets, which are few and bound rarely.
+pub fn park_high(fd: RawFd) -> io::Result<RawFd> {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        // SAFETY: `F_DUPFD_CLOEXEC` takes an int floor and returns an owned
+        // descriptor, or -1 with errno set. Atomic: no window in which a
+        // concurrent fork could inherit the original number twice.
+        let parked = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 100) };
+        if parked < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let _ = close_quietly(fd);
+        Ok(parked)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        // SAFETY: as above, without the atomic flag; finished with an
+        // explicit CLOEXEC instead. The window is harmless for the same
+        // reason as the `pipe2` fallback: single-threaded, no fork inside.
+        let parked = unsafe { libc::fcntl(fd, libc::F_DUPFD, 100) };
+        if parked < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if let Err(e) = set_cloexec(parked, true) {
+            let _ = close_quietly(parked);
+            let _ = close_quietly(fd);
+            return Err(e);
+        }
+        let _ = close_quietly(fd);
+        Ok(parked)
+    }
+}
+
+/// Copy `fd` onto the first free descriptor ≥ 100, CLOEXEC, keeping the
+/// original open.
+///
+/// Same collision rationale as [`park_high`], opposite ownership: the caller
+/// keeps its descriptor (a supervisor-held listen socket, a test's socketpair
+/// end) and the copy exists only to survive the fork with a number no `dup2`
+/// target below 100 can collide with. The caller closes the copy when the
+/// handover is done — `spawn` does so right after the fork — and keeps (and
+/// eventually closes, exactly once) the original.
+///
+/// Using [`park_high`] here would be a double-close factory: the original's
+/// number goes back to the kernel while the caller still believes it owns it,
+/// so the next open reuses the number and the caller's later close amputates
+/// someone else's descriptor — under parallel tests, another test's pipe.
+pub fn dup_high(fd: RawFd) -> io::Result<RawFd> {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        // SAFETY: `F_DUPFD_CLOEXEC` takes an int floor and returns an owned
+        // descriptor, or -1 with errno set. Atomic: no window in which a
+        // concurrent fork could inherit the original number twice.
+        let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 100) };
+        if high < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(high)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        // SAFETY: as above, without the atomic flag; finished with an
+        // explicit CLOEXEC instead. The window is harmless for the same
+        // reason as the `pipe2` fallback: single-threaded, no fork inside.
+        let high = unsafe { libc::fcntl(fd, libc::F_DUPFD, 100) };
+        if high < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if let Err(e) = set_cloexec(high, true) {
+            let _ = close_quietly(high);
+            return Err(e);
+        }
+        Ok(high)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Waiting for children
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1141,4 +1616,171 @@ fn cpath(p: &Path) -> io::Result<CString> {
 
 fn cstr(s: &str) -> io::Result<CString> {
     CString::new(s).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interior NUL"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A socket path owned by this test. Stale files from a failed run are
+    /// removed by the caller: `unix_listener` unlinks before `bind` anyway.
+    fn scratch_sock(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("zinit-sys-{tag}-{}", std::process::id()));
+        p
+    }
+
+    #[test]
+    fn listener_accepts_a_client_and_passes_bytes() {
+        let path = scratch_sock("accept");
+        let listener = unix_listener(&path).expect("bind");
+        let client = unix_connect(&path).expect("connect");
+        let server = unix_accept(listener).expect("accept");
+        write(client, b"ping").expect("write");
+        let mut buf = [0u8; 8];
+        let n = read(server, &mut buf).expect("read");
+        assert_eq!(&buf[..n], b"ping");
+        let _ = close(client);
+        let _ = close(server);
+        let _ = close(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn accept_on_an_empty_queue_reports_wouldblock() {
+        let path = scratch_sock("empty");
+        let listener = unix_listener(&path).expect("bind");
+        let e = unix_accept(listener).expect_err("nothing is queued");
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+        let _ = close(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn overlong_paths_are_refused_before_the_kernel() {
+        let long = "x".repeat(10_000);
+        let path = PathBuf::from(long);
+        assert!(unix_listener(&path).is_err());
+        assert!(unix_connect(&path).is_err());
+    }
+
+    #[test]
+    fn subreaper_probe_matches_the_platform() {
+        // Sets the flag on the test process itself on Linux: harmless, since
+        // it only redirects where *orphaned grandchildren* reparent, and no
+        // test here orphans. Elsewhere the call cannot exist.
+        let r = prctl_child_subreaper();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert!(r.is_ok());
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn tcp_listen_accepts_a_loopback_client() {
+        // Port 0 would be ideal, but the format refuses it (an unfilled
+        // variable, far more often than intent) — so probe a high port for
+        // freedom first. A collision with a neighbour is a retry, not a
+        // failure, but three tries is plenty on a test machine.
+        for port in [48021u16, 48022, 48023] {
+            let listener = match tcp_listen(port) {
+                Ok(fd) => fd,
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse => continue,
+                Err(e) => panic!("bind 127.0.0.1:{port}: {e}"),
+            };
+            let mut client =
+                std::net::TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
+            use std::io::Write as _;
+            client.write_all(b"hi").expect("write");
+            // The connect completes asynchronously; the nonblocking accept
+            // may need a moment to see it.
+            let server = loop {
+                match unix_accept(listener) {
+                    Ok(fd) => break fd,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            };
+            // Same for the bytes: loopback is fast, not instant, and a single
+            // optimistic read loses the race on a loaded machine.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut buf = [0u8; 4];
+            let mut got = 0;
+            while got < buf.len() {
+                match read(server, &mut buf[got..]) {
+                    Ok(0) => break,
+                    Ok(n) => got += n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("read: {e}"),
+                }
+            }
+            assert_eq!(&buf[..got], b"hi");
+            let _ = close(listener);
+            let _ = close(server);
+            return;
+        }
+        panic!("no free probe port");
+    }
+
+    #[test]
+    fn service_unix_socket_accepts_a_client() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("zinit-svc-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = unix_service_listen(&path).expect("bind");
+        let client = unix_connect(&path).expect("connect");
+        let server = unix_accept(listener).expect("accept");
+        write(client, b"ok").expect("write");
+        let mut buf = [0u8; 4];
+        let n = read(server, &mut buf).expect("read");
+        assert_eq!(&buf[..n], b"ok");
+        let _ = close(client);
+        let _ = close(server);
+        let _ = close(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Parking moves a descriptor high and closes the original: the child
+    /// handover onto 3.. can never clobber a parked source.
+    #[test]
+    fn park_high_moves_the_descriptor_up() {
+        let (r, w) = pipe2(true).expect("pipe");
+        let parked = park_high(w).expect("park");
+        assert!(parked >= 100, "parked below 100: {parked}");
+        // The original number is closed; the parked copy works.
+        write(parked, b"x").expect("write through parked");
+        let mut buf = [0u8; 2];
+        let n = read(r, &mut buf).expect("read");
+        assert_eq!(&buf[..n], b"x");
+        let _ = close(parked);
+        let _ = close(r);
+    }
+
+    /// Copying highs without closing the original: per-spawn handover must
+    /// not steal the supervisor's held socket, and must not hand a
+    /// double-close to a parallel test reusing the number.
+    #[test]
+    fn dup_high_copies_up_and_keeps_the_original() {
+        let (r, w) = pipe2(true).expect("pipe");
+        let high = dup_high(w).expect("dup");
+        assert!(high >= 100, "copied below 100: {high}");
+        // Both numbers work: they share the pipe, not the descriptor.
+        write(w, b"a").expect("write through original");
+        write(high, b"b").expect("write through copy");
+        let mut buf = [0u8; 4];
+        let n = read(r, &mut buf).expect("read");
+        assert_eq!(&buf[..n], b"ab");
+        let _ = close(high);
+        let _ = close(w);
+        let _ = close(r);
+    }
 }
