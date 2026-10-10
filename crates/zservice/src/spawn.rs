@@ -143,18 +143,18 @@ pub struct SpawnCtx<'a> {
     ///
     /// The supervisor binds these once and holds them across restarts; every
     /// spawn only *lends* them to the child (dup'd onto 3.., with the names
-    /// in `$LISTEN_FDNAMES`). Empty for no socket activation. `spawn` parks
+    /// in `$LISTEN_FDNAMES`). Empty for no socket activation. `spawn` copies
     /// them high itself before the fork, so callers pass whatever numbers
     /// they hold — no fd-number discipline is required of them.
     pub listen: &'a [(RawFd, String)],
 }
 
 /// Cap on listen sockets per spawn. The child dups them onto 3.. one by one
-/// with no allocator to park them in, which is only sound while no target
-/// can clobber a not-yet-moved source (see `ManagedService::ensure_listeners`,
-/// which parks every source at 100+). 32 is far past any sane service and
-/// keeps 3+32 < 100 with room to spare; past it the description is refused,
-/// not truncated — half a socket set is a service that binds the wrong half.
+/// with no allocator to stage them in, which is only sound while no target
+/// can clobber a not-yet-moved source (`spawn` copies every source to 100+
+/// first). 32 is far past any sane service and keeps 3+32 < 100 with room to
+/// spare; past it the description is refused, not truncated — half a socket
+/// set is a service that binds the wrong half.
 pub const MAX_LISTEN_FDS: usize = 32;
 
 /// Descriptor the notify write-end lands on: 3 with no listeners, 3+N with.
@@ -483,15 +483,15 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
     // Listen fd numbers, by value: the child dups them onto 3.. and must not
     // touch the supervisor's (name, fd) pairs.
     let listen_numbers: Vec<RawFd> = ctx.listen.iter().map(|(fd, _)| *fd).collect();
-    // Parked copies, high: dup targets below (3..) can never clobber a
-    // source this way, no matter what numbers the caller holds. Parked
-    // here — not by the caller — so the guarantee holds for every spawn,
-    // including direct ones that never went through `ensure_listeners`.
-    // The caller's originals stay open and owned by the caller; these
-    // copies die in the parent right after the fork.
+    // High copies: dup targets below (3..) can never clobber a source this
+    // way, no matter what numbers the caller holds. Copied here — not by the
+    // caller — so the guarantee holds for every spawn, including direct ones
+    // that never went through `ensure_listeners`. Copy, not move (see
+    // `dup_high`): the caller's originals stay open and owned by the caller;
+    // these copies die in the parent right after the fork.
     let mut parked: Vec<RawFd> = Vec::with_capacity(listen_numbers.len());
     for fd in &listen_numbers {
-        match zrt::sys::park_high(*fd) {
+        match zrt::sys::dup_high(*fd) {
             Ok(high) => parked.push(high),
             Err(e) => {
                 for high in parked {
@@ -501,7 +501,7 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
                 return Err(io::Error::new(
                     e.kind(),
                     format!(
-                        "service `{}`: cannot park listen sockets ({e})",
+                        "service `{}`: cannot stage listen sockets ({e})",
                         ctx.service_name
                     ),
                 ));
@@ -569,7 +569,7 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
     if pid == 0 {
         child_main(plan_child);
     }
-    // The parked copies served their one purpose (surviving the fork with
+    // The high copies served their one purpose (surviving the fork with
     // numbers nothing can collide with). The child holds its dups; the
     // caller's originals stay with the caller.
     for high in parked {
@@ -648,9 +648,10 @@ struct ChildPlan {
     /// contract).
     notify_no: libc::c_int,
     /// Listen fds to hand over, dup'd onto 3.. in order. Every source is
-    /// parked at 100+ by `spawn` itself right before the fork, so no target
-    /// below 100 (`MAX_LISTEN_FDS` caps the count) can clobber a
-    /// not-yet-moved source, whatever numbers the caller holds.
+    /// copied high by `spawn` itself right before the fork (see `dup_high`),
+    /// so no target below 100 (`MAX_LISTEN_FDS` caps the count) can clobber
+    /// a not-yet-moved source, whatever numbers the caller holds. Copies,
+    /// never moves: the caller's descriptors stay open.
     listen_fds: *const RawFd,
     /// How many `listen_fds` points at.
     listen_len: usize,
@@ -877,7 +878,7 @@ fn child_step_session(pgid_want: i32) -> bool {
 /// stays `CLOEXEC` on its side.
 ///
 /// The listen handover is single-phase and safe by construction: every
-/// source is parked at 100+ (see `SpawnCtx::listen`) while every target is
+/// source is copied to 100+ (see `SpawnCtx::listen`) while every target is
 /// below it (`MAX_LISTEN_FDS` caps the count), so no `dup2` target can ever
 /// clobber a not-yet-moved source. `dup2` onto an already-correct number is
 /// a no-op success, and the matching close is skipped with it.

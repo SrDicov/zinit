@@ -745,6 +745,13 @@ pub fn unix_service_listen(path: &Path) -> io::Result<RawFd> {
 /// can clobber a source. The original number is closed: parking must not
 /// leave a low shadow of every descriptor behind.
 ///
+/// Move semantics: only for descriptors owned by the caller of this function
+/// (the unit test below, historical bind-time parking). Per-spawn handover
+/// from descriptors the supervisor keeps must use [`dup_high`] instead:
+/// closing the supervisor's held socket there would hand the next spawn a
+/// dead number, and closing a test's number while sibling tests reuse numbers
+/// in parallel closes someone else's pipe.
+///
 /// Used only for listen sockets, which are few and bound rarely.
 pub fn park_high(fd: RawFd) -> io::Result<RawFd> {
     #[cfg(any(
@@ -789,6 +796,63 @@ pub fn park_high(fd: RawFd) -> io::Result<RawFd> {
         }
         let _ = close_quietly(fd);
         Ok(parked)
+    }
+}
+
+/// Copy `fd` onto the first free descriptor ≥ 100, CLOEXEC, keeping the
+/// original open.
+///
+/// Same collision rationale as [`park_high`], opposite ownership: the caller
+/// keeps its descriptor (a supervisor-held listen socket, a test's socketpair
+/// end) and the copy exists only to survive the fork with a number no `dup2`
+/// target below 100 can collide with. The caller closes the copy when the
+/// handover is done — `spawn` does so right after the fork — and keeps (and
+/// eventually closes, exactly once) the original.
+///
+/// Using [`park_high`] here would be a double-close factory: the original's
+/// number goes back to the kernel while the caller still believes it owns it,
+/// so the next open reuses the number and the caller's later close amputates
+/// someone else's descriptor — under parallel tests, another test's pipe.
+pub fn dup_high(fd: RawFd) -> io::Result<RawFd> {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        // SAFETY: `F_DUPFD_CLOEXEC` takes an int floor and returns an owned
+        // descriptor, or -1 with errno set. Atomic: no window in which a
+        // concurrent fork could inherit the original number twice.
+        let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 100) };
+        if high < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(high)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        // SAFETY: as above, without the atomic flag; finished with an
+        // explicit CLOEXEC instead. The window is harmless for the same
+        // reason as the `pipe2` fallback: single-threaded, no fork inside.
+        let high = unsafe { libc::fcntl(fd, libc::F_DUPFD, 100) };
+        if high < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if let Err(e) = set_cloexec(high, true) {
+            let _ = close_quietly(high);
+            return Err(e);
+        }
+        Ok(high)
     }
 }
 
@@ -1698,6 +1762,25 @@ mod tests {
         let n = read(r, &mut buf).expect("read");
         assert_eq!(&buf[..n], b"x");
         let _ = close(parked);
+        let _ = close(r);
+    }
+
+    /// Copying highs without closing the original: per-spawn handover must
+    /// not steal the supervisor's held socket, and must not hand a
+    /// double-close to a parallel test reusing the number.
+    #[test]
+    fn dup_high_copies_up_and_keeps_the_original() {
+        let (r, w) = pipe2(true).expect("pipe");
+        let high = dup_high(w).expect("dup");
+        assert!(high >= 100, "copied below 100: {high}");
+        // Both numbers work: they share the pipe, not the descriptor.
+        write(w, b"a").expect("write through original");
+        write(high, b"b").expect("write through copy");
+        let mut buf = [0u8; 4];
+        let n = read(r, &mut buf).expect("read");
+        assert_eq!(&buf[..n], b"ab");
+        let _ = close(high);
+        let _ = close(w);
         let _ = close(r);
     }
 }
