@@ -320,6 +320,7 @@ fn sibling(path: &Path, n: u8) -> PathBuf {
 
 /// Current size of an open fd, via `fstat` — never via the path.
 fn fstat_size(fd: RawFd) -> io::Result<u64> {
+    // SAFETY: all zeros is a valid empty `stat`; `fstat` fills it.
     let mut st: libc::stat = unsafe { core::mem::zeroed() };
     // SAFETY: `st` is a live, aligned `stat`; `fstat` writes exactly one and
     // retains nothing.

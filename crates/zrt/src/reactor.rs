@@ -375,6 +375,7 @@ impl Reactor for EpollReactor {
     }
 
     fn wait(&mut self, timeout_ms: Option<u64>) -> io::Result<Vec<ReadyEvent>> {
+        // SAFETY: all zeros is a valid empty event array; the kernel fills it.
         let mut buf: [libc::epoll_event; MAX_EVENTS] = unsafe { core::mem::zeroed() };
         // `epoll_wait` takes an `int` timeout; clamping rather than wrapping is
         // the difference between "wait ~24 days" and "return immediately".
@@ -723,6 +724,7 @@ impl Reactor for KqueueReactor {
     }
 
     fn wait(&mut self, timeout_ms: Option<u64>) -> io::Result<Vec<ReadyEvent>> {
+        // SAFETY: all zeros is a valid empty event array; the kernel fills it.
         let mut buf: [libc::kevent; MAX_EVENTS] = unsafe { core::mem::zeroed() };
         let ts = timeout_ms.map(|ms| {
             // `tv_nsec` follows the platform `long`: 64 bits on macOS/aarch64,

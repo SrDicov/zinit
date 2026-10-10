@@ -290,6 +290,7 @@ fn probe_signal_source() -> Option<SignalSourceKind> {
         // An empty mask is a legal signalfd request and is the cheapest probe
         // that still exercises the syscall, its flags and the kernel's
         // support. If this works, a populated mask works.
+        // SAFETY: all zeros is a valid empty signal set.
         let set: libc::sigset_t = unsafe { core::mem::zeroed() };
         // SAFETY: `set` is a live, zeroed `sigset_t`; `signalfd` copies it and
         // does not retain the pointer. The fd it returns is closed immediately

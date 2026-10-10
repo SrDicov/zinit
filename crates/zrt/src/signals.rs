@@ -263,6 +263,7 @@ impl SignalSet {
     /// leaves two numbers out, so `EINVAL` is the one errno treated as "not
     /// available" here.
     fn to_sigset(self) -> io::Result<libc::sigset_t> {
+        // SAFETY: all zeros is a valid empty signal set.
         let mut set: libc::sigset_t = unsafe { core::mem::zeroed() };
         for sig in self.iter() {
             // SAFETY: `set` is a live, zeroed `sigset_t` and `sigaddset` only
@@ -321,6 +322,7 @@ pub fn block_all() -> io::Result<()> {
 /// hold and the supervisor should refuse to start rather than run with a
 /// window it cannot reason about.
 pub fn blocked() -> io::Result<SignalSet> {
+    // SAFETY: all zeros is a valid empty signal set; read back by `pthread_sigmask` below.
     let mut cur: libc::sigset_t = unsafe { core::mem::zeroed() };
     // SAFETY: `cur` is a live, zeroed `sigset_t` that `pthread_sigmask` fills
     // with the current mask; it is not retained.
@@ -683,6 +685,7 @@ impl SignalSource for KqueueSignalSource {
     }
 
     fn drain(&mut self) -> io::Result<Vec<Signal>> {
+        // SAFETY: all zeros is a valid empty event array; the kernel fills it.
         let mut buf: [libc::kevent; 16] = unsafe { core::mem::zeroed() };
         // A zero timeout: this is called *because* the reactor said the kqueue
         // is readable, so there is nothing to wait for.
@@ -917,6 +920,7 @@ extern "C" fn selfpipe_handler(signo: libc::c_int) {
 }
 
 fn install_handler(sig: Signal) -> io::Result<libc::sigaction> {
+    // SAFETY: all zeros is a valid empty action; fields are set before `sigaction` below.
     let mut new: libc::sigaction = unsafe { core::mem::zeroed() };
     new.sa_sigaction = selfpipe_handler as *const () as usize;
     new.sa_flags = libc::SA_RESTART;

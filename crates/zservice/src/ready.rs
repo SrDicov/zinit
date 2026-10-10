@@ -496,6 +496,7 @@ fn new_probe_socket() -> io::Result<RawFd> {
         return Err(io::Error::last_os_error());
     }
     if let Err(e) = zrt::sys::set_cloexec(fd, true).and(zrt::sys::set_nonblocking(fd, true)) {
+        // SAFETY: `fd` came from the `socket` above and is still owned here.
         unsafe { libc::close(fd) };
         return Err(e);
     }
