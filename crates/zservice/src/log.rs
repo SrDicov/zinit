@@ -534,13 +534,7 @@ mod tests {
         let len = (core::mem::size_of::<libc::sockaddr_un>() - addr.sun_path.len()
             + bytes.len()
             + 1) as libc::socklen_t;
-        let rc = unsafe {
-            libc::bind(
-                fd,
-                &raw const addr as *const libc::sockaddr,
-                len,
-            )
-        };
+        let rc = unsafe { libc::bind(fd, &raw const addr as *const libc::sockaddr, len) };
         assert_eq!(rc, 0, "bind: {}", io::Error::last_os_error());
         zrt::sys::set_cloexec(fd, true).expect("cloexec");
         fd
