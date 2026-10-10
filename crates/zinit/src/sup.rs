@@ -1274,9 +1274,9 @@ impl Sup {
         if let Err(e) = started {
             let errno = match e.raw_os_error() {
                 Some(code) => code,
-                // A refusal before any syscall — `NotFound`, `EmptyCommand`,
-                // `SyslogNotWired` — has no errno of its own, and `EIO` is the
-                // honest "no process exists".
+                // A refusal before any syscall — `NotFound`, `EmptyCommand` —
+                // has no errno of its own, and `EIO` is the honest
+                // "no process exists".
                 None => libc::EIO,
             };
             let name = self.name_of(idx);

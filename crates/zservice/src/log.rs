@@ -14,19 +14,29 @@
 //!   `SIGKILL` between the write and the flush would silently eat. A partial
 //!   write is looped in this function, so the caller never sees half a line.
 //!
-//! What is *not* here: `log = syslog`. The sink is refused with a typed error
-//! ([`crate::SpawnError::SyslogNotWired`]) rather
-//! than faked — journald consumer integration is a v2 feature (`DESIGN.md`
-//! §10), and inventing a syslog line format here would make that future
-//! integration disagree with every log already written.
+//! What is *not* here: rotation for anything but files, and timestamps.
+//! Timestamps belong to the writer (a service that wants them prints them);
+//! rewriting other programs' lines is how log pipelines start disagreeing
+//! about what was actually said.
+//!
+//! `log = syslog` is a connected `AF_UNIX` datagram socket to `/dev/log`,
+//! handed to the child as stdout/stderr like any other sink: one `write(2)`
+//! is one datagram, which is the whole syslog transport contract. There is
+//! deliberately no `PRI`/`TAG` framing in this crate — attribution travels
+//! in the kernel's `SCM_CREDENTIALS`, which is how journald names the
+//! sender, and inventing a line format here would make a future journald
+//! consumer disagree with every log already written. Supervisor-side lines
+//! go out on a fresh socket per message (no stale connection to a restarted
+//! daemon, ever); over-4 KiB lines split across two datagrams, exactly as
+//! oversized lines already split on pipes. No daemon at `/dev/log` is
+//! announced degradation with the service running dark, never a refused
+//! spawn: a machine whose logger is down still needs its services.
 
 use std::ffi::CString;
 use std::io;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-
-use crate::SpawnError;
 
 /// An open log destination, owned by the supervisor.
 ///
@@ -37,14 +47,20 @@ use crate::SpawnError;
 /// no offset is ever cached.
 #[derive(Debug)]
 pub struct LogHandle {
-    /// The open file (or `/dev/null`) the child writes to.
+    /// The open file (or `/dev/null`, or a connected syslog socket) the
+    /// child writes to.
     fd: RawFd,
-    /// Filesystem path, when this is a real file. `None` for `/dev/null`.
+    /// Filesystem path, when this is a real file. `None` for `/dev/null`
+    /// and for syslog (rotation is a file concept; datagrams are not
+    /// renamed).
     path: Option<PathBuf>,
     /// Rotate once the file reaches this size.
     max_bytes: u64,
     /// Rotated generations kept (`.1` … `.N`).
     backups: u8,
+    /// True for a syslog socket: supervisor-side lines go out on a fresh
+    /// socket per message (see `write_datagram_line`) instead of this fd.
+    datagram: bool,
 }
 
 impl LogHandle {
@@ -88,6 +104,7 @@ pub fn open_sink(sink: &zcore::LogSink) -> io::Result<LogHandle> {
             path: None,
             max_bytes: u64::MAX,
             backups: 0,
+            datagram: false,
         }),
         zcore::LogSink::File {
             path,
@@ -111,12 +128,39 @@ pub fn open_sink(sink: &zcore::LogSink) -> io::Result<LogHandle> {
                 path: Some(file),
                 max_bytes: *max_bytes,
                 backups: *backups,
+                datagram: false,
             })
         }
-        zcore::LogSink::Syslog => Err(SpawnError::SyslogNotWired {
-            name: String::from("<unknown>"),
-        }
-        .into()),
+        zcore::LogSink::Syslog => open_syslog_at(Path::new(SYSLOG_PATH)),
+    }
+}
+
+/// Where syslog daemons listen, on every system that has one.
+const SYSLOG_PATH: &str = "/dev/log";
+
+/// Open the syslog sink against `path` (normally [`SYSLOG_PATH`]).
+///
+/// The socket is connected and blocking: it is inherited as the service's
+/// stdout/stderr, and stdio expects blocking fds. No daemon there is an
+/// error naming the path — the supervisor announces it and runs the service
+/// dark (see `open_sink`'s contract), which is degradation, not refusal.
+///
+/// Factored by path (rather than inlining `/dev/log`) so tests can bind
+/// their own daemon: the host's `/dev/log` may or may not exist, and a test
+/// must not depend on which.
+fn open_syslog_at(path: &Path) -> io::Result<LogHandle> {
+    match zrt::sys::unix_dgram_connect(path) {
+        Ok(fd) => Ok(LogHandle {
+            fd,
+            path: None,
+            max_bytes: u64::MAX,
+            backups: 0,
+            datagram: true,
+        }),
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!("no syslog daemon at {} ({e})", path.display()),
+        )),
     }
 }
 
@@ -140,6 +184,11 @@ pub fn write_line(h: &mut LogHandle, line: &[u8]) -> io::Result<()> {
             "log sink is closed",
         ));
     }
+    // Datagrams leave through a fresh socket per message (see
+    // `write_datagram_line`): the handle's own fd belongs to the child.
+    if h.datagram {
+        return write_datagram_line(line);
+    }
     rotate(h)?;
     // Room for the newline without splitting the line across two writes.
     if line.len() < 4096 {
@@ -156,6 +205,31 @@ pub fn write_line(h: &mut LogHandle, line: &[u8]) -> io::Result<()> {
         write_all(h.fd, b"\n")?;
     }
     Ok(())
+}
+
+/// One supervisor-side line to the syslog daemon: open, write, close.
+///
+/// A fresh socket per message rather than a held one: a daemon that
+/// restarts rebinds `/dev/log`, and a held connection to the old socket
+/// would fail every write until the supervisor itself restarts. Three
+/// syscalls on a path taken only for diagnostics is the cheaper honesty —
+/// and a missing daemon fails here, loudly, instead of parking the loop
+/// in a blocking write to nowhere.
+fn write_datagram_line(line: &[u8]) -> io::Result<()> {
+    let fd = zrt::sys::unix_dgram_connect(Path::new(SYSLOG_PATH))?;
+    // Same framing as `write_line`: line plus terminator in one write when
+    // it fits (one datagram), split across two when it does not — the same
+    // documented fallback pipes already live with.
+    let result = if line.len() < 4096 {
+        let mut buf = [0u8; 4096];
+        buf[..line.len()].copy_from_slice(line);
+        buf[line.len()] = b'\n';
+        write_all(fd, &buf[..line.len() + 1])
+    } else {
+        write_all(fd, line).and(write_all(fd, b"\n"))
+    };
+    let _ = zrt::sys::close(fd);
+    result
 }
 
 /// Rotate when the file has reached `max_bytes`. No-op for `/dev/null`.
@@ -391,10 +465,68 @@ mod tests {
     }
 
     #[test]
-    fn syslog_is_a_typed_refusal_not_silent_loss() {
-        let e = open_sink(&zcore::LogSink::Syslog).expect_err("must refuse");
-        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
-        assert!(e.to_string().contains("syslog"));
+    fn syslog_without_daemon_is_a_loud_error() {
+        // No listener at the path: the error names it, and the supervisor
+        // announces that error and runs the service dark. What must never
+        // happen is silent success.
+        let missing = tmpdir("syslog-missing").join("dev-log.sock");
+        let e = open_syslog_at(&missing).expect_err("no daemon must fail");
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        assert!(e.to_string().contains("no syslog daemon"), "{e}");
+    }
+
+    #[test]
+    fn syslog_round_trip_through_a_bound_peer() {
+        // A daemon of our own (a bound datagram socket): one `write_line`
+        // arrives as one datagram with its terminator.
+        let dir = tmpdir("syslog-roundtrip");
+        let path = dir.join("dev-log.sock");
+        let listener = bind_dgram(&path);
+        let mut h = open_syslog_at(&path).expect("daemon present");
+        write_line(&mut h, b"hello").expect("write");
+        h.close();
+        let mut buf = [0u8; 32];
+        // SAFETY: `listener` is an owned bound datagram socket; `recvfrom`
+        // with null address arguments writes at most `buf.len()` bytes and
+        // retains nothing.
+        let n =
+            unsafe { libc::recvfrom(listener, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len(), 0, core::ptr::null_mut(), core::ptr::null_mut()) };
+        assert!(n > 0, "recvfrom: {}", io::Error::last_os_error());
+        assert_eq!(&buf[..n as usize], b"hello\n");
+        let _ = zrt::sys::close(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Bind a `SOCK_DGRAM` socket at `path`: the test daemon.
+    ///
+    /// Test-only because production never binds (it only dials `/dev/log`).
+    /// `path` comes from `tmpdir`, so it fits `sun_path` with room.
+    fn bind_dgram(path: &Path) -> RawFd {
+        let bytes = path.as_os_str().as_bytes();
+        assert!(bytes.len() + 1 < 108, "test path must fit sun_path");
+        // SAFETY: `socket` takes ints; the fd is owned on success.
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
+        assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+        let mut addr: libc::sockaddr_un = unsafe { core::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (i, b) in bytes.iter().enumerate() {
+            addr.sun_path[i] = *b as libc::c_char;
+        }
+        // SAFETY: `addr` carries exactly the path bytes plus the zeroed
+        // terminator; `bind` copies `len` bytes and retains nothing.
+        let len =
+            (core::mem::size_of::<libc::sockaddr_un>() - addr.sun_path.len() + bytes.len() + 1)
+                as libc::socklen_t;
+        let rc = unsafe {
+            libc::bind(
+                fd,
+                &raw const addr as *const libc::sockaddr,
+                len,
+            )
+        };
+        assert_eq!(rc, 0, "bind: {}", io::Error::last_os_error());
+        zrt::sys::set_cloexec(fd, true).expect("cloexec");
+        fd
     }
 
     #[test]

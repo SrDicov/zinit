@@ -1,6 +1,14 @@
 # Changelog
 
 ## [Unreleased]
+### syslog por datagrama (Fase D)
+- `log = syslog` cableado: socket `AF_UNIX` datagrama conectado a `/dev/log`
+  como stdout/stderr del hijo (un `write` = un datagrama; bloqueante, como
+  manda stdio POSIX). Sin formato `PRI`/`TAG` — la atribución viaja en
+  `SCM_CREDENTIALS`. El supervisor escribe por socket fresco por mensaje
+  (un daemon reiniciado nunca cuelga escrituras); sin daemon, degradación
+  anunciada con el servicio a oscuras, nunca rechazo. Desaparece
+  `SpawnError::SyslogNotWired` (y su test de rechazo).
 ### runit import + enable + service shim (Fase C)
 - `scripts/runsv-import.sh` (POSIX sh, dash/ash-clean): `runsvdir` →
   `<name>.conf`. `run` (ejecutable, cwd=dir) + `finish` plegado

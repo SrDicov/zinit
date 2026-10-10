@@ -613,6 +613,45 @@ pub fn prctl_child_subreaper() -> io::Result<()> {
     ))
 }
 
+/// Connect a `SOCK_DGRAM` client to the socket at `path`.
+///
+/// Datagram twin of [`unix_connect`]: one `write(2)` is one message, which
+/// is exactly the syslog contract (`/dev/log`). Blocking and CLOEXEC, and
+/// deliberately *not* non-blocking: a log descriptor is inherited as a
+/// service's stdout/stderr, and POSIX stdio expects blocking fds — a
+/// non-blocking stdout would fail arbitrary programs with `EAGAIN` on
+/// their own output. The supervisor never polls this fd (writes to it go
+/// out on a fresh socket per message), so nothing deadlocks on it either.
+pub fn unix_dgram_connect(path: &Path) -> io::Result<RawFd> {
+    // SOCK_CLOEXEC is not universal (Apple lacks it), so the flag travels
+    // through `socket_flags()` like every other socket here, and CLOEXEC
+    // is finished explicitly below. Non-blocking is never set: see above.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | socket_flags(), 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `set_cloexec` is one `fcntl(F_SETFD)` on an owned fd.
+    if let Err(e) = set_cloexec(fd, true) {
+        let _ = close(fd);
+        return Err(e);
+    }
+    let (addr, len) = match unix_addr(path) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = close(fd);
+            return Err(e);
+        }
+    };
+    // SAFETY: `addr` is a live `sockaddr_un` of exactly `len` bytes;
+    // `connect` copies it and retains nothing.
+    if unsafe { libc::connect(fd, &raw const addr as *const libc::sockaddr, len) } != 0 {
+        let e = io::Error::last_os_error();
+        let _ = close(fd);
+        return Err(e);
+    }
+    Ok(fd)
+}
+
 /// Connect a `SOCK_STREAM` client to the socket at `path`.
 ///
 /// Used by `zctl` and by the integration tests. The supervisor itself only
@@ -1663,6 +1702,18 @@ mod tests {
         let path = PathBuf::from(long);
         assert!(unix_listener(&path).is_err());
         assert!(unix_connect(&path).is_err());
+        assert!(unix_dgram_connect(&path).is_err());
+    }
+
+    #[test]
+    fn dgram_connect_to_nothing_is_an_error() {
+        // No listener, no daemon: connecting must fail rather than hand out
+        // a socket that writes into the void. Deterministic everywhere —
+        // nothing to bind, no daemon needed.
+        let mut path = std::env::temp_dir();
+        path.push(format!("zinit-no-such-dgram-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(unix_dgram_connect(&path).is_err());
     }
 
     #[test]

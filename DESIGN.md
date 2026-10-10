@@ -564,6 +564,12 @@ enum LogSink {
   lo oldest se descarta. **20 líneas, sin estado, sin tabla de estados.**
 - Escritura: cada línea del hijo se escribe con un `write(2)` al fd. Sin buffer, sin
   `BufWriter` que pueda perder datos en un `SIGKILL`.
+- `log = syslog`: socket `AF_UNIX` datagrama conectado a `/dev/log`, heredado
+  como stdout/stderr — un `write(2)` es un datagrama. Sin formato `PRI`/`TAG`
+  (la atribución viaja en `SCM_CREDENTIALS` del kernel); las líneas del
+  supervisor salen por socket fresco por mensaje (un daemon reiniciado nunca
+  deja escrituras colgadas); sin daemon, degradación anunciada con el servicio
+  a oscuras, nunca spawn rechazado.
 - `zctl catlog <svc>` — `tail -f` sobre el fichero. La integración con journald
   (`log-type = pipe` + `consumer-of`) es una **feature separada** para v2, no parte del núcleo.
 
