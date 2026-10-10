@@ -4,9 +4,10 @@
 ### montajes privados (Fase D3)
 - `private-tmp = yes|no` (defecto `no`): `unshare` de montajes + tmpfs
   `mode=1777` sobre `/tmp`, instalado en el hijo con privilegios aún
-  (tras cgroup, antes de ids); cualquier fallo rechaza el spawn
-  (fail-closed). Linux-only (rechazo en padre fuera de Linux); sin
-  privilegios + activado = fallo ruidoso, nunca degradación. Viaja a plan.
+  (tras cgroup, antes de ids); si el tmpfs falla se rechaza el spawn
+  (fail-closed; el detach de propagación es best-effort).
+  Linux-only (rechazo en padre fuera de Linux); sin privilegios +
+  activado = fallo ruidoso. Viaja a plan.
 ### demand-start por sockets (Fase D2)
 - `on-demand = yes|no` (defecto `no`): un servicio parado y no deseado con
   sockets retenidos arranca con la primera conexión — igual que un `start`

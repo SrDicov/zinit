@@ -1064,13 +1064,13 @@ fn pid_ascii(pid: i32) -> ([u8; 12], usize) {
 /// Enter a private mount namespace and hide the shared `/tmp`.
 ///
 /// Unconfigured (`false`) is a no-op returning true on every platform, so
-/// the parent is the only gatekeeper off Linux. Configured, three syscalls
-/// while still privileged (mounts need capabilities the uid drop below
-/// gives away): detach the namespace from host mount events, then mount a
-/// fresh `mode=1777` tmpfs over `/tmp`. Any failure fails the spawn —
-/// running shared while configured private is more exposure than asked
-/// for. Open fds (the log, pipes) transcend the namespace change, so
-/// nothing opened earlier is disturbed.
+/// the parent is the only gatekeeper off Linux. Configured: detach the
+/// namespace from host mount events (best effort — nested containers
+/// restrict propagation changes, and isolation holds without it), then
+/// mount a fresh `mode=1777` tmpfs over `/tmp`, which must succeed: its
+/// failure would genuinely share `/tmp`, so it fails the spawn. Open fds
+/// (the log, pipes) transcend the namespace change, so nothing opened
+/// earlier is disturbed.
 ///
 /// The `#[allow]` documents a split, not a hiding: the `MS_*` constants
 /// are `c_ulong` on some targets and narrower integers on others, so the
@@ -1088,9 +1088,14 @@ fn child_step_mount(private_tmp: bool) -> bool {
         if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
             return false;
         }
+        // Detaching hides host mount events, but it is hardening, not the
+        // guarantee: nested containers restrict propagation changes
+        // (`EINVAL`), while the tmpfs below still isolates our files. So a
+        // failure here continues — fail-closed applies to the tmpfs mount,
+        // whose failure would genuinely share `/tmp`.
         let detach = (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong;
         // SAFETY: NULL-path `mount` takes ints and flags only.
-        if unsafe {
+        let _ = unsafe {
             libc::mount(
                 core::ptr::null(),
                 c"/".as_ptr(),
@@ -1098,10 +1103,7 @@ fn child_step_mount(private_tmp: bool) -> bool {
                 detach,
                 core::ptr::null(),
             )
-        } != 0
-        {
-            return false;
-        }
+        };
         let tmpfs = (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong;
         // SAFETY: static literals, NUL-terminated by construction; `mount`
         // copies what it needs and retains nothing.
