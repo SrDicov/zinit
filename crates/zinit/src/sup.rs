@@ -41,8 +41,8 @@ use std::path::{Path, PathBuf};
 use zconfig::parser::parse_service_with_diagnostics;
 use zconfig::{RunAs, ServiceDesc, build_plan};
 use zcore::{
-    Action, Desired, Event, Idx, LogLevel, Plan, Runtime, ServiceKind, SignalKind, State, Tick,
-    Transition, apply, kick, reconcile,
+    Action, Desired, Event, Idx, LogLevel, Plan, Runtime, ServiceKind, ServicePlan, SignalKind,
+    State, Tick, Transition, apply, kick, reconcile,
 };
 use zrt::childproc::{ChildTracker, new_child_tracker};
 use zrt::reactor::{Interest, Reactor, new_reactor};
@@ -192,6 +192,30 @@ impl Slot {
     }
 }
 
+/// Open the log sink for a slot, degrading `syslog` without a daemon to dark.
+///
+/// A missing daemon is environmental and transient (it may start later);
+/// refusing every spawn until then would burn restart budget on a
+/// non-service failure and keep the service down for no service reason.
+/// Anything else failing still fails loudly: a bad log path is a config
+/// error, not weather. Announced once here — slot builds happen at boot
+/// and for reload newcomers, both rare — while restarts stay quiet.
+fn open_log(sp: &ServicePlan) -> Option<LogHandle> {
+    match open_sink(&sp.log) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            if matches!(sp.log, zcore::LogSink::Syslog) {
+                // The error already names the missing daemon; add only the
+                // consequence.
+                announce_degradation(&format!("{}: {}; running dark", sp.name, e));
+                return open_sink(&zcore::LogSink::None).ok();
+            }
+            announce_degradation(&format!("{}: no log sink ({})", sp.name, e));
+            None
+        }
+    }
+}
+
 /// A service deleted by `reload-all` while its process still lives.
 ///
 /// No plan entry, no core slot, no future: one SIGTERM already sent, and the
@@ -279,18 +303,7 @@ impl Sup {
 
         let mut slots = Vec::with_capacity(plan.services.len());
         for (idx, (sp, desc)) in plan.services.iter().zip(descs).enumerate() {
-            let log = match open_sink(&sp.log) {
-                Ok(handle) => Some(handle),
-                // Not fatal: the service still runs, it just cannot be told
-                // anything. `log = syslog` lands here too — `zservice` refuses
-                // it and the spawn will fail on its own — so the operator hears
-                // about it once instead of once per start.
-                Err(e) => {
-                    let name = &sp.name;
-                    announce_degradation(&format!("{name}: no log sink ({e})"));
-                    None
-                }
-            };
+            let log = open_log(sp);
             slots.push(Slot {
                 svc: ManagedService::new(idx),
                 desc,
@@ -1082,14 +1095,7 @@ impl Sup {
                 slot.desc = new_descs[new_idx].take();
                 new_slots.push(slot);
             } else {
-                let log = match open_sink(&sp.log) {
-                    Ok(handle) => Some(handle),
-                    Err(e) => {
-                        let name = &sp.name;
-                        announce_degradation(&format!("{name}: no log sink ({e})"));
-                        None
-                    }
-                };
+                let log = open_log(sp);
                 // A reload during an operator stop must not resurrect: new
                 // services join the stop, they do not outvote it.
                 if self.stopping {
