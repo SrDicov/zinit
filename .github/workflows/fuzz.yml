@@ -1,9 +1,9 @@
 name: fuzz
 
-# Continuous fuzzing proxy. No `fuzz/` targets exist yet (Phase 5 tooling), so
-# the run exercises the parser's mutation tests — the honest fuzz surface
-# available today. Real `cargo fuzz` lands with `fuzz/fuzz_targets/`, and this
-# file grows a `cargo-fuzz` job the same day. Heavy by design: nightly +
+# Continuous fuzzing: proxy on every parser PR, libFuzzer nightly.
+#
+# `fuzz/` is a detached crate (its own `[workspace]`), so libfuzzer-sys
+# never enters the workspace dependency gate. Heavy by design: nightly +
 # manual + parser PRs only, never every push.
 on:
   schedule:
@@ -44,3 +44,30 @@ jobs:
         run: cargo test -p zconfig --release no_panic
       - name: Full zconfig suite
         run: cargo test -p zconfig --release
+
+  cargo-fuzz:
+    name: libFuzzer parser (nightly, 10 min)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Nightly and manual only: needs nightly rustc and ~15 minutes of
+    # machine. Parser PRs keep the proxy above; libFuzzer runs while we
+    # sleep. libFuzzer needs no corpus to start, but the seeds in
+    # `fuzz/seeds/` teach it the format on the first run.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Build fuzz target
+        working-directory: fuzz
+        run: cargo fuzz build -O parse_service
+      - name: Fuzz the parser
+        working-directory: fuzz
+        run: cargo fuzz run parse_service seeds/parse_service -- -max_total_time=600 -max_len=65536
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts/

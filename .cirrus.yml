@@ -1,0 +1,27 @@
+# Cirrus CI: native FreeBSD validation (experimental).
+#
+# GitHub runners cannot do BSD (the vmactions VMs stalled forever, so the
+# `bsd` job left ci.yml). Cirrus donates real FreeBSD VMs: enable the
+# Cirrus GitHub App on the repo and this file starts validating what the
+# Linux cross-`check`s can only compile — reactor kqueue backend, child
+# tracking, signals. Until enabled, this file is inert documentation. If
+# Cirrus renames its image families, adjust `image_family` below.
+#
+# Deliberately check+test only (no clippy/fmt/doc gates here): the Linux
+# matrix owns style, BSD owns "does it run". Keep it that way.
+
+freebsd_task:
+  freebsd_instance:
+    image_family: freebsd-14-2
+    cpu: 4
+    memory: 4G
+
+  install_script:
+    - pkg install -y curl
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+
+  script:
+    - export PATH="$HOME/.cargo/bin:$PATH"
+    - cargo --version && rustc --version
+    - cargo build --workspace --all-targets
+    - cargo test --workspace

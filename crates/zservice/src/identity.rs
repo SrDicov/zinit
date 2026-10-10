@@ -77,6 +77,7 @@ pub fn resolve_user(name: &str) -> io::Result<(u32, u32)> {
     // than guessed at twice.
     let mut buf = vec![0u8; 16 * 1024];
     loop {
+        // SAFETY: all zeros is a valid empty `passwd`; `getpwnam_r` fills it.
         let mut pwd: libc::passwd = unsafe { core::mem::zeroed() };
         let mut result: *mut libc::passwd = core::ptr::null_mut();
         // SAFETY: `cname` is NUL-terminated and alive; `pwd` is a live
@@ -128,6 +129,7 @@ pub fn resolve_group(name: &str) -> io::Result<u32> {
     })?;
     let mut buf = vec![0u8; 16 * 1024];
     loop {
+        // SAFETY: all zeros is a valid empty `group`; `getgrnam_r` fills it.
         let mut grp: libc::group = unsafe { core::mem::zeroed() };
         let mut result: *mut libc::group = core::ptr::null_mut();
         // SAFETY: as in `resolve_user`: every pointer is live, correctly
@@ -268,6 +270,7 @@ pub fn prepare_rlimits(rlimits: &[(String, u64)]) -> io::Result<Vec<ChildRlimit>
                 .into());
             }
         };
+        // SAFETY: all zeros is a valid empty `rlimit`; `getrlimit` fills it.
         let mut current: libc::rlimit = unsafe { core::mem::zeroed() };
         // SAFETY: `current` is a live, aligned `rlimit`; `getrlimit` writes
         // exactly one and retains nothing. `resource as _` resolves against
@@ -548,6 +551,7 @@ mod tests {
         assert_eq!(got.len(), 3);
         assert_eq!(got[0].cur, 1024);
         // The hard limit is carried over, never invented.
+        // SAFETY: all zeros is a valid empty `rlimit`; `getrlimit` fills it.
         let mut cur: libc::rlimit = unsafe { core::mem::zeroed() };
         // SAFETY: live `rlimit`, written once, retained never.
         assert_eq!(
@@ -570,6 +574,7 @@ mod tests {
     #[test]
     fn dropping_to_our_own_ids_is_either_clean_or_untouched() {
         let (ruid, _, rgid, _) = current_ids();
+        // SAFETY: `fork` takes no arguments; the child below `_exit`s with the verdict, never returning to the harness.
         match unsafe { libc::fork() } {
             -1 => panic!("fork failed"),
             0 => {
@@ -604,6 +609,7 @@ mod tests {
         if current_ids().0 == 0 {
             return;
         }
+        // SAFETY: `fork` takes no arguments; the child below `_exit`s with the verdict, never returning to the harness.
         match unsafe { libc::fork() } {
             -1 => panic!("fork failed"),
             0 => {
@@ -635,6 +641,7 @@ mod tests {
         if current_ids().0 != 0 {
             return;
         }
+        // SAFETY: `fork` takes no arguments; the child below `_exit`s with the verdict, never returning to the harness.
         match unsafe { libc::fork() } {
             -1 => panic!("fork failed"),
             0 => {

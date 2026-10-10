@@ -656,6 +656,7 @@ pub fn unix_dgram_connect(path: &Path) -> io::Result<RawFd> {
     // SOCK_CLOEXEC is not universal (Apple lacks it), so the flag travels
     // through `socket_flags()` like every other socket here, and CLOEXEC
     // is finished explicitly below. Non-blocking is never set: see above.
+    // SAFETY: domain, type and protocol are plain ints; -1 with errno set on failure.
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | socket_flags(), 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
@@ -1408,6 +1409,7 @@ pub fn umount2(target: &Path, flags: u32) -> io::Result<()> {
         target_os = "netbsd",
         target_os = "dragonfly",
     ))]
+    // SAFETY: `t` is a live NUL-terminated path; flags is an int.
     let rc = unsafe { libc::unmount(t.as_ptr(), flags as libc::c_int) };
 
     #[cfg(not(any(

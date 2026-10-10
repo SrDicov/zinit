@@ -489,6 +489,7 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
     // do setup work. `fork` copies the supervisor's blocked set and `execve`
     // preserves it, so a child that does not clear it would run with `SIGTERM`
     // blocked — pending, never delivered, un-stoppable until `SIGKILL`.
+    // SAFETY: all zeros is a valid empty signal set, completed by `sigemptyset` below.
     let mut empty_mask: libc::sigset_t = unsafe { core::mem::zeroed() };
     // SAFETY: `empty_mask` is a live, zeroed `sigset_t` and `sigemptyset` only
     // clears bits inside it. POSIX says it cannot fail.

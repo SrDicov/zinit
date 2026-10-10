@@ -316,6 +316,7 @@ impl ChildTracker for PidfdTracker {
     }
 
     fn reap(&mut self) -> io::Result<Vec<(i32, ExitStatus)>> {
+        // SAFETY: all zeros is a valid empty event array; the kernel fills it.
         let mut buf: [libc::epoll_event; 32] = unsafe { core::mem::zeroed() };
         // Timeout 0: `reap` is called *because* the supervisor's reactor said
         // the epoll is readable. Waiting again here would block the loop.
@@ -501,6 +502,7 @@ impl ChildTracker for KqueueProcTracker {
     }
 
     fn reap(&mut self) -> io::Result<Vec<(i32, ExitStatus)>> {
+        // SAFETY: all zeros is a valid empty event array; the kernel fills it.
         let mut buf: [libc::kevent; 32] = unsafe { core::mem::zeroed() };
         let ts = libc::timespec {
             tv_sec: 0,

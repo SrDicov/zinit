@@ -1,0 +1,18 @@
+[package]
+name = "zinit-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detached from the workspace on purpose (`[workspace]` below): libfuzzer-sys
+# is a test-only dependency of the fuzzer, and the workspace gate (`cargo
+# tree -p zinit` is workspace crates + libc only) must never see it. This
+# crate never ships, never publishes, never leaves CI.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zconfig = { path = "../crates/zconfig" }

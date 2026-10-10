@@ -11,3 +11,7 @@
 *.swp
 .idea/
 .vscode/
+
+# cargo-fuzz working sets (corpus/artifacts regenerate every run)
+fuzz/corpus/
+fuzz/artifacts/
