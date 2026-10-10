@@ -1,6 +1,12 @@
 # Changelog
 
 ## [Unreleased]
+### libFuzzer real (Fase E)
+- `fuzz/` (crate aislada, fuera del workspace: libfuzzer-sys nunca toca
+  el gate de dependencias): target `parse_service` (cuerpo arbitrario,
+  nombre fijo + instanciado) + seeds comprometidas. CI nocturno 10 min
+  (`fuzz.yml`: job `cargo-fuzz` en nightly/manual; el proxy `no_panic`
+  sigue en cada PR de parser).
 ### montajes privados (Fase D3)
 - `private-tmp = yes|no` (defecto `no`): `unshare` de montajes + tmpfs
   `mode=1777` sobre `/tmp`, instalado en el hijo con privilegios aún

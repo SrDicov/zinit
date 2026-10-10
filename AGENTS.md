@@ -13,7 +13,9 @@ cargo test                    # all
 cargo test -p zcore           # single crate; same for zconfig/zrt/zservice/zinit/zctl
 cargo test -p zcore <filter>  # single test
 cargo test -p zcore --release # property tests run fastest here (nightly cron does this)
-cargo test -p zconfig no_panic  # fuzz proxy until real cargo-fuzz targets exist (Phase 5)
+cargo test -p zconfig no_panic  # fuzz proxy (fast, every parser PR)
+# real libFuzzer: cd fuzz && cargo fuzz run parse_service seeds/parse_service
+# (nightly only; CI runs 10 min nightly — see .github/workflows/fuzz.yml)
 cargo clippy --all-targets    # must be 0 warnings (CI sets RUSTFLAGS=-D warnings)
 cargo fmt --check             # CI runs cargo fmt --all --check
 cargo doc --workspace --no-deps  # must stay clean (RUSTDOCFLAGS=-D warnings, deny(missing_docs))
