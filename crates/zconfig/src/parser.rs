@@ -1083,10 +1083,10 @@ fn expand_instance(desc: &mut ServiceDesc) -> Result<(), ParseError> {
     let Some(at) = desc.name.rfind('@') else {
         return Ok(());
     };
-    // `@` is one ASCII byte, so `at + 1` is always a `char` boundary, and
-    // everything after it is the candidate instance.
-    let instance = desc.name[at + 1..].to_owned();
-    if instance.is_empty() || instance.contains('@') {
+    // Exactly one `@`: with two, no half of the name is unambiguously the
+    // instance. Both slices are safe: `@` is one ASCII byte, so `at` and
+    // `at + 1` are `char` boundaries.
+    if desc.name[..at].contains('@') || desc.name[at + 1..].is_empty() {
         return Err(ParseError::new(
             ParseErrorKind::BadName,
             "E018",
@@ -1100,6 +1100,7 @@ fn expand_instance(desc: &mut ServiceDesc) -> Result<(), ParseError> {
             ),
         ));
     }
+    let instance = desc.name[at + 1..].to_owned();
     desc.command = substitute_instance(&desc.command, &instance);
     if let Some(tty) = desc.tty.as_mut() {
         *tty = substitute_instance(tty, &instance);
@@ -3265,7 +3266,7 @@ mod lifecycle_directive_tests {
     fn tty_relative_is_refused() {
         let e = parse_service("svc", "type = console\ncommand = /bin/x\ntty = tty1\n")
             .expect_err("relative tty must not parse");
-        assert!(e.message.contains("absolute"), "wrong error: {}", e.message);
+        assert!(e.help.contains("absolute"), "wrong help: {}", e.help);
     }
 
     #[test]
