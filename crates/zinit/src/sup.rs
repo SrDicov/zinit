@@ -1620,6 +1620,25 @@ fn is_executable(_meta: &std::fs::Metadata) -> bool {
     true
 }
 
+/// True when a spawn failed because the file is being written.
+///
+/// `ETXTBSY` is POSIX; the constant lives behind `cfg(unix)` because that
+/// is where `libc` exposes it. Elsewhere every spawn error is final.
+#[cfg(unix)]
+fn is_txtbsy(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ETXTBSY)
+}
+
+/// True when a spawn failed because the file is being written.
+///
+/// Non-Unix builds never retry: without the constant there is nothing to
+/// match, and retrying blindly would turn every missing interpreter into
+/// a 15 ms stall.
+#[cfg(not(unix))]
+fn is_txtbsy(_e: &io::Error) -> bool {
+    false
+}
+
 /// Run one generator to completion: `Ok(Some(text))` is stdout worth keeping,
 /// `Ok(None)` is silence worth nothing, `Err(msg)` is an announced skip.
 ///
@@ -1628,14 +1647,28 @@ fn is_executable(_meta: &std::fs::Metadata) -> bool {
 /// generator that hangs must cost 10 seconds, not the boot.
 fn run_one_generator(path: &Path) -> Result<Option<String>, String> {
     use std::process::{Command, Stdio};
-    let mut child = match Command::new(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => return Err(format!("cannot spawn ({e})")),
+    let mut child = {
+        let mut tries = 0;
+        loop {
+            match Command::new(path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => break child,
+                // The generator is being written right now (an editor
+                // saving mid-boot, or a writer racing the exec on
+                // overlayfs): a few milliseconds almost always settles
+                // it. Bounded — three tries, then the normal loud skip —
+                // and anything else fails on the first try.
+                Err(e) if is_txtbsy(&e) && tries < 3 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => return Err(format!("cannot spawn ({e})")),
+            }
+        }
     };
     let start = std::time::Instant::now();
     let budget = std::time::Duration::from_millis(GENERATOR_TIMEOUT_MS);
