@@ -566,10 +566,10 @@ enum LogSink {
   `BufWriter` que pueda perder datos en un `SIGKILL`.
 - `log = syslog`: socket `AF_UNIX` datagrama conectado a `/dev/log`, heredado
   como stdout/stderr — un `write(2)` es un datagrama. Sin formato `PRI`/`TAG`
-  (la atribución viaja en `SCM_CREDENTIALS` del kernel); las líneas del
-  supervisor salen por socket fresco por mensaje (un daemon reiniciado nunca
-  deja escrituras colgadas); sin daemon, degradación anunciada con el servicio
-  a oscuras, nunca spawn rechazado.
+  (la atribución viaja en `SCM_CREDENTIALS` del kernel); una escritura
+  fallida reconecta una vez (un daemon reiniciado re-enlaza `/dev/log`,
+  huerfanando la conexión vieja) antes de fallar en voz alta; sin daemon,
+  degradación anunciada con el servicio a oscuras, nunca spawn rechazado.
 - `zctl catlog <svc>` — `tail -f` sobre el fichero. La integración con journald
   (`log-type = pipe` + `consumer-of`) es una **feature separada** para v2, no parte del núcleo.
 

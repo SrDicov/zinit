@@ -26,11 +26,11 @@
 //! in the kernel's `SCM_CREDENTIALS`, which is how journald names the
 //! sender, and inventing a line format here would make a future journald
 //! consumer disagree with every log already written. Supervisor-side lines
-//! go out on a fresh socket per message (no stale connection to a restarted
-//! daemon, ever); over-4 KiB lines split across two datagrams, exactly as
-//! oversized lines already split on pipes. No daemon at `/dev/log` is
-//! announced degradation with the service running dark, never a refused
-//! spawn: a machine whose logger is down still needs its services.
+//! share the handle's connected socket; a failed write reconnects once
+//! (a restarted daemon rebinds `/dev/log`, orphaning the old connection)
+//! before failing loudly. No daemon at `/dev/log` is announced degradation
+//! with the service running dark, never a refused spawn: a machine whose
+//! logger is down still needs its services.
 
 use std::ffi::CString;
 use std::io;
@@ -58,8 +58,8 @@ pub struct LogHandle {
     max_bytes: u64,
     /// Rotated generations kept (`.1` … `.N`).
     backups: u8,
-    /// True for a syslog socket: supervisor-side lines go out on a fresh
-    /// socket per message (see `write_datagram_line`) instead of this fd.
+    /// True for a syslog socket: supervisor-side lines share this connected
+    /// socket (reconnecting once on failure), instead of a log file.
     datagram: bool,
 }
 
@@ -184,10 +184,11 @@ pub fn write_line(h: &mut LogHandle, line: &[u8]) -> io::Result<()> {
             "log sink is closed",
         ));
     }
-    // Datagrams leave through a fresh socket per message (see
-    // `write_datagram_line`): the handle's own fd belongs to the child.
+    // Datagrams leave through the handle's own connected socket (see
+    // `write_datagram`): the supervisor shares the child's connection the
+    // way it shares a log file.
     if h.datagram {
-        return write_datagram_line(line);
+        return write_datagram(h, line);
     }
     rotate(h)?;
     // Room for the newline without splitting the line across two writes.
@@ -207,29 +208,37 @@ pub fn write_line(h: &mut LogHandle, line: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// One supervisor-side line to the syslog daemon: open, write, close.
+/// One supervisor-side line to the syslog daemon, through the handle.
 ///
-/// A fresh socket per message rather than a held one: a daemon that
-/// restarts rebinds `/dev/log`, and a held connection to the old socket
-/// would fail every write until the supervisor itself restarts. Three
-/// syscalls on a path taken only for diagnostics is the cheaper honesty —
-/// and a missing daemon fails here, loudly, instead of parking the loop
-/// in a blocking write to nowhere.
-fn write_datagram_line(line: &[u8]) -> io::Result<()> {
-    let fd = zrt::sys::unix_dgram_connect(Path::new(SYSLOG_PATH))?;
+/// Normally a single write on the connected socket opened at `open_sink.
+/// If the write fails the daemon likely restarted and rebound `/dev/log`
+/// under us — a connected datagram socket points at the old binding
+/// forever — so reconnect once and retry once before admitting failure.
+/// A missing daemon fails here, loudly, instead of parking the loop in a
+/// blocking write to nowhere. (The child's own copy of the fd is not
+/// refreshed: like a rotated log file, post-`exec` writes go wherever the
+/// descriptor pointed at spawn. Same shape, same acceptance.)
+fn write_datagram(h: &mut LogHandle, line: &[u8]) -> io::Result<()> {
     // Same framing as `write_line`: line plus terminator in one write when
     // it fits (one datagram), split across two when it does not — the same
     // documented fallback pipes already live with.
-    let result = if line.len() < 4096 {
-        let mut buf = [0u8; 4096];
-        buf[..line.len()].copy_from_slice(line);
-        buf[line.len()] = b'\n';
-        write_all(fd, &buf[..line.len() + 1])
-    } else {
-        write_all(fd, line).and(write_all(fd, b"\n"))
+    let send = |fd: RawFd| {
+        if line.len() < 4096 {
+            let mut buf = [0u8; 4096];
+            buf[..line.len()].copy_from_slice(line);
+            buf[line.len()] = b'\n';
+            write_all(fd, &buf[..line.len() + 1])
+        } else {
+            write_all(fd, line).and(write_all(fd, b"\n"))
+        }
     };
-    let _ = zrt::sys::close(fd);
-    result
+    if send(h.fd).is_ok() {
+        return Ok(());
+    }
+    let fd = zrt::sys::unix_dgram_connect(Path::new(SYSLOG_PATH))?;
+    let _ = zrt::sys::close(h.fd);
+    h.fd = fd;
+    send(h.fd)
 }
 
 /// Rotate when the file has reached `max_bytes`. No-op for `/dev/null`.
