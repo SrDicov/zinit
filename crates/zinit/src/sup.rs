@@ -1648,7 +1648,8 @@ fn is_txtbsy(_e: &io::Error) -> bool {
 /// fails with `ETXTBSY` retries a bounded three times: the generator file
 /// may be under concurrent write (an editor saving mid-boot, or overlayfs
 /// settling a just-written file), and a few milliseconds almost always
-/// settle it. Anything else fails on the first try, loudly.fn run_one_generator(path: &Path) -> Result<Option<String>, String> {
+/// settle it. Anything else fails on the first try, loudly.
+fn run_one_generator(path: &Path) -> Result<Option<String>, String> {
     use std::process::{Command, Stdio};
     let mut child = {
         let mut tries = 0;
