@@ -405,12 +405,24 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
     env_ptrs.push(core::ptr::null());
 
     // ── fds, all CLOEXEC, all before the fork ───────────────────────────
-    let log_handle = log::open_sink(ctx.log).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("service `{}`: cannot open log: {e}", ctx.service_name),
-        )
-    })?;
+    let log_handle = log::open_sink(ctx.log)
+        .or_else(|e| {
+            // `log = syslog` without a daemon runs dark (announced once at
+            // slot build): refusing every spawn would burn restart budget
+            // on a non-service failure. Anything else failing still fails
+            // the spawn — and if `/dev/null` itself is gone, so does this.
+            if matches!(ctx.log, zcore::LogSink::Syslog) {
+                log::open_sink(&zcore::LogSink::None)
+            } else {
+                Err(e)
+            }
+        })
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("service `{}`: cannot open log: {e}", ctx.service_name),
+            )
+        })?;
     // The handle is closed on spawn failure and forgotten (owned by the
     // supervisor) on success. `mem::forget` reads badly but is honest: the
     // fd must outlive this function, and the owner is the returned Spawned.
@@ -1764,6 +1776,21 @@ mod tests {
         let log = LogSink::None;
         let c = ctx(crate::testutil::true_bin(), &[], &log);
         let s = spawn(&plan, 0, &c).expect("spawn");
+        assert_eq!(reap(&s), zrt::sys::ExitStatus::Exited(0));
+    }
+
+    #[test]
+    fn syslog_without_daemon_still_spawns_dark() {
+        let mut sp = ServicePlan::new(String::from("sys"));
+        sp.ready = zcore::Ready::None;
+        sp.log = LogSink::Syslog;
+        let plan = plan_with(sp);
+        let log = LogSink::Syslog;
+        // With a daemon this logs there; without one the spawn falls back
+        // to dark. Either way the spawn succeeds — a missing logger must
+        // never refuse a service — so this holds on every machine.
+        let c = ctx(crate::testutil::true_bin(), &[], &log);
+        let s = spawn(&plan, 0, &c).expect("syslog must never refuse a spawn");
         assert_eq!(reap(&s), zrt::sys::ExitStatus::Exited(0));
     }
 
