@@ -408,7 +408,9 @@ mod tests {
             "delay should have held the restart: {t:?}"
         );
         assert!(
-            !t.actions.iter().any(|a| matches!(a, Action::BudgetExhausted(_i))),
+            !t.actions
+                .iter()
+                .any(|a| matches!(a, Action::BudgetExhausted(_i))),
             "a delay is not an empty bucket: {t:?}"
         );
         assert!(t.budget_exhausted.is_empty());
