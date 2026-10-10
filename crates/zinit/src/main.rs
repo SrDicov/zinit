@@ -17,6 +17,7 @@
 //! No CLI framework. There are two flags and a directory; `clap` would be more
 //! dependencies than behaviour.
 
+mod ctl;
 mod init;
 mod sup;
 
@@ -24,9 +25,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use zrt::report::announce_degradation;
-
-/// Where service descriptions live when `--sup` is given no directory.
-const DEFAULT_CONFIG_DIR: &str = "/etc/zinit/services.d";
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -47,15 +45,13 @@ fn main() -> ExitCode {
             init::run();
         }
         "--sup" => {
-            let dir: PathBuf = args
-                .next()
-                .map_or_else(|| PathBuf::from(DEFAULT_CONFIG_DIR), PathBuf::from);
+            let dir: Option<PathBuf> = args.next().map(PathBuf::from);
             if args.next().is_some() {
                 announce_degradation("--sup takes at most one argument: a directory");
                 usage();
                 return ExitCode::from(2);
             }
-            match sup::run(&dir) {
+            match sup::run(dir.as_deref()) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     // The supervisor cannot supervise. It says why, and it says

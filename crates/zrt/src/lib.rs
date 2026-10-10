@@ -120,6 +120,7 @@ pub mod childproc;
 pub mod clock;
 pub mod reactor;
 pub mod report;
+pub mod seccomp;
 pub mod signals;
 pub mod sys;
 

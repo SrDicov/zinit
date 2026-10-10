@@ -9,7 +9,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::types::{Bucket, Desired, Idx, Plan, State};
+use crate::types::{Bucket, Desired, Idx, Plan, ServiceKind, State};
 
 /// Per-service mutable state.
 #[derive(Clone, Debug)]
@@ -61,6 +61,23 @@ pub struct ServiceState {
     /// Cleared by an explicit operator action (`zctl kick`, `zctl start`) or by
     /// [`Bucket::reset`], never by the passage of time.
     pub restart_suppressed: bool,
+    /// A oneshot ran to a clean exit. Only [`ServiceKind`] `Oneshot` ever sets
+    /// this; while set, the reconciler does not start the
+    /// service (only `kick` — or an explicit `start`, which kicks — re-arms
+    /// it), and dependents treat the service as satisfied without a live
+    /// process. No timer or pid may be set while it holds (the `Stopped`
+    /// invariants already guarantee that), and
+    /// [`Runtime::check_invariants`] additionally refuses it on any other
+    /// kind. Cleared like `restart_suppressed`: explicitly, never by time.
+    pub completed: bool,
+    /// Monotonic ms of the last watchdog check-in (`WATCHDOG=1` on the notify
+    /// fd), or `None` when no ping has arrived yet.
+    ///
+    /// Diagnostic only, like `restarts` and `last_exit`: no invariant
+    /// constrains it. [`crate::reconcile()`] falls back to `started_at` when
+    /// it is `None`, so a service that never pinged is measured from its
+    /// birth, not from zero.
+    pub last_watchdog_ms: Option<u64>,
 }
 
 impl ServiceState {
@@ -83,6 +100,8 @@ impl ServiceState {
             last_exit: None,
             failed_starts: 0,
             restart_suppressed: false,
+            completed: false,
+            last_watchdog_ms: None,
         }
     }
 
@@ -200,13 +219,16 @@ impl Runtime {
         self.services[idx].state
     }
 
-    /// True when every required dependency of `idx` is `Running`.
+    /// True when every required dependency of `idx` is satisfied: `Running`,
+    /// or a completed oneshot. A oneshot that ran clean has no process by
+    /// design; requiring it to be `Running` would make every dependent wait
+    /// for a process that is never coming back.
     #[inline]
     pub fn deps_satisfied(&self, idx: Idx, plan: &Plan) -> bool {
-        plan.services[idx]
-            .required
-            .iter()
-            .all(|&d| self.services[d].state.is_up())
+        plan.services[idx].required.iter().all(|&d| {
+            self.services[d].state.is_up()
+                || (plan.services[d].kind == ServiceKind::Oneshot && self.services[d].completed)
+        })
     }
 
     /// Convenience: set the desired state of a service.
@@ -219,7 +241,12 @@ impl Runtime {
         plan.services
             .iter()
             .enumerate()
-            .filter(|(idx, sp)| !self.services[*idx].invariants_hold(sp.ready.is_handshake()))
+            .filter(|(idx, sp)| {
+                !self.services[*idx].invariants_hold(sp.ready.is_handshake())
+                    // Completion is a oneshot-only fact. Anywhere else it
+                    // means the machine recorded a meaning the plan never gave.
+                    || (self.services[*idx].completed && sp.kind != ServiceKind::Oneshot)
+            })
             .map(|(idx, _)| idx)
             .collect()
     }

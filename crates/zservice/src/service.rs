@@ -35,7 +35,7 @@
 use std::io;
 use std::os::fd::RawFd;
 
-use zcore::{Event, Idx, Plan, Runtime, SignalKind, transition::arm_start_deadlines};
+use zcore::{Event, Idx, ListenSpec, Plan, Runtime, SignalKind, transition::arm_start_deadlines};
 
 use crate::ready::{PollNeed, ReadyWait};
 use crate::spawn::{SpawnCtx, Spawned, spawn};
@@ -68,6 +68,32 @@ pub struct ManagedService {
     exec_fd: Option<RawFd>,
     /// Pending readiness handshake for the current start.
     ready: ReadyWait,
+    /// Unparsed notify-pipe bytes across polls, so a `WATCHDOG=1` split in
+    /// two still parses as one line. Cleared on every start and teardown.
+    notify_buf: Vec<u8>,
+    /// A watchdog ping arrived together with readiness and lost the coin
+    /// toss: the `Ready` went out first, this goes out next poll. Set only
+    /// for watchdog services, whose pipe stays open past readiness.
+    pending_ping: bool,
+    /// The recorded pid came from the pid file, not from our own fork. An
+    /// adopted daemon is signalled by pid, never by group (see
+    /// [`ManagedService::group_is_signallable`]), and — where the kernel
+    /// offers no subreaper — its liveness is polled rather than reaped.
+    adopted: bool,
+    /// The direct child's exit, held while a `Forking` service awaits
+    /// adoption. The fork is gone but the daemon may still materialise via
+    /// its pid file; translating the exit immediately would either kill a
+    /// service that is about to exist or wait forever for one that never
+    /// will. [`ManagedService::poll_forking_unstick`] resolves it once the
+    /// outcome is known.
+    fork_gone: Option<Event>,
+    /// Pre-bound listen sockets as `(fd, logical name)`, held across
+    /// restarts. Bound once (see [`ManagedService::ensure_listeners`]) and
+    /// passed down at every spawn: a crash loop must not drop connections
+    /// to rebind them. Released only when the plan stops asking (same call)
+    /// or the service is retired for good
+    /// ([`ManagedService::close_listeners`]) — never on a plain death.
+    listen_fds: Vec<(RawFd, String)>,
     /// Monotonic ms at which `SIGTERM` was (first) reported due.
     term_sent_at: Option<u64>,
     /// Whether `SIGKILL` was already reported due for this stop.
@@ -88,6 +114,11 @@ impl ManagedService {
             notify_fd: None,
             exec_fd: None,
             ready: ReadyWait::None,
+            notify_buf: Vec::new(),
+            pending_ping: false,
+            adopted: false,
+            fork_gone: None,
+            listen_fds: Vec::new(),
             term_sent_at: None,
             kill_sent: false,
             pending_warning: None,
@@ -102,6 +133,18 @@ impl ManagedService {
     /// The process group to signal, if any.
     pub const fn pgid(&self) -> Option<i32> {
         self.pgid
+    }
+
+    /// Adopt a new plan index after a configuration reload.
+    ///
+    /// The only caller is the supervisor's reload path: the plan is rebuilt
+    /// from scratch, so a surviving service may sit at a different position.
+    /// The mechanism (pid, fds, waiter) is untouched — only the key the core
+    /// uses to address this service changes, and the caller moves the core's
+    /// own slot to match in the same step. Calling this anywhere else would
+    /// desynchronise the mechanism from the machine it reports about.
+    pub fn reindex(&mut self, idx: Idx) {
+        self.idx = idx;
     }
 
     /// Start the service: spawn, record, arm deadlines.
@@ -140,6 +183,10 @@ impl ManagedService {
         self.term_sent_at = None;
         self.kill_sent = false;
         self.pending_warning = None;
+        self.notify_buf.clear();
+        self.pending_ping = false;
+        self.adopted = false;
+        self.fork_gone = None;
         arm_start_deadlines(runtime, plan, self.idx, now_ms);
         let slot = runtime.get_mut(self.idx);
         slot.pid = Some(spawned.pid);
@@ -196,8 +243,84 @@ impl ManagedService {
     /// its `EOF` is proof the image was replaced, and the child necessarily
     /// called `setsid` before `execve`. Until that proof, callers must
     /// signal the bare pid instead, which cannot be lost to a missing group.
+    ///
+    /// Adopted daemons are pid-only forever: the supervisor never saw them
+    /// call `setsid` (that happened inside the daemon's own double fork),
+    /// and signalling a group it cannot prove exists is how a supervisor
+    /// ends up signalling its *own*.
     pub fn group_is_signallable(&self) -> bool {
-        self.exec_confirmed
+        self.exec_confirmed && !self.adopted
+    }
+
+    /// True when the recorded pid came from the pid file rather than our
+    /// own fork. The supervisor uses this to decide how the pid is tracked
+    /// (child tracker where the kernel reaps for us, liveness poll where it
+    /// does not) and — via [`ManagedService::group_is_signallable`] — how it
+    /// is signalled.
+    pub const fn adopted(&self) -> bool {
+        self.adopted
+    }
+
+    /// A snapshot of the held listen sockets for one spawn.
+    ///
+    /// Cloned rather than borrowed: the spawn context outlives any borrow of
+    /// this struct the supervisor could hold across `start`. The set is
+    /// small (capped at spawn time), so the copy is cheaper than the alias.
+    pub fn listen_snapshot(&self) -> Vec<(RawFd, String)> {
+        self.listen_fds.clone()
+    }
+
+    /// Bring the held listen sockets in line with the plan.
+    ///
+    /// Sockets the plan no longer asks for (by logical name) are closed;
+    /// missing ones are bound. Held sockets survive: a crash loop reuses
+    /// them instead of dropping connections to rebind. More than 32 wanted
+    /// sockets is refused outright: past that the description is confused,
+    /// not ambitious. The high-number parking the child handover needs
+    /// happens in `spawn`, not here — this only binds and holds.
+    pub fn ensure_listeners(&mut self, plan: &Plan) -> io::Result<()> {
+        let want = &plan.services[self.idx].listens;
+        if want.len() > crate::spawn::MAX_LISTEN_FDS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "too many listen sockets ({} > {})",
+                    want.len(),
+                    crate::spawn::MAX_LISTEN_FDS
+                ),
+            ));
+        }
+        let mut i = 0;
+        while i < self.listen_fds.len() {
+            if want.iter().any(|w| w.name == self.listen_fds[i].1) {
+                i += 1;
+            } else {
+                let (fd, _) = self.listen_fds.remove(i);
+                let _ = zrt::sys::close_quietly(fd);
+            }
+        }
+        for w in want {
+            if self.listen_fds.iter().any(|(_, n)| n == &w.name) {
+                continue;
+            }
+            let fd = match &w.spec {
+                ListenSpec::TcpPort(port) => zrt::sys::tcp_listen(*port),
+                ListenSpec::UnixPath(path) => {
+                    zrt::sys::unix_service_listen(std::path::Path::new(path))
+                }
+            }?;
+            self.listen_fds.push((fd, w.name.clone()));
+        }
+        Ok(())
+    }
+
+    /// Close and drop every held listen socket. Only for retirement: a dead
+    /// service that may restart keeps its sockets (see `ensure_listeners`),
+    /// a retired one is never coming back.
+    pub fn close_listeners(&mut self) {
+        for (fd, _) in self.listen_fds.drain(..) {
+            let _ = zrt::sys::close_quietly(fd);
+        }
     }
 
     /// Drain the exec-error pipe once.
@@ -257,17 +380,54 @@ impl ManagedService {
 
     /// Run the readiness adapter when it is due.
     ///
-    /// Returns `Some(Ready)` the moment the handshake completes — and closes
-    /// the notify pipe then, so a second line from a chatty service cannot
-    /// re-trigger readiness later. `None` means "not yet"; consult
-    /// [`ManagedService::poll_need`] for when to ask again. Errors are the
-    /// probe's own failures (never a merely-unready service; that is
+    /// Returns `Some(Ready)` the moment the handshake completes, `Some`
+    /// (`WatchdogPing`) for a check-in that arrives without readiness, and
+    /// `None` while neither has happened. A completed handshake closes the
+    /// notify pipe — unless the plan configures a watchdog, in which case
+    /// the pipe stays open for the service's whole life, because a watchdog
+    /// whose fd closed at ready would starve on its first pass. Errors are
+    /// the probe's own failures (never a merely-unready service; that is
     /// `Ok(None)`).
-    pub fn poll_ready(&mut self, now_ms: u64) -> io::Result<Option<Event>> {
-        if self.ready.check(now_ms)? {
-            self.close_notify_fd();
-            self.ready = ReadyWait::None;
+    pub fn poll_ready(&mut self, plan: &Plan, now_ms: u64) -> io::Result<Option<Event>> {
+        // A ping deferred by a simultaneous readiness goes out first: it is
+        // older than anything this round could read.
+        if self.pending_ping {
+            self.pending_ping = false;
+            return Ok(Some(Event::WatchdogPing(self.idx)));
+        }
+        if !matches!(self.ready, ReadyWait::Notify { .. }) {
+            if self.ready.check(now_ms)? {
+                self.close_notify_fd();
+                self.ready = ReadyWait::None;
+                return Ok(Some(Event::Ready(self.idx)));
+            }
+            return Ok(None);
+        }
+        let fd = match self.ready {
+            ReadyWait::Notify { fd } => fd,
+            _ => return Ok(None),
+        };
+        let (ready, watchdog) = crate::ready::drain_notify(fd, &mut self.notify_buf)?;
+        if ready {
+            if plan.services[self.idx].watchdog_sec.is_some() {
+                // The handshake is done but the watch continues: keep the
+                // pipe, keep the waiter, and defer the simultaneous ping to
+                // the next poll so neither event is lost.
+                if watchdog {
+                    self.pending_ping = true;
+                }
+            } else {
+                // No watchdog will ever read this pipe again: close it now,
+                // so a second line from a chatty service cannot re-trigger
+                // readiness later.
+                self.close_notify_fd();
+                self.ready = ReadyWait::None;
+                self.notify_buf.clear();
+            }
             return Ok(Some(Event::Ready(self.idx)));
+        }
+        if watchdog {
+            return Ok(Some(Event::WatchdogPing(self.idx)));
         }
         Ok(None)
     }
@@ -367,8 +527,14 @@ impl ManagedService {
     /// which zinit never asks for — no `WUNTRACED` anywhere) produce `None`:
     /// they are not deaths, and synthesising a death from them would restart
     /// a service that never died.
-    pub fn on_waitpid(&self, status: zrt::sys::ExitStatus) -> Option<Event> {
-        match status {
+    ///
+    /// The one exception is a `Forking` service awaiting adoption: its direct
+    /// child's exit is expected (the launcher's whole job is to exit), so the
+    /// death is *stored* in [`ManagedService::poll_forking_unstick`] instead
+    /// of reported, and `None` comes back. The pid file decides what the
+    /// exit meant — a daemon that materialised, or a start that failed.
+    pub fn on_waitpid(&mut self, is_forking: bool, status: zrt::sys::ExitStatus) -> Option<Event> {
+        let event = match status {
             zrt::sys::ExitStatus::Exited(code) => Some(Event::Exited {
                 idx: self.idx,
                 code,
@@ -378,7 +544,72 @@ impl ManagedService {
                 signal,
             }),
             zrt::sys::ExitStatus::Reported(_) => None,
+        };
+        if is_forking && !self.adopted {
+            // Only real deaths are held: a `Reported` status was never a
+            // death and must not become one later either.
+            if event.is_some() {
+                self.fork_gone = event;
+            }
+            return None;
         }
+        event
+    }
+
+    /// Try to adopt a `Forking` daemon from its pid file.
+    ///
+    /// Reads `<pid_file>`, and on a valid pid records it (`pid` and `pgid`
+    /// both — the daemon is its own group by the double-fork contract, but
+    /// see [`ManagedService::group_is_signallable`] for why that group is
+    /// never signalled) and reports [`Event::AdoptedPid`]. Anything else —
+    /// missing file, unreadable file, no integer in it — is `None`: absence
+    /// of evidence while the launcher may still be writing is routine, not
+    /// an error, and the start timeout bounds the wait either way. Files
+    /// past 1 KiB are not pid files and are refused without reading to
+    /// the end.
+    pub fn poll_forking_adopt(&mut self, plan: &Plan) -> Option<Event> {
+        if self.adopted {
+            return None;
+        }
+        // Misconfigured (the parser refuses this combination, so this is a
+        // hand-built plan in a test): without a file there is nothing to
+        // adopt from, and failing loudly here would turn a plan bug into a
+        // wedged Starting service instead of a start timeout.
+        let path = plan.services[self.idx].pid_file.as_deref()?;
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(_) => return None,
+        };
+        if text.len() > 1024 {
+            return None;
+        }
+        let pid: i32 = match text.trim().parse() {
+            Ok(pid) if pid > 0 => pid,
+            _ => return None,
+        };
+        self.pid = Some(pid);
+        self.pgid = Some(pid);
+        self.adopted = true;
+        Some(Event::AdoptedPid { idx: self.idx, pid })
+    }
+
+    /// Resolve a held fork exit once its meaning is known.
+    ///
+    /// `stopping` is whether the core has given up waiting (start timeout
+    /// fired): a failed launcher (`Exited(non-zero)` / signalled) resolves
+    /// immediately — no daemon is coming — while a clean launcher exit keeps
+    /// waiting for its pid file until the core stops waiting too. Returns the
+    /// stored death exactly once; afterwards there is nothing left to resolve.
+    pub fn poll_forking_unstick(&mut self, stopping: bool) -> Option<Event> {
+        if self.adopted {
+            return None;
+        }
+        let death = self.fork_gone.as_ref()?;
+        let failed = !matches!(death, Event::Exited { code: 0, .. });
+        if !(failed || stopping) {
+            return None;
+        }
+        self.fork_gone.take()
     }
 
     /// Release every custodial fd and reset per-start state.
@@ -400,6 +631,10 @@ impl ManagedService {
         self.term_sent_at = None;
         self.kill_sent = false;
         self.pending_warning = None;
+        self.notify_buf.clear();
+        self.pending_ping = false;
+        self.adopted = false;
+        self.fork_gone = None;
     }
 
     fn close_notify_fd(&mut self) {
@@ -418,7 +653,7 @@ impl ManagedService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zcore::{Desired, LogSink, Ready, ServicePlan, State, StrictReady};
+    use zcore::{Desired, ListenAddr, ListenSpec, LogSink, Ready, ServicePlan, State, StrictReady};
 
     fn plan_with(sp: ServicePlan) -> Plan {
         Plan {
@@ -446,6 +681,7 @@ mod tests {
             log: Box::leak(Box::new(log)),
             service_name: leak(name),
             tty: None,
+            listen: &[],
         };
         (plan, ctx)
     }
@@ -460,6 +696,7 @@ mod tests {
             log,
             service_name: name,
             tty: None,
+            listen: &[],
         }
     }
 
@@ -571,19 +808,85 @@ mod tests {
 
     #[test]
     fn waitpid_status_maps_to_core_events() {
-        let svc = ManagedService::new(3);
+        let mut svc = ManagedService::new(3);
         assert_eq!(
-            svc.on_waitpid(zrt::sys::ExitStatus::Exited(5)),
+            svc.on_waitpid(false, zrt::sys::ExitStatus::Exited(5)),
             Some(Event::Exited { idx: 3, code: 5 })
         );
         assert_eq!(
-            svc.on_waitpid(zrt::sys::ExitStatus::Signaled {
-                signal: 15,
-                core_dumped: false
-            }),
+            svc.on_waitpid(
+                false,
+                zrt::sys::ExitStatus::Signaled {
+                    signal: 15,
+                    core_dumped: false
+                }
+            ),
             Some(Event::Signalled { idx: 3, signal: 15 })
         );
-        assert_eq!(svc.on_waitpid(zrt::sys::ExitStatus::Reported(0x7f)), None);
+        assert_eq!(
+            svc.on_waitpid(false, zrt::sys::ExitStatus::Reported(0x7f)),
+            None
+        );
+    }
+
+    /// A forking launcher's exit is held, not reported: the pid file decides.
+    #[test]
+    fn forking_fork_exit_waits_for_the_pid_file() {
+        let mut svc = ManagedService::new(0);
+        assert_eq!(
+            svc.on_waitpid(true, zrt::sys::ExitStatus::Exited(0)),
+            None,
+            "a clean launcher exit is not a death yet"
+        );
+        // Clean exit, core still waiting: keep waiting for the file.
+        assert_eq!(svc.poll_forking_unstick(false), None);
+        // Core gave up (start timeout): resolve as the clean exit it was.
+        assert_eq!(
+            svc.poll_forking_unstick(true),
+            Some(Event::Exited { idx: 0, code: 0 })
+        );
+        // Exactly once.
+        assert_eq!(svc.poll_forking_unstick(true), None);
+    }
+
+    #[test]
+    fn forking_failed_launcher_resolves_at_once() {
+        let mut svc = ManagedService::new(0);
+        assert_eq!(svc.on_waitpid(true, zrt::sys::ExitStatus::Exited(3)), None);
+        // A failed launcher means no daemon is coming: no need to wait for
+        // the start timeout to say so.
+        assert_eq!(
+            svc.poll_forking_unstick(false),
+            Some(Event::Exited { idx: 0, code: 3 })
+        );
+    }
+
+    #[test]
+    fn forking_adoption_reads_the_pid_file() {
+        let dir = crate::testutil::scratch("adopt");
+        let pidfile = dir.join("d.pid");
+        let mut sp = ServicePlan::new(String::from("d"));
+        sp.kind = zcore::ServiceKind::Forking;
+        sp.ready = Ready::None;
+        sp.log = LogSink::None;
+        sp.pid_file = Some(pidfile.to_string_lossy().into_owned());
+        let plan = plan_with(sp);
+        let mut svc = ManagedService::new(0);
+        // Nothing written yet: no adoption, no error.
+        assert!(svc.poll_forking_adopt(&plan).is_none());
+        std::fs::write(&pidfile, "4242\n").expect("write pidfile");
+        let event = svc.poll_forking_adopt(&plan).expect("adopts");
+        assert_eq!(event, Event::AdoptedPid { idx: 0, pid: 4242 });
+        assert!(svc.adopted());
+        assert_eq!(svc.pid(), Some(4242));
+        // Even with a confirmed exec behind it, an adopted daemon is never
+        // group-signalled: the supervisor did not see it call setsid.
+        svc.exec_confirmed = true;
+        assert!(
+            !svc.group_is_signallable(),
+            "adopted pids are pid-signalled only"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -596,7 +899,7 @@ mod tests {
         kill_group(&svc, zrt::signals::Signal::Kill);
         let pid = svc.pid().expect("pid");
         let status = reap_status(pid);
-        let event = svc.on_waitpid(status).expect("a death is an event");
+        let event = svc.on_waitpid(false, status).expect("a death is an event");
         svc.cleanup();
         let t = zcore::transition::apply(&event, &mut rt, &plan, 10);
         assert_eq!(rt.state_at(0), State::Stopped);
@@ -709,7 +1012,7 @@ mod tests {
         kill_group(&svc, zrt::signals::Signal::Term);
         let pid = svc.pid().expect("pid");
         let status = reap_status(pid);
-        let event = svc.on_waitpid(status).expect("death");
+        let event = svc.on_waitpid(false, status).expect("death");
         svc.cleanup();
         let t = zcore::transition::apply(&event, &mut rt, &plan, 5);
         assert_eq!(rt.state_at(0), State::Stopped);
@@ -775,6 +1078,7 @@ mod tests {
             log: Box::leak(Box::new(LogSink::None)),
             service_name: Box::leak(Box::new(String::from("stubborn"))),
             tty: None,
+            listen: &[],
         };
         let mut rt = Runtime::from_plan(&plan);
         rt.set_desired(0, Desired::Up);
@@ -858,6 +1162,7 @@ mod tests {
             log: Box::leak(Box::new(LogSink::None)),
             service_name: Box::leak(Box::new(String::from("ntfy"))),
             tty: None,
+            listen: &[],
         };
         let mut rt = Runtime::from_plan(&plan);
         rt.set_desired(0, Desired::Up);
@@ -865,7 +1170,7 @@ mod tests {
         svc.start(&plan, &mut rt, &ctx, 0).expect("start");
         let deadline = zrt::clock::now_ms().saturating_add(5_000);
         let ready = loop {
-            if let Some(e) = svc.poll_ready(zrt::clock::now_ms()).expect("poll") {
+            if let Some(e) = svc.poll_ready(&plan, zrt::clock::now_ms()).expect("poll") {
                 break e;
             }
             // A dead child can never notify: EOF on the notify pipe reads as
@@ -889,7 +1194,7 @@ mod tests {
         let pid = svc.pid().expect("pid");
         let status = reap_status(pid);
         svc.cleanup();
-        let _ = svc.on_waitpid(status);
+        let _ = svc.on_waitpid(false, status);
     }
 
     #[test]
@@ -915,6 +1220,7 @@ mod tests {
             log,
             service_name: Box::leak(Box::new(String::from("logged"))),
             tty: None,
+            listen: &[],
         };
         let mut rt = Runtime::from_plan(&plan);
         let mut svc = ManagedService::new(0);
@@ -925,6 +1231,36 @@ mod tests {
         svc.cleanup();
         let content = std::fs::read(&path).expect("log file exists");
         assert_eq!(content, b"hello-from-child\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Listen sockets bind once, survive deaths, and release on retirement:
+    /// a crash loop must not drop connections to rebind them.
+    #[test]
+    fn listeners_bind_once_and_survive_cleanup() {
+        let dir = crate::testutil::scratch("listen");
+        let sock = dir.join("s.sock");
+        let mut sp = ServicePlan::new(String::from("l"));
+        sp.ready = Ready::None;
+        sp.log = LogSink::None;
+        sp.listens = vec![ListenAddr {
+            spec: ListenSpec::UnixPath(sock.to_string_lossy().into_owned()),
+            name: String::from("main"),
+        }];
+        let plan = plan_with(sp);
+        let mut svc = ManagedService::new(0);
+        svc.ensure_listeners(&plan).expect("bind");
+        assert_eq!(svc.listen_snapshot().len(), 1);
+        // Re-checking is a no-op: same fd, no rebind.
+        let first = svc.listen_snapshot()[0].0;
+        svc.ensure_listeners(&plan).expect("recheck");
+        assert_eq!(svc.listen_snapshot()[0].0, first);
+        // A death is not a retirement: the sockets stay held.
+        svc.cleanup();
+        assert_eq!(svc.listen_snapshot().len(), 1);
+        // Retirement releases.
+        svc.close_listeners();
+        assert!(svc.listen_snapshot().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

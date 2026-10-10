@@ -46,4 +46,7 @@ pub use diagnostic::{Diagnostic, DiagnosticBag, Severity, Span};
 pub use graph::{Graph, GraphError};
 pub use parser::{ParseError, parse_service};
 pub use plan::build_plan;
-pub use value::{LogSpec, ReadySpec, RestartSpec, RunAs, ValueError, parse_duration};
+pub use value::{
+    LogSpec, ReadySpec, RestartSpec, RunAs, ValueError, parse_capability, parse_duration,
+    parse_listen,
+};

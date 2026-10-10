@@ -55,8 +55,9 @@ pub use reconcile::{Tick, due_events, reconcile, should_restart};
 pub use runtime::{Runtime, ServiceState};
 pub use transition::{Transition, apply, arm_start_deadlines, kick};
 pub use types::{
-    Bucket, Budget, Desired, Idx, LogLevel, LogSink, MAX_SERVICES, Plan, Ready, Restart,
-    ServiceKind, ServicePlan, SignalKind, State, StrictReady,
+    Bucket, Budget, Desired, Idx, ListenAddr, ListenSpec, LogLevel, LogSink, MAX_SERVICES, Plan,
+    Ready, Restart, SeccompAction, SeccompPolicy, ServiceKind, ServicePlan, SignalKind, State,
+    StrictReady,
 };
 
 /// Errors the core can produce on its own.

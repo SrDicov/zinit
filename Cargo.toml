@@ -6,6 +6,7 @@ members = [
     "crates/zrt",
     "crates/zservice",
     "crates/zinit",
+    "crates/zctl",
 ]
 
 [workspace.package]

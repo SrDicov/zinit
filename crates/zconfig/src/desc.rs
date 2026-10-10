@@ -62,8 +62,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use zcore::{Budget, Restart, ServiceKind};
+use zcore::{Budget, ListenAddr, Restart, SeccompAction, ServiceKind};
 
+use crate::parser::Directive;
 use crate::value::{LogSpec, ReadySpec, ReadySpecKind, RestartSpec, RunAs};
 
 /// Default `stop-timeout`: 10 s, then `SIGKILL`.
@@ -368,6 +369,39 @@ pub struct ServiceDesc {
     /// environment, and so `zcheck` can refuse to certify a description that
     /// depends on something it cannot see.
     pub needs_env_expansion: bool,
+    /// Directives this file set explicitly, in first-seen order.
+    ///
+    /// The parser records every successfully applied directive here. A
+    /// freshly defaulted description has none set. Drop-in merging consults
+    /// this list: only fields the overlay file *said* override the base —
+    /// anything else would let a default the parser filled into the overlay
+    /// silently clobber an explicit value in the base, which is exactly the
+    /// "which one won" question the duplicate rule (`E005`) exists to prevent
+    /// *within* one file.
+    pub explicit: Vec<Directive>,
+    /// Path of the pid file, for `type = forking` only. The parser refuses
+    /// the directive on any other kind rather than storing a path nobody
+    /// will read.
+    pub pid_file: Option<String>,
+    /// Watchdog budget in whole seconds. The parser refuses it without
+    /// `ready = notify` (pings arrive on the notify fd) and refuses zero
+    /// (an instant kill timer is never what was meant).
+    pub watchdog_sec: Option<u64>,
+    /// Sockets to pre-bind, in declaration order, duplicates kept. The only
+    /// accumulating directive besides `env`: each line — and each drop-in —
+    /// adds one socket.
+    pub listens: Vec<ListenAddr>,
+    /// Linux capabilities to drop from the bounding set, canonical
+    /// lowercase names. Merged as a union across layers: dropping twice is
+    /// idempotent, and a layer can only narrow, never widen.
+    pub drop_caps: Vec<String>,
+    /// What a seccomp violation does, when confinement is configured. `None`
+    /// is unconfined — including an explicit `syscall-filter = off`, which
+    /// still records presence so a drop-in can lift a base's filter.
+    pub syscall_filter: Option<SeccompAction>,
+    /// Extra allowed syscall names beyond the always-allowed baseline.
+    /// Merged as a union across layers, like capabilities.
+    pub syscall_allow: Vec<String>,
 }
 
 impl Default for ServiceDesc {
@@ -413,6 +447,13 @@ impl Default for ServiceDesc {
             source: String::new(),
             source_line: 0,
             needs_env_expansion: false,
+            explicit: Vec::new(),
+            pid_file: None,
+            watchdog_sec: None,
+            listens: Vec::new(),
+            drop_caps: Vec::new(),
+            syscall_filter: None,
+            syscall_allow: Vec::new(),
         }
     }
 }
@@ -452,6 +493,143 @@ impl ServiceDesc {
         self.source = source.into();
         self.source_line = line;
         self
+    }
+
+    /// Record that the file being parsed set `directive`.
+    ///
+    /// Called once per successfully applied directive by the parser, which is
+    /// the only writer. Readers (the drop-in merge below) only ever query.
+    pub fn mark_explicit(&mut self, directive: Directive) {
+        if !self.explicit.contains(&directive) {
+            self.explicit.push(directive);
+        }
+    }
+
+    /// True when the file being parsed set `directive` explicitly, rather
+    /// than the parser filling in a default for it.
+    pub fn is_explicit(&self, directive: Directive) -> bool {
+        self.explicit.contains(&directive)
+    }
+
+    /// Merge a drop-in description over this base one, in place.
+    ///
+    /// Fields the drop-in set explicitly win; fields it never mentioned keep
+    /// the base value — a default the parser filled into the drop-in must
+    /// never clobber an explicit value in the base. The accumulating fields
+    /// (`env` with same-key override, `depends` and `rlimits` appends,
+    /// `listen`/`drop_caps`/`syscall_allow` unioned) add rather than replace.
+    /// `restart` merges field-wise (policy, budget numbers, delay separately),
+    /// because a wholesale copy would let a drop-in saying `restart = always`
+    /// silently reset the base's custom budget to the parser's default.
+    /// `source` records both files; `name` is never renamed here (the loader
+    /// only merges same-named files).
+    pub fn overlay_onto(&mut self, over: ServiceDesc) {
+        if over.is_explicit(Directive::Command) {
+            self.command = over.command.clone();
+        }
+        if over.is_explicit(Directive::Type) {
+            self.kind = over.kind;
+        }
+        if over.is_explicit(Directive::Restart) {
+            self.restart.policy = over.restart.policy;
+        }
+        if over.is_explicit(Directive::RestartBudget) {
+            self.restart.budget.capacity = over.restart.budget.capacity;
+            self.restart.budget.window_ms = over.restart.budget.window_ms;
+        }
+        if over.is_explicit(Directive::RestartDelay) {
+            self.restart.budget.delay_ms = over.restart.budget.delay_ms;
+        }
+        if over.is_explicit(Directive::Ready) {
+            self.ready = over.ready.clone();
+        }
+        if over.is_explicit(Directive::ReadyTimeout) {
+            self.ready_timeout_ms = over.ready_timeout_ms;
+        }
+        if over.is_explicit(Directive::StopTimeout) {
+            self.stop_timeout_ms = over.stop_timeout_ms;
+        }
+        if over.is_explicit(Directive::StartTimeout) {
+            self.start_timeout_ms = over.start_timeout_ms;
+        }
+        if over.is_explicit(Directive::User) {
+            self.run_as = over.run_as;
+            self.unresolved_run_as = over.unresolved_run_as.clone();
+        }
+        if over.is_explicit(Directive::Log) {
+            self.log = over.log.clone();
+        }
+        if over.is_explicit(Directive::Critical) {
+            self.is_critical = over.is_critical;
+        }
+        if over.is_explicit(Directive::Cgroup) {
+            self.cgroup = over.cgroup.clone();
+        }
+        if over.is_explicit(Directive::PidFile) {
+            self.pid_file = over.pid_file.clone();
+        }
+        if over.is_explicit(Directive::WatchdogSec) {
+            self.watchdog_sec = over.watchdog_sec;
+        }
+        // `listen` accumulates like `env`, but entries are never overridden:
+        // two identical lines are the same socket twice (harmless — the
+        // supervisor binds by name and the second bind is a no-op re-check),
+        // while two different lines are two sockets. Exact duplicates are
+        // skipped so a base file and a drop-in saying the same thing do not
+        // double the descriptor set.
+        for addr in &over.listens {
+            if !self.listens.iter().any(|a| a == addr) {
+                self.listens.push(addr.clone());
+            }
+        }
+        // Capability and syscall sets only narrow: union, deduplicated.
+        for cap in &over.drop_caps {
+            if !self.drop_caps.iter().any(|c| c == cap) {
+                self.drop_caps.push(cap.clone());
+            }
+        }
+        if over.is_explicit(Directive::SyscallFilter) {
+            self.syscall_filter = over.syscall_filter;
+        }
+        for name in &over.syscall_allow {
+            if !self.syscall_allow.iter().any(|n| n == name) {
+                self.syscall_allow.push(name.clone());
+            }
+        }
+        if over.is_explicit(Directive::Depends) {
+            for name in &over.depends_required {
+                if !self.depends_required.iter().any(|n| n == name) {
+                    self.depends_required.push(name.clone());
+                }
+            }
+            for name in &over.depends_optional {
+                if !self.depends_optional.iter().any(|n| n == name) {
+                    self.depends_optional.push(name.clone());
+                }
+            }
+        }
+        for (k, v) in &over.env {
+            match self.env.iter_mut().rev().find(|(ek, _)| ek == k) {
+                Some(slot) => slot.1 = v.clone(),
+                None => self.env.push((k.clone(), v.clone())),
+            }
+        }
+        for (k, v) in &over.rlimits {
+            match self.rlimits.iter_mut().find(|(ek, _)| ek == k) {
+                Some(slot) => slot.1 = *v,
+                None => self.rlimits.push((k.clone(), *v)),
+            }
+        }
+        self.needs_env_expansion |= over.needs_env_expansion;
+        if !over.source.is_empty() {
+            if !self.source.is_empty() {
+                self.source.push_str(" + ");
+            }
+            self.source.push_str(&over.source);
+        }
+        for d in over.explicit {
+            self.mark_explicit(d);
+        }
     }
 
     /// True when this service runs no process and therefore forks nothing.
@@ -848,5 +1026,102 @@ mod tests {
             ..ServiceDesc::default()
         };
         assert_eq!(custom.kind, ServiceKind::Script);
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+    use crate::parser::parse_service;
+
+    fn parsed(name: &str, text: &str) -> ServiceDesc {
+        parse_service(name, text).expect("test fixture must parse")
+    }
+
+    #[test]
+    fn an_overlay_that_says_nothing_changes_nothing() {
+        let mut base = parsed("svc", "command = /bin/a\nstop-timeout = 20s\n");
+        let over = parsed("svc", "command = /bin/a\n");
+        let before = base.clone();
+        base.overlay_onto(over);
+        assert_eq!(base.stop_timeout_ms, before.stop_timeout_ms);
+        assert_eq!(base.command, "/bin/a");
+    }
+
+    #[test]
+    fn explicit_values_win_and_defaults_do_not_clobber() {
+        let mut base = parsed(
+            "svc",
+            "command = /bin/a\nstop-timeout = 20s\nready = tcp:80\n",
+        );
+        // The overlay sets only `command`. Its parser-filled defaults for
+        // `stop-timeout` (10s) and `ready` (notify) must not leak through.
+        let over = parsed("svc", "command = /bin/b\n");
+        base.overlay_onto(over);
+        assert_eq!(base.command, "/bin/b");
+        assert_eq!(base.stop_timeout_ms, 20_000);
+        assert_eq!(base.ready.kind, crate::value::ReadySpecKind::Tcp);
+    }
+
+    #[test]
+    fn restart_merges_field_wise_not_wholesale() {
+        let mut base = parsed(
+            "svc",
+            "command = /bin/a\nrestart = on-failure\nrestart-budget = 3 restarts per 10s\n",
+        );
+        // `restart = always` must take the policy and leave the budget alone.
+        let over = parsed("svc", "command = /bin/a\nrestart = always\n");
+        base.overlay_onto(over);
+        assert_eq!(base.restart.policy, zcore::Restart::Always);
+        assert_eq!(base.restart.budget.capacity, 3);
+        // And the reverse: a budget-only drop-in keeps the policy.
+        let mut base2 = parsed("svc", "command = /bin/a\nrestart = never\n");
+        let over2 = parsed(
+            "svc",
+            "command = /bin/a\nrestart-budget = 7 restarts per 60s\n",
+        );
+        base2.overlay_onto(over2);
+        assert_eq!(base2.restart.policy, zcore::Restart::Never);
+        assert_eq!(base2.restart.budget.capacity, 7);
+    }
+
+    #[test]
+    fn env_merges_with_same_key_override() {
+        let mut base = parsed("svc", "command = /bin/a\nenv = A=1\nenv = B=2\n");
+        let over = parsed("svc", "command = /bin/a\nenv = B=override\nenv = C=3\n");
+        base.overlay_onto(over);
+        assert_eq!(base.env_get("A"), Some("1"));
+        assert_eq!(base.env_get("B"), Some("override"));
+        assert_eq!(base.env_get("C"), Some("3"));
+    }
+
+    #[test]
+    fn depends_accumulate_without_exact_duplicates() {
+        let mut base = parsed("svc", "command = /bin/a\ndepends = net, db\n");
+        let over = parsed("svc", "command = /bin/a\ndepends = db, cache\n");
+        base.overlay_onto(over);
+        assert_eq!(base.depends_required.len(), 3);
+        assert!(base.requires("net") && base.requires("db") && base.requires("cache"));
+    }
+
+    #[test]
+    fn rlimits_override_per_resource() {
+        let mut base = parsed("svc", "command = /bin/a\nrlimit-nofile = 1024\n");
+        let over = parsed(
+            "svc",
+            "command = /bin/a\nrlimit-nofile = 4096\nrlimit-nproc = 64\n",
+        );
+        base.overlay_onto(over);
+        assert_eq!(base.rlimit("nofile"), Some(4096));
+        assert_eq!(base.rlimit("nproc"), Some(64));
+    }
+
+    #[test]
+    fn sources_chain_for_diagnostics() {
+        let mut base = parsed("svc", "command = /bin/a\n").with_source("base.conf", 1);
+        let over = parsed("svc", "command = /bin/b\n").with_source("base.d/10.conf", 1);
+        base.overlay_onto(over);
+        assert_eq!(base.source, "base.conf + base.d/10.conf");
+        assert_eq!(base.command, "/bin/b");
     }
 }

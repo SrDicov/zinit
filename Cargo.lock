@@ -20,6 +20,21 @@ name = "zcore"
 version = "0.1.0"
 
 [[package]]
+name = "zctl"
+version = "0.1.0"
+
+[[package]]
+name = "zinit"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "zconfig",
+ "zcore",
+ "zrt",
+ "zservice",
+]
+
+[[package]]
 name = "zrt"
 version = "0.1.0"
 dependencies = [

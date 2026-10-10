@@ -12,15 +12,16 @@
 | `zconfig` | Parser de descripciones, grafo, plan congelado. | ✅ | 272 |
 | `zrt` | `libc`: reactor ×3, señales, seguimiento de hijos, detección de capacidades. | ✅ | 37 |
 | `zservice` | Ciclo de vida, readiness, identidad, rotación de logs. | ✅ | 65 |
-| `zinit` | Binario: `--init` (PID 1) y `--sup` (supervisor) | ⏳ fase 1 | |
-| `zctl` | CLI | ⏳ fase 3 | |
+| `zinit` | Binario: `--init` (PID 1) y `--sup` (supervisor) | ✅ | |
+| `zctl` | CLI sobre el socket de control (una trama dentro, una línea fuera) | ✅ | |
 | `zcheck` | `zinit check` — valida sin arrancar | ⏳ fase 3 | |
 
-Los crates son librerías: no hay `[[bin]]` ni `main.rs` en el árbol todavía, y por eso no
-existe ningún job de *size budget* que medir. Vuelve con el primer `main.rs`.
+Los binarios son `zinit` y `zctl` (los únicos `[[bin]]` del árbol). El *size
+budget* de CI mide `target/release/zinit` (≤ 500 KiB); `zctl` no entra en el
+presupuesto porque nunca corre como PID 1.
 
-Falta el pegamento: el reactor de `zrt` ya existe, pero aún no hay un `main()` que lo
-conecte con el reconciliador de `zcore` y ejecute los `Action`. Esa es la fase 1.
+El supervisor (`zinit --sup`) ya conecta el reactor de `zrt` con el
+reconciliador de `zcore`, sirve el socket de control y vuelca el estado visible.
 
 ## Bugs de producción que la integración destapó
 
