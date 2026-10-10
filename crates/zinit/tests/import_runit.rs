@@ -66,7 +66,10 @@ fn full_service_converts_exactly() {
     assert_eq!(got, want);
     // And the output governs: what the importer writes, the parser takes.
     let desc = zconfig::parse_service("web", &got).expect("generated output must parse");
-    assert_eq!(desc.command, format!("cd '{f}/web' && ./run; code=$?; exec ./finish $code 0"));
+    assert_eq!(
+        desc.command,
+        format!("cd '{f}/web' && ./run; code=$?; exec ./finish $code 0")
+    );
     let _ = std::fs::remove_dir_all(&out);
 }
 
@@ -102,7 +105,10 @@ fn broken_services_are_skipped_loudly() {
         "odd service name, skipped",
         "web: ./conf is sourced shell, not imported",
     ] {
-        assert!(stderr.contains(needle), "missing warning `{needle}`:\n{stderr}");
+        assert!(
+            stderr.contains(needle),
+            "missing warning `{needle}`:\n{stderr}"
+        );
     }
     let _ = std::fs::remove_dir_all(&out);
 }
