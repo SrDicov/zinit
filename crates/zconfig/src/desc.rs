@@ -1109,14 +1109,18 @@ mod overlay_tests {
         let over = parsed("svc", "command = /bin/a\non-demand = yes\n");
         base.overlay_onto(over);
         assert!(base.on_demand);
-        let mut base2 = parsed("svc", "command = /bin/a\nlisten = tcp:8080\non-demand = yes\n");
+        let mut base2 = parsed(
+            "svc",
+            "command = /bin/a\nlisten = tcp:8080\non-demand = yes\n",
+        );
         let over2 = parsed("svc", "command = /bin/a\n");
         base2.overlay_onto(over2);
         assert!(base2.on_demand, "a silent overlay must not disarm demand");
     }
 
     #[test]
-    fn tty_overrides_only_when_explicit() {        let mut base = parsed("svc", "type = console\ncommand = /bin/a\ntty = /dev/tty1\n");
+    fn tty_overrides_only_when_explicit() {
+        let mut base = parsed("svc", "type = console\ncommand = /bin/a\ntty = /dev/tty1\n");
         let over = parsed("svc", "type = console\ncommand = /bin/a\n");
         base.overlay_onto(over);
         assert_eq!(base.tty.as_deref(), Some("/dev/tty1"));

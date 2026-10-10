@@ -492,10 +492,7 @@ impl Sup {
             // A down on-demand service is a connection away from work: cap
             // the sleep so the trigger in `poll` sees traffic within
             // `DEMAND_TICK_MS`, not within a whole idle cap.
-            if sp.on_demand
-                && core.desired == Desired::Down
-                && core.state == State::Stopped
-            {
+            if sp.on_demand && core.desired == Desired::Down && core.state == State::Stopped {
                 deadline = deadline.min(now.saturating_add(DEMAND_TICK_MS));
             }
         }

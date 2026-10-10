@@ -3400,7 +3400,11 @@ mod lifecycle_directive_tests {
     fn on_demand_on_a_target_is_refused() {
         let e = parse_service("svc", "type = target\non-demand = yes\n")
             .expect_err("a target never spawns to be woken");
-        assert!(e.message.contains("on-demand"), "wrong error: {}", e.message);
+        assert!(
+            e.message.contains("on-demand"),
+            "wrong error: {}",
+            e.message
+        );
     }
 
     #[test]

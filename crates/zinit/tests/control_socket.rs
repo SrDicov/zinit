@@ -408,7 +408,11 @@ fn demand_start_wakes_on_connection() {
             }
         }
     };
-    let running = || scratch.state_of("lazy").is_some_and(|s| s.contains("state=Running"));
+    let running = || {
+        scratch
+            .state_of("lazy")
+            .is_some_and(|s| s.contains("state=Running"))
+    };
     assert!(
         wait_until(START_DEADLINE_MS, running),
         "traffic never woke the service"

@@ -335,7 +335,11 @@ pub fn poll_readable(fds: &[RawFd]) -> io::Result<bool> {
     }
     let mut pfds: Vec<libc::pollfd> = fds
         .iter()
-        .map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
+        .map(|&fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
         .collect();
     // SAFETY: `pfds` is a live array of exactly `len` `pollfd`s; a zero
     // timeout means the call never sleeps and the kernel writes only
