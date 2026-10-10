@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 ### runit import + enable + service shim (Fase C)
-- `scripts/runit-import.sh` (POSIX sh, dash/ash-clean): `runsvdir` →
+- `scripts/runsv-import.sh` (POSIX sh, dash/ash-clean): `runsvdir` →
   `<name>.conf`. `run` (ejecutable, cwd=dir) + `finish` plegado
   (`./finish $code 0`; sin equivalencia ante señales, documentado),
   `check` → `ready = ping:`, `log/run` (dir de svlogd) →

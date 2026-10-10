@@ -1,7 +1,7 @@
 #!/bin/sh
-# runit-import.sh — convert a runit runsvdir into zinit service descriptions.
+# runsv-import.sh — convert a runit runsvdir into zinit service descriptions.
 #
-# Usage: runit-import.sh <runsvdir> <outdir>
+# Usage: runsv-import.sh <runsvdir> <outdir>
 #
 # Reads every service directory in <runsvdir> and writes one `<name>.conf`
 # per service into <outdir>. Text in, text out; nothing is started.
@@ -38,12 +38,12 @@
 # busybox ash, no arrays, no `local`, no pipefail.
 #
 # Example:
-#   ./scripts/runit-import.sh /etc/sv ./services.d
+#   ./scripts/runsv-import.sh /etc/sv ./services.d
 #   zinit check ./services.d && echo imports govern
 
 set -eu
 
-prog=runit-import
+prog=runsv-import
 
 warn() {
     printf '%s: %s\n' "$prog" "$*" >&2

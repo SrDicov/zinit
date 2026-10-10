@@ -1,4 +1,4 @@
-//! The runit importer, end to end: `scripts/runit-import.sh` over a fixture
+//! The runit importer, end to end: `scripts/runsv-import.sh` over a fixture
 //! runsvdir, byte-compared outputs, every output re-parsed by `zconfig`.
 //!
 //! The script is POSIX sh and the assertions are order-free where the shell
@@ -16,7 +16,7 @@ fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
-        .join("runit-sv")
+        .join("runsv")
 }
 
 fn script_path() -> PathBuf {
@@ -24,7 +24,7 @@ fn script_path() -> PathBuf {
         .join("..")
         .join("..")
         .join("scripts")
-        .join("runit-import.sh")
+        .join("runsv-import.sh")
 }
 
 fn scratch_out() -> PathBuf {
