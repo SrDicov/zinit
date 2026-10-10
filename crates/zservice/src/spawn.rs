@@ -1700,7 +1700,35 @@ mod tests {
         // releases what `Spawned` owns (the listen set outlives one start).
         let _ = zrt::sys::close_quietly(a);
         let _ = zrt::sys::close_quietly(b);
-        assert_eq!(reap(&s), zrt::sys::ExitStatus::Exited(0));
+        // The exec verdict, drained for the failure message: `Exited(127)`
+        // below means the child path failed before `execve` (with its errno
+        // here), not that the script's probes failed.
+        let exec = s.exec_fd.expect("exec pipe");
+        let mut ebuf = [0u8; 4];
+        let mut egot = 0;
+        let exec_verdict = loop {
+            match zrt::sys::read(exec, &mut ebuf[egot..]) {
+                Ok(0) if egot == 0 => break String::from("exec ok"),
+                Ok(0) => {
+                    break format!("exec pipe truncated after {egot} bytes");
+                }
+                Ok(n) => {
+                    egot += n;
+                    if egot >= 4 {
+                        break format!("exec failed: errno {}", u32::from_le_bytes(ebuf));
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    break String::from("exec undecided yet");
+                }
+                Err(e) => panic!("exec pipe read: {e}"),
+            }
+        };
+        assert_eq!(
+            reap(&s),
+            zrt::sys::ExitStatus::Exited(0),
+            "exec verdict was: {exec_verdict}"
+        );
     }
 
     /// A notify handshake and a listen socket share the child without

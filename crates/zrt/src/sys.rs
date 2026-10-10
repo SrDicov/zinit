@@ -1641,9 +1641,25 @@ mod tests {
                     Err(e) => panic!("accept: {e}"),
                 }
             };
+            // Same for the bytes: loopback is fast, not instant, and a single
+            // optimistic read loses the race on a loaded machine.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let mut buf = [0u8; 4];
-            let n = read(server, &mut buf).expect("read");
-            assert_eq!(&buf[..n], b"hi");
+            let mut got = 0;
+            while got < buf.len() {
+                match read(server, &mut buf[got..]) {
+                    Ok(0) => break,
+                    Ok(n) => got += n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("read: {e}"),
+                }
+            }
+            assert_eq!(&buf[..got], b"hi");
             let _ = close(listener);
             let _ = close(server);
             return;
