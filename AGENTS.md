@@ -31,7 +31,8 @@ Miri is lib-only by design: `cargo +nightly miri test -p zcore --lib` (never the
   `#![deny(unsafe_op_in_unsafe_fn)]`.
 - `zservice`: only `zcore+zconfig+zrt+libc`. No async runtime, logger, or CLI parser.
 - `zinit`: only place where all four meet (+`libc`). Hand-rolled args
-  (`--init | --sup [<dir>] | --version`); do not add `clap`.
+  (`--init | --sup [<dir>] | check [<dir>] | --version`); do not add `clap`.
+  `check` is a module, never a new crate (size budget).
 - `zctl`: zero deps. CLI shim only (formats one frame, prints one reply);
   the one crate exempt from the print ban (CI-exempted, not PID-1 path).
 - Workspace lints `unsafe_code=forbid`; `zrt`/`zservice` override locally to `allow`

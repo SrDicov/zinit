@@ -3,7 +3,7 @@
 > Un init con **un solo concepto** — *estado deseado* — y un reconciliador que lo cumple.
 > Sin shell para la lógica, sin grafos mutables en runtime, sin acuses que falten.
 
-**Estado**: núcleo, configuración y servicio cerrados. **486 tests, 0 warnings de clippy,
+**Estado**: núcleo, configuración y servicio cerrados. **492 tests, 0 warnings de clippy,
 `cargo doc` limpio.**
 
 | Crate | Qué es | Estado | Tests |
@@ -14,7 +14,7 @@
 | `zservice` | Ciclo de vida, readiness, identidad, rotación de logs. | ✅ | 72 |
 | `zinit` | Binario: `--init` (PID 1) y `--sup` (supervisor) | ✅ | 19 + 7 integración |
 | `zctl` | CLI sobre el socket de control (una trama dentro, una línea fuera) | ✅ | 4 |
-| `zcheck` | `zinit check` — valida sin arrancar | ⏳ fase 3 | |
+| `zcheck` | `zinit check` — valida sin arrancar | ✅ | 6 |
 
 Los binarios son `zinit` y `zctl` (los únicos `[[bin]]` del árbol). El *size
 budget* de CI mide `target/release/zinit` (≤ 1 MiB); `zctl` no entra en el
