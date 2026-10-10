@@ -1104,7 +1104,8 @@ mod overlay_tests {
     }
 
     #[test]
-    fn on_demand_overrides_only_when_explicit() {        let mut base = parsed("svc", "command = /bin/a\nlisten = tcp:8080\n");
+    fn on_demand_overrides_only_when_explicit() {
+        let mut base = parsed("svc", "command = /bin/a\nlisten = tcp:8080\n");
         assert!(!base.on_demand);
         let over = parsed("svc", "command = /bin/a\non-demand = yes\n");
         base.overlay_onto(over);

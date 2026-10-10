@@ -3421,7 +3421,11 @@ mod lifecycle_directive_tests {
     fn private_tmp_on_a_target_is_refused() {
         let e = parse_service("svc", "type = target\nprivate-tmp = yes\n")
             .expect_err("a target has no mounts to isolate");
-        assert!(e.message.contains("private-tmp"), "wrong error: {}", e.message);
+        assert!(
+            e.message.contains("private-tmp"),
+            "wrong error: {}",
+            e.message
+        );
     }
 
     #[test]
