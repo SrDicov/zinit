@@ -62,7 +62,8 @@ pub enum Action {
     CascadeStop { idx: Idx, dep: Idx },
 
     /// The restart budget for this service is now empty. The runtime should
-    /// log loudly - this is a service that is down and staying down.
+    /// log loudly: the service is backing off until the bucket refills or an
+    /// operator runs `zctl kick`.
     BudgetExhausted(Idx),
 
     /// Hand the controlling terminal to this service.

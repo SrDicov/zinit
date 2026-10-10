@@ -433,6 +433,23 @@ impl Bucket {
         true
     }
 
+    /// True when no token is available right now, after refilling.
+    ///
+    /// This is what distinguishes "the budget is empty" from "the delay is
+    /// still spacing attempts": `take` fails in both cases, but only an
+    /// empty bucket is exhaustion worth announcing. A delay-gated retry is
+    /// routine spacing — the reconciler stays silent and a later pass spends
+    /// the token. (A real machine caught the conflation: with the default
+    /// 250 ms delay every restart cycle announced "budget empty" while
+    /// holding tokens.)
+    pub fn exhausted(&mut self, budget: &Budget, now_ms: u64) -> bool {
+        if budget.capacity == 0 {
+            return true;
+        }
+        self.refill(budget, now_ms);
+        self.tokens == 0
+    }
+
     /// Refill to at most `capacity`, proportional to elapsed time.
     fn refill(&mut self, budget: &Budget, now_ms: u64) {
         if !self.started {

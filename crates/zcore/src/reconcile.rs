@@ -119,6 +119,14 @@ pub fn reconcile(runtime: &mut Runtime, plan: &Plan, now_ms: u64) -> Tick {
                     // spent, and it is spent exactly when the spawn is
                     // decided. A budget of N therefore permits N restarts.
                     if !runtime.get_mut(idx).bucket.take(&budget, now_ms) {
+                        // A take fails two ways: the bucket is empty, or the
+                        // delay is still spacing attempts. Only the first is
+                        // exhaustion worth reporting; a delay-gated retry is
+                        // routine, and the next passes spend the token in
+                        // silence.
+                        if !runtime.get_mut(idx).bucket.exhausted(&budget, now_ms) {
+                            continue;
+                        }
                         if !tick.budget_exhausted.contains(&idx) {
                             tick.budget_exhausted.push(idx);
                             tick.actions.push(Action::BudgetExhausted(idx));
@@ -365,6 +373,51 @@ mod tests {
             "budget should have blocked the restart: {t2:?}"
         );
         assert!(t2.budget_exhausted.contains(&i), "and reported it");
+    }
+
+    #[test]
+    fn delay_gated_retry_is_silent_not_exhausted() {
+        // Tokens in hand but the delay still spacing attempts: routine, not
+        // exhaustion. The reconciler must stay quiet and let a later pass
+        // spend the token — announcing "budget empty" here once flooded a
+        // real machine's log on every restart cycle.
+        let mut p = build(&[("flappy", &[])]);
+        let i = 0;
+        p.services[i].restart_budget = crate::types::Budget {
+            capacity: 2,
+            window_ms: 60_000,
+            delay_ms: 1_000,
+        };
+        let mut rt = Runtime::from_plan(&p);
+        rt.set_desired(i, Desired::Up);
+        // One restart spent at t=0: one token left, delay clock running.
+        {
+            let s = rt.get_mut(i);
+            s.state = State::Stopped;
+            s.pid = None;
+            s.started_at = None;
+            s.start_due_at = None;
+            s.last_exit = Some(1);
+            s.failed_starts = 1;
+        }
+        let _ = rt.get_mut(i).bucket.take(&p.services[i].restart_budget, 0);
+        // At t=100 the delay still gates: no spawn, and no exhaustion noise.
+        let t = reconcile(&mut rt, &p, 100);
+        assert!(
+            !t.actions.iter().any(|a| matches!(a, Action::Spawn(_i))),
+            "delay should have held the restart: {t:?}"
+        );
+        assert!(
+            !t.actions.iter().any(|a| matches!(a, Action::BudgetExhausted(_i))),
+            "a delay is not an empty bucket: {t:?}"
+        );
+        assert!(t.budget_exhausted.is_empty());
+        // At t=1000 the delay has passed and the held token spends.
+        let t = reconcile(&mut rt, &p, 1_000);
+        assert!(
+            t.actions.iter().any(|a| matches!(a, Action::Spawn(_i))),
+            "the held token must spend once the delay passes: {t:?}"
+        );
     }
 
     #[test]
