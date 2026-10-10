@@ -83,7 +83,7 @@ use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use zcore::{Idx, Plan, SeccompAction, ServiceKind, StrictReady};
+use zcore::{Idx, Plan, ServiceKind, StrictReady};
 
 use crate::SpawnError;
 use crate::identity::{self, ChildRlimit};
@@ -200,11 +200,10 @@ fn resolve_cap_drops(service_name: &str, caps: &[String]) -> io::Result<Vec<u32>
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        let _ = service_name;
-        return Err(io::Error::new(
+        Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("service `{service_name}`: capability drops are Linux-only"),
-        ));
+        ))
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -239,11 +238,13 @@ fn resolve_seccomp_filter(
     };
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        let _ = (service_name, policy);
-        return Err(io::Error::new(
+        // The policy cannot apply here; naming it keeps the signature honest
+        // on targets that refuse it.
+        let _ = policy;
+        Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("service `{service_name}`: syscall filters are Linux-only"),
-        ));
+        ))
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -260,8 +261,8 @@ fn resolve_seccomp_filter(
             }
         }
         let action = match policy.action {
-            SeccompAction::Enforce => zrt::seccomp::OnViolation::Kill,
-            SeccompAction::Errno => zrt::seccomp::OnViolation::Errno,
+            zcore::SeccompAction::Enforce => zrt::seccomp::OnViolation::Kill,
+            zcore::SeccompAction::Errno => zrt::seccomp::OnViolation::Errno,
         };
         match zrt::seccomp::build(&numbers, action) {
             Some(filter) => Ok(filter),
@@ -508,14 +509,15 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
     // The `LISTEN_PID=` digit field the child fills with its own pid (see
     // `child_step_listen_pid`). Found by prefix; an entry the operator
     // smuggled in with the wrong shape is ignored rather than patched.
-    let mut listen_pid_digits: *mut libc::c_char = core::ptr::null_mut();
+    // Plain bytes: the child writes ASCII digits, which need no signedness.
+    let mut listen_pid_digits: *mut u8 = core::ptr::null_mut();
     if !ctx.listen.is_empty() {
         for c in &env_c {
             let bytes = c.as_bytes();
             if bytes.len() == 11 + 10 && bytes.starts_with(b"LISTEN_PID=") {
                 // SAFETY: `c` is alive in this frame (inherited across the
                 // fork); offset 11 is the first of exactly 10 digit bytes.
-                listen_pid_digits = unsafe { c.as_ptr().add(11) as *mut libc::c_char };
+                listen_pid_digits = unsafe { c.as_ptr().add(11) as *mut u8 };
                 break;
             }
         }
@@ -652,9 +654,14 @@ struct ChildPlan {
     listen_len: usize,
     /// Digit field of the `LISTEN_PID=` env entry, filled with our own pid
     /// before `execve` (null when no listeners: no placeholder was built).
-    listen_pid_digits: *mut libc::c_char,
-    /// Capability numbers to drop from the bounding set (Linux; empty
-    /// elsewhere — the parent refuses a non-empty list off Linux).
+    /// Plain bytes (`*mut u8`), not `c_char`: the values written are ASCII
+    /// digits either way, and a `c_char` field would need a conversion cast
+    /// that is a no-op (rightly refused) on unsigned-char platforms.
+    listen_pid_digits: *mut u8,
+    /// Capability numbers to drop from the bounding set. Linux-only concept:
+    /// the parent refuses a non-empty list off Linux (see `resolve_cap_drops`
+    /// and `child_step_capdrop`, which consult the length on every target so
+    /// the fields stay live everywhere).
     cap_drops: *const u32,
     /// How many `cap_drops` points at.
     cap_len: usize,
@@ -1070,10 +1077,18 @@ fn child_step_no_new_privs() {
 /// setuid `execve`. Failure fails the spawn: running with *more* privilege
 /// than configured is the one outcome this step must never produce.
 ///
-/// Linux only. Off Linux the parent refuses a non-empty list, so the empty
-/// case below is the only one reachable there — and dropping nothing always
-/// succeeds.
+/// The length is consulted on every platform so the fields stay live
+/// everywhere; only Linux acts on them (off Linux the parent refuses a
+/// non-empty list, so the loop below is unreachable there).
+// `cap as c_ulong` is a real conversion on LP64 and the identity on ILP32,
+// where the cast is redundant and rightly refused. The allow documents the
+// split rather than hiding it — same pattern as the mount-flags cast in
+// `zinit --init`.
+#[allow(clippy::unnecessary_cast)]
 fn child_step_capdrop(p: ChildPlan) -> bool {
+    if p.cap_len == 0 {
+        return true;
+    }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         // `PR_CAPBSET_DROP` is 24 (linux/prctl.h); defined here so a missing
@@ -1087,8 +1102,16 @@ fn child_step_capdrop(p: ChildPlan) -> bool {
                 return false;
             }
         }
+        true
     }
-    true
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // Unreachable in practice (see above): a non-empty list cannot arrive
+        // here, and failing closed beats running unconfined. Reading the
+        // pointer keeps the field live on targets that never act on it.
+        let _ = p.cap_drops;
+        false
+    }
 }
 
 /// Take over the controlling terminal for `console` services.
@@ -1143,7 +1166,7 @@ fn child_step_listen_pid(p: ChildPlan) {
         if pid <= 0 {
             // Unreachable in practice (`getpid` is always positive); a `0`
             // keeps the entry valid rather than leaving ten stale zeroes.
-            *digits = b'0' as libc::c_char;
+            *digits = b'0';
             *digits.add(1) = 0;
             return;
         }
@@ -1156,8 +1179,7 @@ fn child_step_listen_pid(p: ChildPlan) {
         }
         let mut i = 0;
         while i < len {
-            // Through `c_char`: signed on some platforms, unsigned on others.
-            *digits.add(i) = rev[len - 1 - i] as libc::c_char;
+            *digits.add(i) = rev[len - 1 - i];
             i += 1;
         }
         *digits.add(len) = 0;
@@ -1698,6 +1720,32 @@ mod tests {
         assert!(s.notify_fd.is_some());
         let _ = zrt::sys::close_quietly(a);
         let _ = zrt::sys::close_quietly(b);
+        // The exec verdict first: a child that never exec'd (missing shell,
+        // dead binary) reports here, not on the notify pipe. EOF means the
+        // image was replaced; four bytes mean the errno; WouldBlock means
+        // the child has not decided yet and the notify drain below is the
+        // verdict that counts.
+        let exec = s.exec_fd.expect("exec pipe");
+        let mut ebuf = [0u8; 4];
+        let mut egot = 0;
+        let exec_verdict = loop {
+            match zrt::sys::read(exec, &mut ebuf[egot..]) {
+                Ok(0) if egot == 0 => break String::from("exec ok"),
+                Ok(0) => {
+                    break format!("exec pipe truncated after {egot} bytes");
+                }
+                Ok(n) => {
+                    egot += n;
+                    if egot >= 4 {
+                        break format!("exec failed: errno {}", u32::from_le_bytes(ebuf));
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    break String::from("exec undecided yet");
+                }
+                Err(e) => panic!("exec pipe read: {e}"),
+            }
+        };
         // The child wrote READY=1 to fd 4; drain it from our read end like
         // the supervisor's readiness poll would, with a deadline instead of
         // a single optimistic read — the child may not have run yet.
@@ -1705,12 +1753,18 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut buf = [0u8; 16];
         let mut got = 0;
+        let mut saw_eof = false;
+        let mut timed_out = false;
         while got < 8 {
             match zrt::sys::read(notify, &mut buf[got..]) {
-                Ok(0) => break,
+                Ok(0) => {
+                    saw_eof = true;
+                    break;
+                }
                 Ok(n) => got += n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     if std::time::Instant::now() > deadline {
+                        timed_out = true;
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1720,7 +1774,7 @@ mod tests {
         }
         assert!(
             buf[..got].starts_with(b"READY=1"),
-            "notify arrived on the moved fd: {:?}",
+            "notify on moved fd: got={got} eof={saw_eof} timeout={timed_out} exec=[{exec_verdict}] bytes={:?}",
             &buf[..got]
         );
         let _ = zrt::sys::kill_process(s.pid, zrt::signals::Signal::Kill);

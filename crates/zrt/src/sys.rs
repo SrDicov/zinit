@@ -421,10 +421,13 @@ fn unix_addr(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
     }
     // SAFETY: `bytes.len() <= room < sun_path.len()`, so the copy stays
     // inside the field; the trailing NUL comes from the `zeroed` above.
+    // `.cast()` rather than `as`: `sun_path` is `c_char`, signed on some
+    // platforms and unsigned on others, and an `as` cast would be a no-op
+    // (rightly refused) where they coincide.
     unsafe {
         core::ptr::copy_nonoverlapping(
             bytes.as_ptr(),
-            addr.sun_path.as_mut_ptr() as *mut u8,
+            addr.sun_path.as_mut_ptr().cast::<u8>(),
             bytes.len(),
         );
     }
