@@ -1673,6 +1673,28 @@ mod tests {
     }
 
     #[test]
+    fn console_with_tty_survives_the_handover() {
+        let mut sp = ServicePlan::new(String::from("con"));
+        sp.kind = ServiceKind::Console;
+        sp.ready = zcore::Ready::None;
+        sp.log = LogSink::None;
+        let plan = plan_with(sp);
+        let log = LogSink::None;
+        // `/dev/null` is not a terminal: `open` succeeds, `TIOCSCTTY` fails,
+        // and the child runs on without one — the lenient path the handover
+        // documents. What this proves is the plumbing: the path travels from
+        // `SpawnCtx` into the child without killing the spawn. Acquiring a
+        // real line is proven where real lines exist (hardware stage), not
+        // in a container without one.
+        let c = SpawnCtx {
+            tty: Some(Path::new("/dev/null")),
+            ..ctx(crate::testutil::true_bin(), &[], &log)
+        };
+        let s = spawn(&plan, 0, &c).expect("spawn");
+        assert_eq!(reap(&s), zrt::sys::ExitStatus::Exited(0));
+    }
+
+    #[test]
     fn notify_spawn_exposes_the_handshake_fd() {
         let mut sp = ServicePlan::new(String::from("ntf"));
         sp.kind = ServiceKind::Script;

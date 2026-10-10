@@ -1253,10 +1253,12 @@ impl Sup {
             cgroup: desc.cgroup.as_deref(),
             log: &sp.log,
             service_name: &desc.name,
-            // ponytail: no getty in this phase, so a `console` service has no
-            // terminal to take. It spawns as an ordinary process rather than
-            // failing; pass `Some("/dev/ttyN")` when the console service lands.
-            tty: None,
+            // The console handover: `tty =` is refused on any other kind at
+            // parse time and again on the merged description at load, so by
+            // the time a path arrives here a console service owns it. A
+            // console *without* one is reported at load and spawns as an
+            // ordinary process (the child's own documented fallback).
+            tty: desc.tty.as_deref().map(Path::new),
             listen: &listen,
         };
         let started = self.slots[idx]
@@ -1677,7 +1679,7 @@ fn read_layer(dir: &Path) -> io::Result<LayerContent> {
             Ok(entry) => entry.path(),
             Err(e) => return Err(fatal(format!("{}: {e}", dir.display()))),
         };
-        // ponytail: `*.conf` only. `DESIGN.md` §5.1 also spells
+        // ponytail: `*.conf` only. `DESIGN.md` §5.2 also spells
         // `network.target` as a file name; targets work today through
         // `type = target`, which is the same code path, so a second filename
         // convention would only be a second way to spell one thing.
@@ -1784,6 +1786,21 @@ fn load_layers(dirs: &[PathBuf]) -> io::Result<(Plan, Vec<Option<ServiceDesc>>)>
         )));
     }
     validate_merged(&descs)?;
+    // A console with no terminal to take is announced, not refused: refusing
+    // would cost the whole boot (or the whole reload) over a login prompt,
+    // while running it as an ordinary process costs only job control — the
+    // child's own fallback, which its documentation already promises. This
+    // check lives here and not in the parser because a drop-in may supply
+    // the tty the base file lacks.
+    for desc in &descs {
+        if desc.kind == zcore::ServiceKind::Console && desc.tty.is_none() {
+            announce_degradation(&format!(
+                "{}: console service `{}` has no `tty =`; it will run as an ordinary process without job control",
+                desc.source,
+                desc.name
+            ));
+        }
+    }
     apply_wants(&mut descs, dirs);
     resolve_identities(&mut descs)?;
     freeze_plan(descs)
@@ -1815,6 +1832,12 @@ fn validate_merged(descs: &[ServiceDesc]) -> io::Result<()> {
         if !desc.listens.is_empty() && !desc.kind.has_process() {
             return Err(fatal(format!(
                 "{}: listen on a service with no process; sockets nobody spawns for bind nowhere",
+                desc.source
+            )));
+        }
+        if desc.tty.is_some() && desc.kind != zcore::ServiceKind::Console {
+            return Err(fatal(format!(
+                "{}: tty needs `type = console` (same file or drop-in)",
                 desc.source
             )));
         }
@@ -2203,6 +2226,33 @@ mod tests {
             load(&dir2).is_err(),
             "watchdog without a handshake must not load even across layers"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn tty_without_console_is_refused_at_load() {
+        // Merged nonsense: the base is an innocent console with a tty, the
+        // drop-in only restates the type — together indefensible, like the
+        // pid-file case above.
+        let dir = scratch("merged-bad-tty");
+        std::fs::write(
+            dir.join("a.conf"),
+            "type = console\ncommand = /bin/d\ntty = /dev/tty1\nready = none\n",
+        )
+        .expect("write");
+        let ddir = dir.join("a.d");
+        std::fs::create_dir_all(&ddir).expect("mkdir");
+        std::fs::write(ddir.join("10.conf"), "type = process\n").expect("write");
+        assert!(load(&dir).is_err(), "tty without console must not load");
+        let dir2 = scratch("merged-good-tty");
+        std::fs::write(
+            dir2.join("a.conf"),
+            "type = console\ncommand = /bin/true\ntty = /dev/tty1\n",
+        )
+        .expect("write");
+        let (plan, _) = load(&dir2).expect("console with tty loads");
+        assert!(plan.index_of("a").is_some());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
     }

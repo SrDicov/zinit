@@ -1,6 +1,15 @@
 # Changelog
 
 ## [Unreleased]
+### Consola e instancias (Fase B)
+- `tty = /dev/ttyN` (absoluta o rechazo): solo `type = console` (rechazo en
+  fichero y baranda fusionada en carga, igual que `pid-file`); el supervisor
+  la entrega al hijo, que hace `TIOCSCTTY` (fallo de `ioctl` degradado,
+  como documentado). Consola sin `tty`: aviso y corre como proceso.
+- `%i`: `nombre@instancia` expande en `command`/`tty`/`pid-file`
+  (`%%` colapsa, `%` solo literal, sin `@` no hay expansión, `@` doble o
+  vacía se rechaza). Cada fichero se expande con su propio nombre;
+  dependencias por nombre exacto.
 ### `zinit check`
 - Offline validator: `zinit check [<dir>]` loads exactly what a boot (or
   `reload-all`) would load — layers, drop-ins, generators, merged

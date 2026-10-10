@@ -178,6 +178,8 @@ pub enum Directive {
     RlimitAs,
     /// Path of the pid file, for `type = forking` only.
     PidFile,
+    /// Controlling terminal path, for `type = console` only.
+    Tty,
     /// Watchdog budget in whole seconds; needs `ready = notify`.
     WatchdogSec,
     /// `tcp:<port>[:<name>]` or `unix:<path>`, repeatable and accumulating.
@@ -213,6 +215,7 @@ impl Directive {
             Directive::RlimitNproc => "rlimit-nproc",
             Directive::RlimitAs => "rlimit-as",
             Directive::PidFile => "pid-file",
+            Directive::Tty => "tty",
             Directive::WatchdogSec => "watchdog-sec",
             Directive::Listen => "listen",
             Directive::DropCapabilities => "drop-capabilities",
@@ -229,7 +232,7 @@ impl Directive {
     /// hidden property of the service *name* would be a policy nobody could
     /// read off the file. The alternative, refusing to model it at all, means
     /// the runtime has to hardcode the same list somewhere less visible.
-    pub const ALL: [Directive; 24] = [
+    pub const ALL: [Directive; 25] = [
         Directive::Command,
         Directive::Type,
         Directive::Depends,
@@ -249,6 +252,7 @@ impl Directive {
         Directive::RlimitNproc,
         Directive::RlimitAs,
         Directive::PidFile,
+        Directive::Tty,
         Directive::WatchdogSec,
         Directive::Listen,
         Directive::DropCapabilities,
@@ -887,6 +891,21 @@ pub fn parse_service_with_diagnostics(name: &str, text: &str) -> Result<ParsedSe
             Directive::PidFile => {
                 desc.pid_file = Some(value.to_owned());
             }
+            Directive::Tty => {
+                // A terminal path is absolute or it is a typo: relative
+                // resolution would depend on a working directory no reader
+                // of this file can see, and `open` in the child would follow
+                // it somewhere else. NUL is refused later, at `CString`
+                // construction, with the service name attached.
+                if value.is_empty() || !value.starts_with('/') {
+                    return Err(bad_value(
+                        directive,
+                        value_span,
+                        "write an absolute terminal path, e.g. `/dev/tty1`",
+                    ));
+                }
+                desc.tty = Some(value.to_owned());
+            }
             Directive::WatchdogSec => {
                 let secs = match parse_u64(value).ok() {
                     Some(n) => n,
@@ -921,7 +940,7 @@ pub fn parse_service_with_diagnostics(name: &str, text: &str) -> Result<ParsedSe
     // triggered them: `type = target` after `cgroup = web` would otherwise be
     // accepted in one order and rejected in the other.
     if desc.is_virtual() {
-        for directive in [Directive::Depends, Directive::Cgroup] {
+        for directive in [Directive::Depends, Directive::Cgroup, Directive::Tty] {
             if let Some(span) = span_of(&seen, directive) {
                 return Err(virtual_directive_error(directive, desc.kind, span));
             }
@@ -948,6 +967,18 @@ pub fn parse_service_with_diagnostics(name: &str, text: &str) -> Result<ParsedSe
             Directive::PidFile,
             span,
             "pid-file needs `type = forking` in the same file, drop-ins included",
+        ));
+    }
+    // A terminal nobody takes over is a path nobody will ever open: only the
+    // console handover reads it, and it only runs for `Console`. Same shape
+    // as `pid-file` above, including the drop-in escape hatch and the merged
+    // cross-layer backstop at load.
+    if desc.is_explicit(Directive::Tty) && desc.kind != ServiceKind::Console {
+        let span = span_of(&seen, Directive::Tty).unwrap_or(Span::point(1, 1));
+        return Err(bad_value(
+            Directive::Tty,
+            span,
+            "tty needs `type = console` in the same file, drop-ins included",
         ));
     }
     // Sockets nobody spawns for bind nowhere: same shape as `pid-file`, for
@@ -1028,7 +1059,89 @@ pub fn parse_service_with_diagnostics(name: &str, text: &str) -> Result<ParsedSe
         ));
     }
 
+    // Instance expansion, last of all: nothing above may depend on whether
+    // the name carries an instance, and the substitution must see the final
+    // field values of this file. (A drop-in merged later re-expands nothing:
+    // every file is parsed under its own name, so each layer already
+    // substituted with the same instance.)
+    expand_instance(&mut desc)?;
+
     Ok(ParsedService { desc, warnings })
+}
+
+/// Expand `%i` (instance) and `%%` in `command`, `tty` and `pid-file`.
+///
+/// Only for names carrying an instance (`getty@tty1`, split at the last
+/// `@`): without one every `%` stays literal, so `printf '%i\n'` in an
+/// ordinary service is untouched, and a literal `%%` outside templates is
+/// never mangled either. A name with more than one `@` or an empty instance
+/// is refused — silently picking one would expand the wrong thing, and the
+/// leading-`@` case never reaches here (the name check at entry refuses it).
+/// A lone `%` (followed by neither `i` nor `%`) is left as-is: the expander
+/// does not touch what it does not understand.
+fn expand_instance(desc: &mut ServiceDesc) -> Result<(), ParseError> {
+    let Some(at) = desc.name.rfind('@') else {
+        return Ok(());
+    };
+    // `@` is one ASCII byte, so `at + 1` is always a `char` boundary, and
+    // everything after it is the candidate instance.
+    let instance = desc.name[at + 1..].to_owned();
+    if instance.is_empty() || instance.contains('@') {
+        return Err(ParseError::new(
+            ParseErrorKind::BadName,
+            "E018",
+            Span::point(1, 1),
+            format!(
+                "service name `{}` has an unusable instance: write `name@instance` with exactly one `@`",
+                desc.name
+            ),
+            String::from(
+                "instances come from the file name (`getty@tty1.conf`); rename the file",
+            ),
+        ));
+    }
+    desc.command = substitute_instance(&desc.command, &instance);
+    if let Some(tty) = desc.tty.as_mut() {
+        *tty = substitute_instance(tty, &instance);
+    }
+    if let Some(pid_file) = desc.pid_file.as_mut() {
+        *pid_file = substitute_instance(pid_file, &instance);
+    }
+    Ok(())
+}
+
+/// One pass over `text`: `%i` becomes `instance`, `%%` becomes `%`,
+/// anything else (including a lone `%`) is copied verbatim.
+///
+/// Index-driven rather than iterator-driven: the expander consumes the
+/// character *after* `%` itself, which a `for` loop cannot express.
+/// Boundaries are safe by construction — `%`, `i` and the second `%` are
+/// all one ASCII byte, so every slice below starts and ends on one.
+fn substitute_instance(text: &str, instance: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        match rest[i + 1..].chars().next() {
+            Some('i') => {
+                out.push_str(instance);
+                rest = &rest[i + 2..];
+            }
+            Some('%') => {
+                out.push('%');
+                rest = &rest[i + 2..];
+            }
+            // A lone `%` (trailing, or before anything else): copied, and
+            // the rest — starting right after the `%`, which is a boundary —
+            // is rescanned, so `%é` keeps both characters.
+            _ => {
+                out.push('%');
+                rest = &rest[i + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Parse one service description, discarding the warnings.
@@ -1651,7 +1764,7 @@ rlimit-nofile = 8192
         }
     }
 
-    /// Wildcards stay legal: DESIGN.md §5.1 uses `depends = *.target` for
+    /// Wildcards stay legal: DESIGN.md §5.2 uses `depends = *.target` for
     /// `all.target`, and `*` is not a path character.
     #[test]
     fn a_wildcard_dependency_is_not_mistaken_for_a_traversal() {
@@ -2039,6 +2152,7 @@ rlimit-nofile = 8192
             Directive::Cgroup => "web",
             Directive::RlimitNofile | Directive::RlimitNproc | Directive::RlimitAs => "1",
             Directive::PidFile => "/run/x.pid",
+            Directive::Tty => "/dev/tty1",
             Directive::WatchdogSec => "30",
             Directive::Listen => "tcp:8080",
             Directive::DropCapabilities => "sys_admin",
@@ -3129,6 +3243,77 @@ mod lifecycle_directive_tests {
             let text = format!("type = {kind}\ncommand = /bin/x\npid-file = /run/x.pid\n");
             let e = parse_service("svc", &text).expect_err("pid-file must be forking-only");
             assert!(e.message.contains("pid-file"), "wrong error: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn tty_lands_on_the_description() {
+        let d = parsed("type = console\ncommand = /sbin/agetty\ntty = /dev/tty1\n");
+        assert_eq!(d.tty.as_deref(), Some("/dev/tty1"));
+    }
+
+    #[test]
+    fn tty_elsewhere_is_refused() {
+        for kind in ["process", "script", "oneshot", "forking", "target"] {
+            let text = format!("type = {kind}\ncommand = /bin/x\ntty = /dev/tty1\n");
+            let e = parse_service("svc", &text).expect_err("tty must be console-only");
+            assert!(e.message.contains("tty"), "wrong error: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn tty_relative_is_refused() {
+        let e = parse_service("svc", "type = console\ncommand = /bin/x\ntty = tty1\n")
+            .expect_err("relative tty must not parse");
+        assert!(e.message.contains("absolute"), "wrong error: {}", e.message);
+    }
+
+    #[test]
+    fn console_without_tty_still_parses() {
+        // The parser cannot know a drop-in will not add the tty; the merged
+        // cross-layer refusal lives at load, and the supervisor reports a
+        // tty-less console instead of killing the boot over it.
+        let d = parsed("type = console\ncommand = /bin/sh\n");
+        assert_eq!(d.kind, ServiceKind::Console);
+        assert_eq!(d.tty, None);
+    }
+
+    #[test]
+    fn instance_expands_in_command_tty_and_pid_file() {
+        let text = "type = console\ncommand = /sbin/agetty %i\ntty = /dev/%i\n";
+        let d = parse_service("getty@tty1", text).expect("instance must expand");
+        assert_eq!(d.command, "/sbin/agetty tty1");
+        assert_eq!(d.tty.as_deref(), Some("/dev/tty1"));
+        let text = "type = forking\ncommand = /bin/d\npid-file = /run/%i.pid\n";
+        let d = parse_service("daemon@web", text).expect("instance must expand");
+        assert_eq!(d.pid_file.as_deref(), Some("/run/web.pid"));
+    }
+
+    #[test]
+    fn percent_without_instance_stays_literal() {
+        // No `@` in the name, no expansion at all: `printf '%i\n'` and `%%`
+        // survive untouched, because the expander does not touch what no
+        // instance explains.
+        let d = parsed("command = /usr/bin/printf '%i%%\\n'\n");
+        assert_eq!(d.command, "/usr/bin/printf '%i%%\\n'");
+    }
+
+    #[test]
+    fn percent_escape_collapses_when_expanding() {
+        let d = parse_service("svc@x", "command = /bin/echo 100%% of %i\n")
+            .expect("escape must collapse");
+        assert_eq!(d.command, "/bin/echo 100% of x");
+        // A lone `%` is copied verbatim: only `%i` and `%%` mean anything.
+        let d = parse_service("svc@x", "command = /bin/echo 100% ready\n")
+            .expect("lone percent must survive");
+        assert_eq!(d.command, "/bin/echo 100% ready");
+    }
+
+    #[test]
+    fn broken_instance_names_are_refused() {
+        for name in ["svc@", "a@b@c"] {
+            let e = parse_service(name, "command = /bin/x\n").expect_err("bad instance");
+            assert_eq!(e.code, "E018", "wrong code: {}", e.message);
         }
     }
 
