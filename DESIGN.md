@@ -299,8 +299,9 @@ env        = PATH=/usr/bin:/bin SSH_LOG_LEVEL=INFO
 | `log` | `none` \| `file` \| `syslog` | `file` | destino `/var/log/zinit/<svc>.log` |
 | `rlimit-nofile` \| `rlimit-nproc` \| `rlimit-as` | número | — | sólo donde exista |
 | `cgroup` | ruta bajo `zinit.slice` | — | Linux; elsewhere ⇒ aviso |
-| `type` += | `oneshot` \| `forking` | — | `oneshot` = éxito terminal; `forking` = adopta vía `pid-file` |
+| `type` += | `oneshot` \| `forking` \| `console` | — | `oneshot` = éxito terminal; `forking` = adopta vía `pid-file`; `console` = toma `tty` vía `TIOCSCTTY` |
 | `pid-file` | ruta | — | sólo `forking`; el pid real tras el doble fork |
+| `tty` | ruta absoluta | — | sólo `console`; sin ella el servicio corre como proceso (aviso, no fatal) |
 | `watchdog-sec` | segundos ≥1 | — | sólo con `ready = notify`; `WATCHDOG=1` por el fd 3 |
 | `listen` | `tcp:<puerto>[:<nombre>]` \| `unix:<ruta>`, repetible | — | pre-bind en 127.0.0.1; `$LISTEN_FDS/$LISTEN_PID/$LISTEN_FDNAMES` desde fd 3 |
 | `drop-capabilities` | nombres (`sys_admin`…) | — | irreversible (`PR_CAPBSET_DROP`); Linux, si no ⇒ el spawn se rechaza |
@@ -310,7 +311,17 @@ env        = PATH=/usr/bin:/bin SSH_LOG_LEVEL=INFO
 **Dos operadores, tres separadores, cero anidamiento.** `=`, `:` y `#`. Si el parser necesita
 más de 300 líneas, se ha designing mal.
 
-### 5.1 Los targets
+### 5.1 Instancias (`%i`)
+
+Un fichero `getty@tty1.conf` instancia la plantilla: el nombre tras el último `@`
+es la instancia, y `%i` en `command`, `tty` y `pid-file` se expande a ella
+(`%%` colapsa a `%`, un `%` solo se copia tal cual). Sin `@` no hay expansión:
+`printf '%i\n'` en un servicio ordinario queda intacto. Doble `@` o instancia
+vacía se rechazan; cada fichero (base y drop-ins) se expande con su propio
+nombre, así que todas las capas ven la misma instancia. Las dependencias casan
+por nombre exacto: nada se instancia solo.
+
+### 5.2 Los targets
 
 ```
 /etc/zinit/services.d/network.target      # target vacío, no arranca nada

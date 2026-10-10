@@ -383,6 +383,11 @@ pub struct ServiceDesc {
     /// the directive on any other kind rather than storing a path nobody
     /// will read.
     pub pid_file: Option<String>,
+    /// Controlling terminal path, for `type = console` only. The parser
+    /// refuses the directive on any other kind (same shape as `pid_file`),
+    /// and refuses relative paths: terminal resolution against an invisible
+    /// working directory would open somewhere else.
+    pub tty: Option<String>,
     /// Watchdog budget in whole seconds. The parser refuses it without
     /// `ready = notify` (pings arrive on the notify fd) and refuses zero
     /// (an instant kill timer is never what was meant).
@@ -449,6 +454,7 @@ impl Default for ServiceDesc {
             needs_env_expansion: false,
             explicit: Vec::new(),
             pid_file: None,
+            tty: None,
             watchdog_sec: None,
             listens: Vec::new(),
             drop_caps: Vec::new(),
@@ -567,6 +573,9 @@ impl ServiceDesc {
         }
         if over.is_explicit(Directive::PidFile) {
             self.pid_file = over.pid_file.clone();
+        }
+        if over.is_explicit(Directive::Tty) {
+            self.tty = over.tty.clone();
         }
         if over.is_explicit(Directive::WatchdogSec) {
             self.watchdog_sec = over.watchdog_sec;
@@ -1061,6 +1070,18 @@ mod overlay_tests {
         assert_eq!(base.command, "/bin/b");
         assert_eq!(base.stop_timeout_ms, 20_000);
         assert_eq!(base.ready.kind, crate::value::ReadySpecKind::Tcp);
+    }
+
+    #[test]
+    fn tty_overrides_only_when_explicit() {
+        let mut base = parsed("svc", "type = console\ncommand = /bin/a\ntty = /dev/tty1\n");
+        let over = parsed("svc", "type = console\ncommand = /bin/a\n");
+        base.overlay_onto(over);
+        assert_eq!(base.tty.as_deref(), Some("/dev/tty1"));
+        let mut base2 = parsed("svc", "type = console\ncommand = /bin/a\n");
+        let over2 = parsed("svc", "type = console\ncommand = /bin/a\ntty = /dev/tty2\n");
+        base2.overlay_onto(over2);
+        assert_eq!(base2.tty.as_deref(), Some("/dev/tty2"));
     }
 
     #[test]
