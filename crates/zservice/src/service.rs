@@ -94,6 +94,11 @@ pub struct ManagedService {
     /// or the service is retired for good
     /// ([`ManagedService::close_listeners`]) — never on a plain death.
     listen_fds: Vec<(RawFd, String)>,
+    /// A failed demand-start bind was already announced. `ensure_listeners`
+    /// is re-attempted silently on every pass while down (a squatted port
+    /// may free up), but the operator is told once — the same once-gate as
+    /// every other standing condition here. Cleared on success.
+    bind_announced: bool,
     /// Monotonic ms at which `SIGTERM` was (first) reported due.
     term_sent_at: Option<u64>,
     /// Whether `SIGKILL` was already reported due for this stop.
@@ -119,6 +124,7 @@ impl ManagedService {
             adopted: false,
             fork_gone: None,
             listen_fds: Vec::new(),
+            bind_announced: false,
             term_sent_at: None,
             kill_sent: false,
             pending_warning: None,
@@ -312,6 +318,34 @@ impl ManagedService {
             self.listen_fds.push((fd, w.name.clone()));
         }
         Ok(())
+    }
+
+    /// True when a held listener has a pending connection.
+    ///
+    /// Pure observation for the demand-start trigger: nothing is accepted
+    /// (the service accepts after it spawns), so this is side-effect free.
+    /// The supervisor calls it only for down services with `on-demand =
+    /// yes`; anywhere else the answer is meaningless, not wrong.
+    pub fn poll_demand(&self) -> io::Result<bool> {
+        let fds: Vec<RawFd> = self.listen_fds.iter().map(|(fd, _)| *fd).collect();
+        zrt::sys::poll_readable(&fds)
+    }
+
+    /// Record a demand-start bind outcome; answer whether to announce it.
+    ///
+    /// First failure answers true (announce once); later failures false
+    /// (already said); any success clears the record and answers false. A
+    /// squatted port is announced once and retried silently until it frees.
+    pub fn note_bind_result(&mut self, ok: bool) -> bool {
+        if ok {
+            self.bind_announced = false;
+            false
+        } else if self.bind_announced {
+            false
+        } else {
+            self.bind_announced = true;
+            true
+        }
     }
 
     /// Close and drop every held listen socket. Only for retirement: a dead
@@ -1263,5 +1297,52 @@ mod tests {
         svc.close_listeners();
         assert!(svc.listen_snapshot().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Demand observation consumes nothing: a pending connection is visible
+    /// without accepting, so the trigger can fire before the service exists.
+    #[test]
+    fn demand_trigger_sees_a_waiting_client() {
+        let dir = crate::testutil::scratch("demand");
+        let sock = dir.join("d.sock");
+        let mut sp = ServicePlan::new(String::from("d"));
+        sp.ready = Ready::None;
+        sp.log = LogSink::None;
+        sp.listens = vec![ListenAddr {
+            spec: ListenSpec::UnixPath(sock.to_string_lossy().into_owned()),
+            name: String::from("main"),
+        }];
+        let plan = plan_with(sp);
+        let mut svc = ManagedService::new(0);
+        svc.ensure_listeners(&plan).expect("bind");
+        assert!(!svc.poll_demand().expect("poll"), "no client yet");
+        let client = zrt::sys::unix_connect(&sock).expect("connect");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if svc.poll_demand().expect("poll") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "listener never turned readable"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Still there on repeek: peeking accepts nothing.
+        assert!(svc.poll_demand().expect("peek again"));
+        let _ = zrt::sys::close(client);
+        svc.close_listeners();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A squatted port is announced once and retried silently: the truth
+    /// table of `note_bind_result`, with no supervisor attached.
+    #[test]
+    fn bind_note_announces_first_failure_only() {
+        let mut svc = ManagedService::new(0);
+        assert!(svc.note_bind_result(false), "first failure speaks");
+        assert!(!svc.note_bind_result(false), "later failures stay quiet");
+        assert!(!svc.note_bind_result(true), "success speaks never");
+        assert!(svc.note_bind_result(false), "a fresh failure speaks again");
     }
 }

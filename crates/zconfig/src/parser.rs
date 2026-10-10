@@ -170,6 +170,9 @@ pub enum Directive {
     Critical,
     /// `yes` | `no`: whether the service starts at boot.
     Enabled,
+    /// `yes` | `no`: whether the first connection to a held socket starts
+    /// a stopped service.
+    OnDemand,
     /// Slice name under `zinit.slice`.
     Cgroup,
     /// Soft limit on open file descriptors.
@@ -213,6 +216,7 @@ impl Directive {
             Directive::Log => "log",
             Directive::Critical => "critical",
             Directive::Enabled => "enabled",
+            Directive::OnDemand => "on-demand",
             Directive::Cgroup => "cgroup",
             Directive::RlimitNofile => "rlimit-nofile",
             Directive::RlimitNproc => "rlimit-nproc",
@@ -235,7 +239,7 @@ impl Directive {
     /// hidden property of the service *name* would be a policy nobody could
     /// read off the file. The alternative, refusing to model it at all, means
     /// the runtime has to hardcode the same list somewhere less visible.
-    pub const ALL: [Directive; 26] = [
+    pub const ALL: [Directive; 27] = [
         Directive::Command,
         Directive::Type,
         Directive::Depends,
@@ -251,6 +255,7 @@ impl Directive {
         Directive::Log,
         Directive::Critical,
         Directive::Enabled,
+        Directive::OnDemand,
         Directive::Cgroup,
         Directive::RlimitNofile,
         Directive::RlimitNproc,
@@ -883,6 +888,18 @@ pub fn parse_service_with_diagnostics(name: &str, text: &str) -> Result<ParsedSe
                     }
                 };
             }
+            Directive::OnDemand => {
+                desc.on_demand = match parse_bool(value) {
+                    Some(b) => b,
+                    None => {
+                        return Err(bad_value(
+                            directive,
+                            value_span,
+                            "write `yes` or `no`; demand-starting is opt-in, so yes is an explicit choice",
+                        ));
+                    }
+                };
+            }
             Directive::Cgroup => desc.cgroup = Some(value.to_owned()),
             Directive::RlimitNofile | Directive::RlimitNproc | Directive::RlimitAs => {
                 // The same scanner a `tcp:` port and a `u64` budget capacity
@@ -956,7 +973,12 @@ pub fn parse_service_with_diagnostics(name: &str, text: &str) -> Result<ParsedSe
     // triggered them: `type = target` after `cgroup = web` would otherwise be
     // accepted in one order and rejected in the other.
     if desc.is_virtual() {
-        for directive in [Directive::Depends, Directive::Cgroup, Directive::Tty] {
+        for directive in [
+            Directive::Depends,
+            Directive::Cgroup,
+            Directive::Tty,
+            Directive::OnDemand,
+        ] {
             if let Some(span) = span_of(&seen, directive) {
                 return Err(virtual_directive_error(directive, desc.kind, span));
             }
@@ -2165,6 +2187,7 @@ rlimit-nofile = 8192
             Directive::Log => "syslog",
             Directive::Critical => "no",
             Directive::Enabled => "no",
+            Directive::OnDemand => "yes",
             Directive::Cgroup => "web",
             Directive::RlimitNofile | Directive::RlimitNproc | Directive::RlimitAs => "1",
             Directive::PidFile => "/run/x.pid",
@@ -3343,6 +3366,23 @@ mod lifecycle_directive_tests {
         let e = parse_service("svc", "command = /bin/x\nenabled = maybe\n")
             .expect_err("enabled must be yes or no");
         assert!(e.help.contains("`yes` or `no`"), "wrong help: {}", e.help);
+    }
+
+    #[test]
+    fn on_demand_is_opt_in_and_refuses_maybe() {
+        assert!(!parsed("command = /bin/x\n").on_demand);
+        let d = parsed("command = /bin/x\nlisten = tcp:8080\non-demand = yes\n");
+        assert!(d.on_demand);
+        let e = parse_service("svc", "command = /bin/x\non-demand = maybe\n")
+            .expect_err("on-demand must be yes or no");
+        assert!(e.help.contains("`yes` or `no`"), "wrong help: {}", e.help);
+    }
+
+    #[test]
+    fn on_demand_on_a_target_is_refused() {
+        let e = parse_service("svc", "type = target\non-demand = yes\n")
+            .expect_err("a target never spawns to be woken");
+        assert!(e.message.contains("on-demand"), "wrong error: {}", e.message);
     }
 
     #[test]

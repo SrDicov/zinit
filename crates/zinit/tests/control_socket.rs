@@ -358,3 +358,56 @@ fn reload_all_preserves_live_pids() {
     );
     assert!(pid_alive(before), "reload took the survivor with it");
 }
+
+#[test]
+fn demand_start_wakes_on_connection() {
+    use std::net::TcpStream;
+
+    // A high port the neighbours are unlikely to want; probed free before
+    // the supervisor ever hears about it, so a squatted port fails loudly
+    // here instead of wedging the supervisor later.
+    let port = [48121u16, 48122, 48123]
+        .into_iter()
+        .find(|p| std::net::TcpListener::bind(format!("127.0.0.1:{p}")).is_ok())
+        .expect("a free probe port");
+    let scratch = Scratch::new("demand");
+    scratch.conf(
+        "lazy.conf",
+        &format!(
+            "type = script\ncommand = exec /bin/sleep 300\nready = none\n\
+             log = none\nrestart = always\nlisten = tcp:{port}\n\
+             on-demand = yes\nenabled = no\n"
+        ),
+    );
+    let _sup = Sup::start(&scratch);
+
+    // Down means down: nothing starts without traffic.
+    sleep_ms(500);
+    let quiet = scratch.state_of("lazy");
+    assert!(
+        quiet.is_none_or(|s| !s.contains("state=Running")),
+        "on-demand service started with no connection: {quiet:?}"
+    );
+
+    // Knock until someone listens (the supervisor binds lazily), then hold
+    // the door open: the backlog keeps the connection readable without
+    // anyone accepting, which is exactly what the trigger watches for.
+    let start = Instant::now();
+    let _held = loop {
+        match TcpStream::connect(format!("127.0.0.1:{port}")) {
+            Ok(s) => break s,
+            Err(_) => {
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "nobody bound tcp:{port}"
+                );
+                sleep_ms(POLL_MS);
+            }
+        }
+    };
+    let running = || scratch.state_of("lazy").is_some_and(|s| s.contains("state=Running"));
+    assert!(
+        wait_until(START_DEADLINE_MS, running),
+        "traffic never woke the service"
+    );
+}

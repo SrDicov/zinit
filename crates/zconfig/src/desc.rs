@@ -356,6 +356,10 @@ pub struct ServiceDesc {
     /// Whether the service starts at boot. `false` leaves `Desired` down
     /// until an operator says otherwise; omitted means yes.
     pub enabled: bool,
+    /// Whether the first connection to a held socket starts a stopped
+    /// service. Opt-in (`no` unless said); needs `listen`, refused without
+    /// it at load.
+    pub on_demand: bool,
     /// Slice name under `zinit.slice`, or `None` for "no limit imposed".
     pub cgroup: Option<String>,
     /// Resource limits as `("nofile" | "nproc" | "as", value)`.
@@ -451,6 +455,7 @@ impl Default for ServiceDesc {
             log: LogSpec::default(),
             is_critical: true,
             enabled: true,
+            on_demand: false,
             cgroup: None,
             rlimits: Vec::new(),
             source: String::new(),
@@ -574,6 +579,9 @@ impl ServiceDesc {
         }
         if over.is_explicit(Directive::Enabled) {
             self.enabled = over.enabled;
+        }
+        if over.is_explicit(Directive::OnDemand) {
+            self.on_demand = over.on_demand;
         }
         if over.is_explicit(Directive::Cgroup) {
             self.cgroup = over.cgroup.clone();
@@ -1080,8 +1088,20 @@ mod overlay_tests {
     }
 
     #[test]
-    fn tty_overrides_only_when_explicit() {
-        let mut base = parsed("svc", "type = console\ncommand = /bin/a\ntty = /dev/tty1\n");
+    fn on_demand_overrides_only_when_explicit() {
+        let mut base = parsed("svc", "command = /bin/a\nlisten = tcp:8080\n");
+        assert!(!base.on_demand);
+        let over = parsed("svc", "command = /bin/a\non-demand = yes\n");
+        base.overlay_onto(over);
+        assert!(base.on_demand);
+        let mut base2 = parsed("svc", "command = /bin/a\nlisten = tcp:8080\non-demand = yes\n");
+        let over2 = parsed("svc", "command = /bin/a\n");
+        base2.overlay_onto(over2);
+        assert!(base2.on_demand, "a silent overlay must not disarm demand");
+    }
+
+    #[test]
+    fn tty_overrides_only_when_explicit() {        let mut base = parsed("svc", "type = console\ncommand = /bin/a\ntty = /dev/tty1\n");
         let over = parsed("svc", "type = console\ncommand = /bin/a\n");
         base.overlay_onto(over);
         assert_eq!(base.tty.as_deref(), Some("/dev/tty1"));

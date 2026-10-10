@@ -1,6 +1,14 @@
 # Changelog
 
 ## [Unreleased]
+### demand-start por sockets (Fase D2)
+- `on-demand = yes|no` (defecto `no`): un servicio parado y no deseado con
+  sockets retenidos arranca con la primera conexión — igual que un `start`
+  de operador (`Up` + `kick`, presupuesto respetado, sin bomba de forks).
+  Sin `listen` es error de carga. Sondeo `poll(2)` sin aceptar (el servicio
+  acepta tras nacer) + tope de 100 ms en `arm` (latencia acotada sin spin).
+  Bind perezoso con un solo aviso ante puerto ocupado. Viaja a plan.
+  Test de integración contra binario real (conexión TCP → `Running`).
 ### syslog por datagrama (Fase D)
 - `log = syslog` cableado: socket `AF_UNIX` datagrama conectado a `/dev/log`
   como stdout/stderr del hijo (un `write` = un datagrama; bloqueante, como

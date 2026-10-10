@@ -70,6 +70,15 @@ const WAIT_CAP_MS: u64 = 1_000;
 /// restart bucket is a spin, and a spin is worse than a 20 Hz heartbeat.
 const MIN_RESTART_TICK_MS: u64 = 50;
 
+/// Longest a demand-start connection waits for its service.
+///
+/// A down `on-demand` service contributes no deadline of its own (nothing
+/// is due while it sleeps), so without this cap a connection arriving just
+/// after a pass would wait out the whole [`WAIT_CAP_MS`]. Polled, not
+/// reactor-driven: listeners are one set per service, not one fd, and the
+/// trigger only matters while down — a bounded heartbeat is the whole cost.
+const DEMAND_TICK_MS: u64 = 100;
+
 /// Run the supervisor: generators, layers, converge, never return.
 ///
 /// Every failure below is announced and reported as an `Err`, which is what
@@ -480,6 +489,15 @@ impl Sup {
                     deadline = deadline.min(last.saturating_add(secs.saturating_mul(1000)));
                 }
             }
+            // A down on-demand service is a connection away from work: cap
+            // the sleep so the trigger in `poll` sees traffic within
+            // `DEMAND_TICK_MS`, not within a whole idle cap.
+            if sp.on_demand
+                && core.desired == Desired::Down
+                && core.state == State::Stopped
+            {
+                deadline = deadline.min(now.saturating_add(DEMAND_TICK_MS));
+            }
         }
         deadline.saturating_sub(now)
     }
@@ -707,6 +725,52 @@ impl Sup {
             // refuses.
             if let Some(warning) = self.slots[idx].svc.take_warning() {
                 announce_degradation(&warning);
+            }
+
+            // 5b. Demand-start: a stopped, unwanted service with
+            // `on-demand = yes` and a connection waiting on a held socket.
+            // Binding happens here and not only at spawn, so the trigger
+            // exists before the first start; a squatted port is announced
+            // once and retried silently. A hit wakes the service exactly
+            // like an operator `start` (up plus `kick`, budget respected),
+            // and the reconciler below spawns it on this same pass.
+            if self.plan.services[idx].on_demand
+                && self.runtime.get(idx).desired == Desired::Down
+                && self.runtime.state_at(idx) == State::Stopped
+            {
+                match self.slots[idx].svc.ensure_listeners(&self.plan) {
+                    Ok(()) => {
+                        self.slots[idx].svc.note_bind_result(true);
+                        let demand = match self.slots[idx].svc.poll_demand() {
+                            Ok(hit) => hit,
+                            Err(e) => {
+                                let name = self.name_of(idx);
+                                announce_degradation(&format!("{name}: demand poll: {e}"));
+                                false
+                            }
+                        };
+                        if demand {
+                            // Owned before mutating: `name_of` borrows the
+                            // whole supervisor, and the wake below mutates
+                            // it. Wakes are transitions, not a hot path, so
+                            // one allocation is noise.
+                            let name = self.name_of(idx).to_string();
+                            self.runtime.set_desired(idx, Desired::Up);
+                            kick(&mut self.runtime, &self.plan, idx, now);
+                            announce_degradation(&format!(
+                                "{name} woke on demand (incoming connection)"
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        if self.slots[idx].svc.note_bind_result(false) {
+                            let name = self.name_of(idx);
+                            announce_degradation(&format!(
+                                "{name}: cannot bind listen sockets ({e})"
+                            ));
+                        }
+                    }
+                }
             }
 
             // 6. A stop nobody asked the core for.
@@ -1842,6 +1906,12 @@ fn validate_merged(descs: &[ServiceDesc]) -> io::Result<()> {
         if desc.tty.is_some() && desc.kind != zcore::ServiceKind::Console {
             return Err(fatal(format!(
                 "{}: tty needs `type = console` (same file or drop-in)",
+                desc.source
+            )));
+        }
+        if desc.on_demand && desc.listens.is_empty() {
+            return Err(fatal(format!(
+                "{}: on-demand needs `listen`; a trigger with no socket never fires",
                 desc.source
             )));
         }

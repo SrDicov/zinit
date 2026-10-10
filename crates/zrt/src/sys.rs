@@ -322,6 +322,32 @@ pub fn set_nonblocking(fd: RawFd, on: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// True when any of `fds` is readable, without consuming anything.
+///
+/// Zero-timeout `poll(2)`: the demand-start trigger peeks at held listen
+/// sockets — a pending connection reads as readable on a listener — without
+/// accepting, because the service accepts after it spawns. Empty set is
+/// always false. POSIX.1-2001, on every target in scope; the only new
+/// syscall this phase adds, and it takes no flags, no timeout, no state.
+pub fn poll_readable(fds: &[RawFd]) -> io::Result<bool> {
+    if fds.is_empty() {
+        return Ok(false);
+    }
+    let mut pfds: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
+        .collect();
+    // SAFETY: `pfds` is a live array of exactly `len` `pollfd`s; a zero
+    // timeout means the call never sleeps and the kernel writes only
+    // `revents`. `nfds_t` holds any slice this crate can build (listen sets
+    // are capped at 32 long before here).
+    let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(n > 0)
+}
+
 /// `socketpair(2)`, both ends `O_CLOEXEC` and `SOCK_NONBLOCK`.
 ///
 /// Used by tests and by the readiness handshake: a socket pair gives a
@@ -1833,5 +1859,34 @@ mod tests {
         let _ = close(high);
         let _ = close(w);
         let _ = close(r);
+    }
+
+    #[test]
+    fn poll_readable_sees_a_waiting_connection() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("zinit-poll-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = unix_service_listen(&path).expect("bind");
+        assert!(!poll_readable(&[listener]).expect("poll"), "no client yet");
+        let client = unix_connect(&path).expect("connect");
+        // The connect completes asynchronously; the listener may need a
+        // moment to report it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if poll_readable(&[listener]).expect("poll") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "listener never turned readable"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Peeking consumes nothing: a second peek still sees it.
+        assert!(poll_readable(&[listener]).expect("peek again"));
+        assert!(!poll_readable(&[]).expect("empty"));
+        let _ = close(client);
+        let _ = close(listener);
+        let _ = std::fs::remove_file(&path);
     }
 }
