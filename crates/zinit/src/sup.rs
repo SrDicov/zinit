@@ -300,6 +300,19 @@ impl Sup {
         // failure degrades to "no control socket": the loop below checks the
         // `Option` every pass, and everything else works without it.
         let socket_path = ctl_socket_path();
+        // The parent is created, not assumed: PID 1 mounts a fresh tmpfs on
+        // `/run` at boot, so `/run/zinit` never survives a reboot — without
+        // this the first boot of every real machine would have no control
+        // socket, found only by booting real hardware (a test's scratch dir
+        // always exists, so no test could catch it).
+        if let Some(parent) = socket_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                announce_degradation(&format!(
+                    "cannot create {} ({e}); running without a control socket",
+                    parent.display()
+                ));
+            }
+        }
         let ctl = match ctl::CtlServer::bind(&socket_path) {
             Ok(server) => match reactor.add(server.listener_fd(), Interest::Read) {
                 Ok(()) => Some(server),

@@ -449,8 +449,13 @@ impl Bucket {
         if budget.window_ms == 0 || elapsed == 0 {
             return;
         }
-        let per_ms = budget.capacity as u128 * 1_000;
-        let gained = (per_ms * elapsed as u128) / budget.window_ms as u128;
+        // Tokens earned, in whole tokens: a 3-per-60s budget earns one token
+        // every 20 s, and nothing at all in the first 19 999 ms. No scaling
+        // factor: `capacity * elapsed / window` is already in tokens, and an
+        // extra `* 1_000` here once refilled 1000x too fast — a crash loop
+        // the budget was built to stop sailed straight through it, caught
+        // only by a real machine (a fixed-clock unit test never refills).
+        let gained = (budget.capacity as u128 * elapsed as u128) / budget.window_ms as u128;
         if gained > 0 {
             self.tokens = self
                 .tokens
@@ -622,6 +627,35 @@ mod tests {
         // Half the window later, one token is back.
         assert!(k.allows(&b, 500));
         assert!(k.take(&b, 500));
+    }
+
+    #[test]
+    fn bucket_refill_rate_is_in_tokens_not_millitokens() {
+        // A realistic `3 restarts per 60s`: one second later nothing has been
+        // earned (3*1000/60000 rounds to zero). A `* 1_000` scaling slip here
+        // once refilled 50 tokens a second — the crash loop the budget exists
+        // to stop ran straight through it, and only a real machine noticed:
+        // every fixed-clock test refills nothing and passed either way.
+        let b = Budget {
+            capacity: 3,
+            window_ms: 60_000,
+            delay_ms: 0,
+        };
+        let mut k = Bucket::new();
+        for _ in 0..3 {
+            assert!(k.take(&b, 0));
+        }
+        assert!(!k.allows(&b, 0), "drained");
+        assert!(!k.allows(&b, 1_000), "one second earns no token");
+        assert!(!k.allows(&b, 19_999), "nineteen seconds earn no token");
+        assert!(k.allows(&b, 20_000), "twenty seconds earn one token");
+        assert!(k.take(&b, 20_000));
+        assert!(!k.allows(&b, 20_000), "one token means one restart");
+        // A full window with no attempts refills the whole bucket.
+        assert!(k.take(&b, 80_000));
+        assert!(k.take(&b, 80_000));
+        assert!(k.take(&b, 80_000));
+        assert!(!k.allows(&b, 80_000));
     }
 
     #[test]
