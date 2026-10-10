@@ -25,8 +25,6 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use zrt::report::announce_degradation;
-
 use crate::sup::{load_all, resolve_sources};
 
 /// Validate one configuration and report the verdict.
@@ -34,16 +32,15 @@ use crate::sup::{load_all, resolve_sources};
 /// `dir` follows the `--sup` convention: an explicit directory is the whole
 /// configuration, otherwise `ZINIT_CONFIG_DIRS`, otherwise the compiled
 /// layer defaults. Warnings encountered while loading are announced as they
-/// are found (the loader's own doing, shared with every boot); a refusal
-/// prints its file-qualified reason and answers `1`.
+/// are found (the loader's own doing, shared with every boot). A refusal
+/// needs no second announcement — every load failure already passed through
+/// `fatal`, which announced it with its file and line — so the error arm is
+/// quiet apart from the exit code.
 pub fn run(dir: Option<&Path>) -> ExitCode {
     let (layers, gen_dir) = resolve_sources(dir);
     match load_all(&layers, &gen_dir) {
         Ok(_) => ExitCode::SUCCESS,
-        Err(e) => {
-            announce_degradation(&format!("check: {e}"));
-            ExitCode::from(1)
-        }
+        Err(_) => ExitCode::from(1),
     }
 }
 
