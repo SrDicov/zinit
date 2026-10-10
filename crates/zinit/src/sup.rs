@@ -115,8 +115,9 @@ struct Sup {
     /// service whose bucket is empty, and an exhausted service is reconciled on
     /// every pass for the rest of the boot. Announcing each one would be a
     /// message a second forever, which is the stderr flood `init.rs` already
-    /// gates against. Cleared when the service starts again, so a service that
-    /// recovers and then exhausts itself a second time is heard about twice.
+    /// gates against. Announced once per supervisor lifetime (a reload starts
+    /// a fresh record with its fresh plan); a delay-gated retry never emits
+    /// this action at all, so routine spacing stays silent by construction.
     budget_announced: Vec<Idx>,
     /// The services whose core invariants were last found violated, so a
     /// standing violation is announced once instead of once per pass.
@@ -300,6 +301,19 @@ impl Sup {
         // failure degrades to "no control socket": the loop below checks the
         // `Option` every pass, and everything else works without it.
         let socket_path = ctl_socket_path();
+        // The parent is created, not assumed: PID 1 mounts a fresh tmpfs on
+        // `/run` at boot, so `/run/zinit` never survives a reboot — without
+        // this the first boot of every real machine would have no control
+        // socket, found only by booting real hardware (a test's scratch dir
+        // always exists, so no test could catch it).
+        if let Some(parent) = socket_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                announce_degradation(&format!(
+                    "cannot create {} ({e}); running without a control socket",
+                    parent.display()
+                ));
+            }
+        }
         let ctl = match ctl::CtlServer::bind(&socket_path) {
             Ok(server) => match reactor.add(server.listener_fd(), Interest::Read) {
                 Ok(()) => Some(server),
@@ -1152,19 +1166,20 @@ impl Sup {
                     level,
                     message,
                 } => self.log_line(*idx, *level, message),
-                // The one thing an action cannot do quietly: a service that
-                // is down and staying down. Announced rather than logged, because
-                // the log file it would go to is exactly what an operator needs
-                // to find afterwards — and announced *once*, because the core
-                // repeats this action on every pass for as long as the bucket is
-                // empty.
+                // The one thing an action cannot do quietly: a service whose
+                // restart budget just ran dry. Announced rather than logged,
+                // because the log file it would go to is exactly what an
+                // operator needs to find afterwards — and announced once per
+                // supervisor lifetime, because the core repeats this action on
+                // every pass for as long as the bucket is empty. A later
+                // reload clears the record (fresh plan, fresh complaints).
                 Action::BudgetExhausted(idx) => {
                     if !self.budget_announced.contains(idx) {
                         self.budget_announced.push(*idx);
                         let name = self.name_of(*idx);
                         announce_degradation(&format!(
-                            "service `{name}` is down and staying down: its restart \
-                             budget is empty and nothing will retry it"
+                            "service `{name}` is backing off: restart budget \
+                             exhausted (use `zctl kick` to retry now)"
                         ));
                     }
                 }
@@ -1262,9 +1277,10 @@ impl Sup {
             self.feed(&Event::SpawnFailed { idx, errno }, now);
             return;
         }
-        // A service that starts again has earned a fresh complaint if it runs
-        // its budget dry a second time.
-        self.budget_announced.retain(|&announced| announced != idx);
+        // The announcement record stands: "backing off" was already said for
+        // this service, and repeating it on every restart would turn the
+        // guard in `execute` into decoration. A reload (which clears the
+        // record) or an operator `kick` is what earns a fresh complaint.
         if let Some(pid) = self.slots[idx].svc.pid()
             && let Err(e) = self.children.track(pid)
         {
