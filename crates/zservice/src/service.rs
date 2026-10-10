@@ -327,9 +327,10 @@ impl ManagedService {
     ///
     /// `Some(ExecOk)` on `EOF` (the image was replaced — the first point at
     /// which the process counts as real), `Some(SpawnFailed{errno})` on four
-    /// bytes (whatever failed in the child, with its errno), `None` while
-    /// inconclusive. The pipe is closed on the first conclusive read; later
-    /// calls answer `None` without touching the kernel.
+    /// bytes (whatever failed in the child, with its errno; a second
+    /// diagnostic word naming the step may follow and is discarded here),
+    /// `None` while inconclusive. The pipe is closed on the first conclusive
+    /// read; later calls answer `None` without touching the kernel.
     ///
     /// Known race, documented: a child killed between `fork` and `exec` also
     /// reads as `EOF`. The supervisor correlates with the reaper — a

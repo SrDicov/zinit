@@ -74,7 +74,9 @@
 //!
 //! Exec success is reported out-of-band through the exec-error pipe: `EOF`
 //! means the image was replaced ([`zcore::Event::ExecOk`]), four bytes mean
-//! the errno of whatever failed ([`zcore::Event::SpawnFailed`]). See
+//! the errno of whatever failed ([`zcore::Event::SpawnFailed`]), followed by
+//! a second word naming the failing step (diagnostic only; production
+//! readers consume the errno and close). See
 //! [`ManagedService`](crate::service::ManagedService), which owns that pipe.
 
 use std::ffi::CString;
@@ -713,32 +715,32 @@ fn child_main(p: ChildPlan) -> ! {
     // Zero: let `setpgid` pick, which means "my own pid", the group the
     // supervisor will later signal with `kill(-pid)`.
     if !child_step_sigmask(p) {
-        child_fail(p.exec_w);
+        child_fail(p.exec_w, CHILD_STEP_SIGMASK);
     }
     if !child_step_session(0) {
-        child_fail(p.exec_w);
+        child_fail(p.exec_w, CHILD_STEP_SESSION);
     }
     if !child_step_fds(p) {
-        child_fail(p.exec_w);
+        child_fail(p.exec_w, CHILD_STEP_FDS);
     }
     if !child_step_chdir() {
-        child_fail(p.exec_w);
+        child_fail(p.exec_w, CHILD_STEP_CHDIR);
     }
     if !child_step_rlimits(p) {
-        child_fail(p.exec_w);
+        child_fail(p.exec_w, CHILD_STEP_RLIMITS);
     }
     if !child_step_cgroup(p) {
-        child_fail(p.exec_w);
+        child_fail(p.exec_w, CHILD_STEP_CGROUP);
     }
     if !child_step_ids(p) {
-        child_fail(p.exec_w);
+        child_fail(p.exec_w, CHILD_STEP_IDS);
     }
     if !child_step_capdrop(p) {
-        child_fail(p.exec_w);
+        child_fail(p.exec_w, CHILD_STEP_CAPDROP);
     }
     child_step_no_new_privs();
     if !child_step_ctty(p) {
-        child_fail(p.exec_w);
+        child_fail(p.exec_w, CHILD_STEP_CTTY);
     }
     // Last: our own pid into the `LISTEN_PID=` digit field, so daemons that
     // check it (`sd_listen_fds`) accept the descriptors below. Past this
@@ -749,7 +751,7 @@ fn child_main(p: ChildPlan) -> ! {
     // failing `execve`'s own error report — runs *under* it, which is why
     // the pid write above and the tty handover earlier both precede it.
     if !child_step_seccomp(p) {
-        child_fail(p.exec_w);
+        child_fail(p.exec_w, CHILD_STEP_SECCOMP);
     }
     // SAFETY: `path` is a NUL-terminated string prepared before the fork;
     // `argv`/`envp` are NUL-terminated pointer arrays to NUL-terminated
@@ -759,7 +761,7 @@ fn child_main(p: ChildPlan) -> ! {
         libc::execve(p.path, p.argv.cast_mut(), p.envp.cast_mut());
     }
     // Only reached on failure. The errno is from `execve` itself.
-    child_fail(p.exec_w);
+    child_fail(p.exec_w, CHILD_STEP_EXECVE);
 }
 
 /// Report the current errno to the parent, then `_exit(127)`.
@@ -767,17 +769,24 @@ fn child_main(p: ChildPlan) -> ! {
 /// 127 is the universal "cannot execute" status (the shell convention): the
 /// supervisor reaps an ordinary `Exited(127)`, and the reconciler spends
 /// budget on it like any other failed start. Never silent, never special.
-fn child_fail(exec_w: RawFd) -> ! {
+///
+/// Eight bytes go down the pipe: the errno first, then the failing step
+/// (see `CHILD_STEP_*`). Production readers (`poll_exec`) consume the first
+/// four and close — the step word is diagnostic only, discarded with the
+/// close — while tests drain all eight to name the culprit.
+fn child_fail(exec_w: RawFd, step: u32) -> ! {
     let errno = io::Error::last_os_error()
         .raw_os_error()
         .unwrap_or(libc::EINVAL) as u32;
     if exec_w >= 0 {
-        let bytes = errno.to_le_bytes();
-        // SAFETY: one `write(2)` of four bytes to a pipe; partial writes are
-        // irrelevant — the parent treats "any bytes" as failure and reads the
-        // first four. Best effort: the return is ignored.
+        let mut msg = [0u8; 8];
+        msg[..4].copy_from_slice(&errno.to_le_bytes());
+        msg[4..].copy_from_slice(&step.to_le_bytes());
+        // SAFETY: one `write(2)` of eight bytes to a pipe — far below
+        // `PIPE_BUF`, so atomic; partial writes are irrelevant, the parent
+        // treats "any bytes" as failure. Best effort: the return is ignored.
         unsafe {
-            libc::write(exec_w, bytes.as_ptr().cast::<libc::c_void>(), bytes.len());
+            libc::write(exec_w, msg.as_ptr().cast::<libc::c_void>(), msg.len());
             libc::close(exec_w);
         }
     }
@@ -785,6 +794,22 @@ fn child_fail(exec_w: RawFd) -> ! {
     // flushes nothing — the double-flush-safe exit for a forked child.
     unsafe { libc::_exit(127) };
 }
+
+/// Failing-step tags for the exec-error pipe's second word.
+///
+/// Numbers, not names: the child may not allocate or format. Order follows
+/// `child_main`.
+const CHILD_STEP_SIGMASK: u32 = 1;
+const CHILD_STEP_SESSION: u32 = 2;
+const CHILD_STEP_FDS: u32 = 3;
+const CHILD_STEP_CHDIR: u32 = 4;
+const CHILD_STEP_RLIMITS: u32 = 5;
+const CHILD_STEP_CGROUP: u32 = 6;
+const CHILD_STEP_IDS: u32 = 7;
+const CHILD_STEP_CAPDROP: u32 = 8;
+const CHILD_STEP_CTTY: u32 = 9;
+const CHILD_STEP_SECCOMP: u32 = 10;
+const CHILD_STEP_EXECVE: u32 = 11;
 
 /// New session and process group, before anything else.
 ///
@@ -1679,6 +1704,49 @@ mod tests {
         }
     }
 
+    /// Drain the exec-error pipe for a failure message: eight bytes are
+    /// `errno` + failing step (see `CHILD_STEP_*`); EOF is a clean exec.
+    fn exec_verdict(exec: RawFd) -> String {
+        fn step_name(step: u32) -> &'static str {
+            match step {
+                1 => "sigmask",
+                2 => "session",
+                3 => "fds",
+                4 => "chdir",
+                5 => "rlimits",
+                6 => "cgroup",
+                7 => "ids",
+                8 => "capdrop",
+                9 => "ctty",
+                10 => "seccomp",
+                11 => "execve",
+                _ => "unknown-step",
+            }
+        }
+        let mut ebuf = [0u8; 8];
+        let mut egot = 0;
+        loop {
+            match zrt::sys::read(exec, &mut ebuf[egot..]) {
+                Ok(0) if egot == 0 => break String::from("exec ok"),
+                Ok(0) => {
+                    break format!("exec pipe truncated after {egot} bytes");
+                }
+                Ok(n) => {
+                    egot += n;
+                    if egot >= 8 {
+                        let errno = u32::from_le_bytes(ebuf[..4].try_into().expect("slice"));
+                        let step = u32::from_le_bytes(ebuf[4..].try_into().expect("slice"));
+                        break format!("exec failed at {}: errno {errno}", step_name(step));
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    break String::from("exec undecided yet");
+                }
+                Err(e) => panic!("exec pipe read: {e}"),
+            }
+        }
+    }
+
     /// Listen sockets arrive on fd 3.. with names and the child's own pid in
     /// the environment — the whole activation contract, asserted from inside
     /// a real (script) child.
@@ -1701,29 +1769,9 @@ mod tests {
         let _ = zrt::sys::close_quietly(a);
         let _ = zrt::sys::close_quietly(b);
         // The exec verdict, drained for the failure message: `Exited(127)`
-        // below means the child path failed before `execve` (with its errno
-        // here), not that the script's probes failed.
-        let exec = s.exec_fd.expect("exec pipe");
-        let mut ebuf = [0u8; 4];
-        let mut egot = 0;
-        let exec_verdict = loop {
-            match zrt::sys::read(exec, &mut ebuf[egot..]) {
-                Ok(0) if egot == 0 => break String::from("exec ok"),
-                Ok(0) => {
-                    break format!("exec pipe truncated after {egot} bytes");
-                }
-                Ok(n) => {
-                    egot += n;
-                    if egot >= 4 {
-                        break format!("exec failed: errno {}", u32::from_le_bytes(ebuf));
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    break String::from("exec undecided yet");
-                }
-                Err(e) => panic!("exec pipe read: {e}"),
-            }
-        };
+        // below means the child path failed before `execve` (with its step
+        // and errno here), not that the script's probes failed.
+        let exec_verdict = exec_verdict(s.exec_fd.expect("exec pipe"));
         assert_eq!(
             reap(&s),
             zrt::sys::ExitStatus::Exited(0),
@@ -1757,30 +1805,10 @@ mod tests {
         let _ = zrt::sys::close_quietly(b);
         // The exec verdict first: a child that never exec'd (missing shell,
         // dead binary) reports here, not on the notify pipe. EOF means the
-        // image was replaced; four bytes mean the errno; WouldBlock means
+        // image was replaced; eight bytes mean step + errno; WouldBlock means
         // the child has not decided yet and the notify drain below is the
         // verdict that counts.
-        let exec = s.exec_fd.expect("exec pipe");
-        let mut ebuf = [0u8; 4];
-        let mut egot = 0;
-        let exec_verdict = loop {
-            match zrt::sys::read(exec, &mut ebuf[egot..]) {
-                Ok(0) if egot == 0 => break String::from("exec ok"),
-                Ok(0) => {
-                    break format!("exec pipe truncated after {egot} bytes");
-                }
-                Ok(n) => {
-                    egot += n;
-                    if egot >= 4 {
-                        break format!("exec failed: errno {}", u32::from_le_bytes(ebuf));
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    break String::from("exec undecided yet");
-                }
-                Err(e) => panic!("exec pipe read: {e}"),
-            }
-        };
+        let exec_verdict = exec_verdict(s.exec_fd.expect("exec pipe"));
         // The child wrote READY=1 to fd 4; drain it from our read end like
         // the supervisor's readiness poll would, with a deadline instead of
         // a single optimistic read — the child may not have run yet.
