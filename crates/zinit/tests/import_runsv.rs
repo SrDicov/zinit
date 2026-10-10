@@ -74,7 +74,8 @@ fn full_service_converts_exactly() {
 }
 
 #[test]
-fn down_file_becomes_enabled_no_with_explicit_sink() {    let out = scratch_out();
+fn down_file_becomes_enabled_no_with_explicit_sink() {
+    let out = scratch_out();
     let (code, _) = import(&fixture_dir(), &out);
     assert_eq!(code, 0);
     let f = fixture_dir().display().to_string();
