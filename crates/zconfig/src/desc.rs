@@ -353,6 +353,9 @@ pub struct ServiceDesc {
     pub log: LogSpec,
     /// Whether a failure of this service should take the system down.
     pub is_critical: bool,
+    /// Whether the service starts at boot. `false` leaves `Desired` down
+    /// until an operator says otherwise; omitted means yes.
+    pub enabled: bool,
     /// Slice name under `zinit.slice`, or `None` for "no limit imposed".
     pub cgroup: Option<String>,
     /// Resource limits as `("nofile" | "nproc" | "as", value)`.
@@ -447,6 +450,7 @@ impl Default for ServiceDesc {
             // path decision into the parser.
             log: LogSpec::default(),
             is_critical: true,
+            enabled: true,
             cgroup: None,
             rlimits: Vec::new(),
             source: String::new(),
@@ -567,6 +571,9 @@ impl ServiceDesc {
         }
         if over.is_explicit(Directive::Critical) {
             self.is_critical = over.is_critical;
+        }
+        if over.is_explicit(Directive::Enabled) {
+            self.enabled = over.enabled;
         }
         if over.is_explicit(Directive::Cgroup) {
             self.cgroup = over.cgroup.clone();

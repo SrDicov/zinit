@@ -1,0 +1,35 @@
+#!/bin/sh
+# service — sysv-flavoured front end to zctl.
+#
+# Usage: service <name> <start|stop|restart|status>
+#
+# Maps one-to-one onto `zctl <verb> <name>` so hands trained on
+# `/etc/init.d` keep working while the backend is zinit. Honors
+# ZINIT_SOCKET (and `--socket` passthrough is deliberately absent:
+# one way to point at the socket, through the environment).
+# Exit status is zctl's; usage errors exit 2, like zctl itself.
+# Strictly POSIX sh.
+
+set -eu
+
+prog=service
+
+usage() {
+    printf 'usage: %s <name> <start|stop|restart|status>\n' "$prog" >&2
+    exit 2
+}
+
+[ $# -eq 2 ] || usage
+name=$1
+action=$2
+
+case "$action" in
+    start | stop | restart | status) ;;
+    *) usage ;;
+esac
+
+case "$name" in
+    "" | *[!a-zA-Z0-9_.@+-]*) usage ;;
+esac
+
+exec zctl "$action" "$name"

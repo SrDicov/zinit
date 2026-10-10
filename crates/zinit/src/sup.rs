@@ -260,7 +260,12 @@ impl Sup {
 
         let mut runtime = Runtime::from_plan(&plan);
         for idx in 0..runtime.len() {
-            runtime.set_desired(idx, Desired::Up);
+            // `enabled = no` is the boot default, not a lock: disabled
+            // services stay down until an operator starts them, while
+            // everything else wants up from the first pass.
+            if plan.services[idx].enabled {
+                runtime.set_desired(idx, Desired::Up);
+            }
         }
 
         let mut slots = Vec::with_capacity(plan.services.len());
