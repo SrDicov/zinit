@@ -554,6 +554,11 @@ pub struct ServicePlan {
     /// Linux capabilities to drop from the bounding set, canonical names.
     /// Empty is undropped. Linux-only at spawn, like `seccomp`.
     pub drop_caps: Vec<String>,
+    /// Start at boot. `false` (`enabled = no`) leaves `Desired` down until
+    /// an operator says otherwise — the boot default, not a lock: `zctl
+    /// start` still starts it. Reloads never flip a live desire; only a
+    /// fresh boot (and `kick`-style explicit intent) consults this.
+    pub enabled: bool,
 }
 
 impl ServicePlan {
@@ -577,6 +582,7 @@ impl ServicePlan {
             listens: Vec::new(),
             seccomp: None,
             drop_caps: Vec::new(),
+            enabled: true,
         }
     }
 }

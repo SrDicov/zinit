@@ -168,6 +168,8 @@ pub enum Directive {
     Log,
     /// `yes` | `no`: whether a failure takes the system down.
     Critical,
+    /// `yes` | `no`: whether the service starts at boot.
+    Enabled,
     /// Slice name under `zinit.slice`.
     Cgroup,
     /// Soft limit on open file descriptors.
@@ -210,6 +212,7 @@ impl Directive {
             Directive::Env => "env",
             Directive::Log => "log",
             Directive::Critical => "critical",
+            Directive::Enabled => "enabled",
             Directive::Cgroup => "cgroup",
             Directive::RlimitNofile => "rlimit-nofile",
             Directive::RlimitNproc => "rlimit-nproc",
@@ -232,7 +235,7 @@ impl Directive {
     /// hidden property of the service *name* would be a policy nobody could
     /// read off the file. The alternative, refusing to model it at all, means
     /// the runtime has to hardcode the same list somewhere less visible.
-    pub const ALL: [Directive; 25] = [
+    pub const ALL: [Directive; 26] = [
         Directive::Command,
         Directive::Type,
         Directive::Depends,
@@ -247,6 +250,7 @@ impl Directive {
         Directive::Env,
         Directive::Log,
         Directive::Critical,
+        Directive::Enabled,
         Directive::Cgroup,
         Directive::RlimitNofile,
         Directive::RlimitNproc,
@@ -863,6 +867,18 @@ pub fn parse_service_with_diagnostics(name: &str, text: &str) -> Result<ParsedSe
                             directive,
                             value_span,
                             "write `yes` or `no`; the default is yes, so a non-critical service is an explicit choice",
+                        ));
+                    }
+                };
+            }
+            Directive::Enabled => {
+                desc.enabled = match parse_bool(value) {
+                    Some(b) => b,
+                    None => {
+                        return Err(bad_value(
+                            directive,
+                            value_span,
+                            "write `yes` or `no`; the default is yes, so a disabled service is an explicit choice",
                         ));
                     }
                 };
@@ -2148,6 +2164,7 @@ rlimit-nofile = 8192
             Directive::User => "0",
             Directive::Log => "syslog",
             Directive::Critical => "no",
+            Directive::Enabled => "no",
             Directive::Cgroup => "web",
             Directive::RlimitNofile | Directive::RlimitNproc | Directive::RlimitAs => "1",
             Directive::PidFile => "/run/x.pid",
@@ -3314,6 +3331,18 @@ mod lifecycle_directive_tests {
             let e = parse_service(name, "command = /bin/x\n").expect_err("bad instance");
             assert_eq!(e.code, "E018", "wrong code: {}", e.message);
         }
+    }
+
+    #[test]
+    fn enabled_defaults_yes_parses_no_and_refuses_maybe() {
+        assert!(parsed("command = /bin/x\n").enabled);
+        let d = parsed("command = /bin/x\nenabled = no\n");
+        assert!(!d.enabled);
+        let d = parsed("command = /bin/x\nenabled = yes\n");
+        assert!(d.enabled);
+        let e = parse_service("svc", "command = /bin/x\nenabled = maybe\n")
+            .expect_err("enabled must be yes or no");
+        assert!(e.help.contains("`yes` or `no`"), "wrong help: {}", e.help);
     }
 
     #[test]

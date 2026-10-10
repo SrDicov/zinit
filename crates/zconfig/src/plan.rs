@@ -449,6 +449,7 @@ fn service_plan(graph: &Graph, i: Idx, findings: &mut Vec<Diagnostic>) -> Servic
         allow: d.syscall_allow.clone(),
     });
     sp.drop_caps = d.drop_caps.clone();
+    sp.enabled = d.enabled;
 
     // A target has no process, so it has no handshake to wait for. Forcing
     // `Ready::None` here is what lets the runtime treat targets uniformly
@@ -715,6 +716,17 @@ mod tests {
     }
 
     // ── the trivial cases ───────────────────────────────────────────────────
+
+    #[test]
+    fn enabled_travels_from_description_to_plan() {
+        let mut off = desc("off");
+        off.enabled = false;
+        let p = plan_of(vec![desc("on"), off]);
+        let on = &p.services[p.index_of("on").expect("on")];
+        let off = &p.services[p.index_of("off").expect("off")];
+        assert!(on.enabled, "omitted means yes");
+        assert!(!off.enabled);
+    }
 
     #[test]
     fn an_empty_description_set_freezes_to_an_empty_plan() {

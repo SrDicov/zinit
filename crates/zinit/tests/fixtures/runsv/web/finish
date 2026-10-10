@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "exit=$1 sig=$2"
