@@ -498,8 +498,16 @@ mod tests {
         // SAFETY: `listener` is an owned bound datagram socket; `recvfrom`
         // with null address arguments writes at most `buf.len()` bytes and
         // retains nothing.
-        let n =
-            unsafe { libc::recvfrom(listener, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len(), 0, core::ptr::null_mut(), core::ptr::null_mut()) };
+        let n = unsafe {
+            libc::recvfrom(
+                listener,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+                0,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        };
         assert!(n > 0, "recvfrom: {}", io::Error::last_os_error());
         assert_eq!(&buf[..n as usize], b"hello\n");
         let _ = zrt::sys::close(listener);
@@ -523,9 +531,9 @@ mod tests {
         }
         // SAFETY: `addr` carries exactly the path bytes plus the zeroed
         // terminator; `bind` copies `len` bytes and retains nothing.
-        let len =
-            (core::mem::size_of::<libc::sockaddr_un>() - addr.sun_path.len() + bytes.len() + 1)
-                as libc::socklen_t;
+        let len = (core::mem::size_of::<libc::sockaddr_un>() - addr.sun_path.len()
+            + bytes.len()
+            + 1) as libc::socklen_t;
         let rc = unsafe {
             libc::bind(
                 fd,

@@ -131,9 +131,7 @@ impl From<SpawnError> for io::Error {
             SpawnError::UnknownService { .. } | SpawnError::NotFound { .. } => {
                 io::ErrorKind::NotFound
             }
-            SpawnError::CgroupUnsupported { .. } => {
-                io::ErrorKind::Unsupported
-            }
+            SpawnError::CgroupUnsupported { .. } => io::ErrorKind::Unsupported,
         };
         io::Error::new(kind, e.to_string())
     }
