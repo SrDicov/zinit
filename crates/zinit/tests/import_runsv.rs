@@ -74,8 +74,7 @@ fn full_service_converts_exactly() {
 }
 
 #[test]
-fn down_file_becomes_enabled_no_with_explicit_sink() {
-    let out = scratch_out();
+fn down_file_becomes_enabled_no_with_explicit_sink() {    let out = scratch_out();
     let (code, _) = import(&fixture_dir(), &out);
     assert_eq!(code, 0);
     let f = fixture_dir().display().to_string();
@@ -129,5 +128,24 @@ fn usage_and_missing_dirs_fail() {
         .status()
         .expect("run sh");
     assert_eq!(status.code(), Some(2));
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn vlogger_becomes_syslog_with_tag_warning() {
+    let out = scratch_out();
+    let (code, stderr) = import(&fixture_dir(), &out);
+    assert_eq!(code, 0);
+    let f = fixture_dir().display().to_string();
+    let want = format!(
+        "type = script\ncommand = cd '{f}/vlog' && exec ./run\nready = none\nlog = syslog\nrestart = always\n"
+    );
+    let got = read(&out.join("vlog.conf"));
+    assert_eq!(got, want);
+    assert!(
+        stderr.contains("vlog: vlogger mapped to syslog"),
+        "missing vlogger warning:\n{stderr}"
+    );
+    zconfig::parse_service("vlog", &got).expect("generated output must parse");
     let _ = std::fs::remove_dir_all(&out);
 }

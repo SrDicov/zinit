@@ -16,6 +16,7 @@ zinit check ./services.d
 | `finish` | folded into `command` (`./finish $code 0`) | no equivalent when killed by a signal — documented in the script header |
 | `check` | `ready = ping:<dir>/check` | re-run until exit 0, like runsv |
 | `log/run` (`svlogd <dir>`) | `log = file:<dir>/<name>.log` | single file, not svlogd rotation |
+| `log/run` (`vlogger …`) | `log = syslog` | `-t`/`-p` tag options dropped (warned) |
 | `down` | `enabled = no` | |
 | `conf` (sourced env) | — (warned, skipped) | sourcing shell into declarative config is refused |
 | supervision itself | `restart = always` | budget/delay stay default; no invented dependencies |

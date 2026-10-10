@@ -18,10 +18,12 @@
 #   check          executable. Becomes `ready = ping:<dir>/check`
 #                  (re-run until exit 0, like runit's check). Otherwise
 #                  `ready = none`. A non-executable check is ignored.
-#   log/run        executable. The svlogd target directory (last non-option
+#   log/run        executable. svlogd's target directory (last non-option
 #                  argument) becomes `log = file:<dir>/<name>.log` — a single
-#                  file, not svlogd's rotation scheme. Otherwise `log = none`
-#                  (explicit: imports state their sink).
+#                  file, not svlogd's rotation scheme. A `vlogger` line
+#                  becomes `log = syslog` (its `-t`/`-p` tag options are
+#                  dropped with a warning: this sink does not frame).
+#                  Anything else warns and logs nowhere (`log = none`).
 #   down           any `down` file becomes `enabled = no`. Absent means yes
 #                  (omitted, never spelled out).
 #   conf           a sourced env file: warned about and skipped. Sourcing
@@ -132,8 +134,11 @@ convert_one() {
         logdir=$(svlogd_dir "$svdir/log/run")
         if [ -n "$logdir" ]; then
             log="file:$logdir/$name.log"
+        elif grep -q vlogger "$svdir/log/run" 2>/dev/null; then
+            log="syslog"
+            warn "$name: vlogger mapped to syslog; -t/-p tag options are dropped"
         else
-            warn "$name: no svlogd target found, logging nowhere"
+            warn "$name: log/run is neither svlogd nor vlogger; logging nowhere"
             log="none"
         fi
     else

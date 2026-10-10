@@ -35,8 +35,8 @@
   `<name>.conf`. `run` (ejecutable, cwd=dir) + `finish` plegado
   (`./finish $code 0`; sin equivalencia ante señales, documentado),
   `check` → `ready = ping:`, `log/run` (dir de svlogd) →
-  `log = file:<dir>/<name>.log`, `down` → `enabled = no`, `conf`
-  avisado y omitido. Siempre `restart = always`, sin dependencias
+  `log = file:<dir>/<name>.log` o `vlogger` → `log = syslog`, `down` →
+  `enabled = no`, `conf` avisado y omitido. Siempre `restart = always`, sin dependencias
   inventadas. Exit 0 aun con omisiones (avisos a stderr), 1 E/S, 2 uso.
   Test de integración con fixtures (`import_runit.rs`): salidas exactas
   byte a byte y re-parseadas por `zconfig`.
