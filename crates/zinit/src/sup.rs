@@ -1400,7 +1400,8 @@ const GENERATOR_OUTPUT_MAX: usize = 1024 * 1024;
 
 /// Resolve where configuration comes from: an explicit `--sup <dir>` is the
 /// whole world; otherwise the environment; otherwise the compiled defaults.
-fn resolve_sources(explicit: Option<&Path>) -> (Vec<PathBuf>, PathBuf) {
+/// Shared with `zinit check`, which validates exactly what a boot would read.
+pub(crate) fn resolve_sources(explicit: Option<&Path>) -> (Vec<PathBuf>, PathBuf) {
     let layers = match explicit {
         Some(dir) => vec![dir.to_path_buf()],
         None => match std::env::var_os(CONFIG_DIRS_ENV) {
@@ -1419,11 +1420,14 @@ fn resolve_sources(explicit: Option<&Path>) -> (Vec<PathBuf>, PathBuf) {
 
 /// Generators, then layers, then cleanup: the full "read the world" path.
 ///
+/// Shared with `zinit check`: the validator must read exactly what a boot
+/// (or a `reload-all`) would read, including generated descriptions.
+///
 /// The generated directory is scratch by design — every byte is in memory
 /// once `load_layers` returns — so it is removed before return either way.
 /// Startup and `reload-all` share this, which is what makes a reload pick up
 /// new generators instead of governing yesterday's outputs.
-fn load_all(
+pub(crate) fn load_all(
     config_dirs: &[PathBuf],
     gen_dir: &Path,
 ) -> io::Result<(Plan, Vec<Option<ServiceDesc>>)> {

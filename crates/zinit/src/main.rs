@@ -9,14 +9,18 @@
 //!        └─ services        one process each
 //! ```
 //!
+//! Offline: `zinit check` validates a configuration directory and reports
+//! the verdict as an exit code, without starting anything.
+//!
 //! The supervisor is a *child* of PID 1, not PID 1 itself. A panic, an OOM or a
 //! protocol bug in the brain then costs one restartable process instead of the
 //! machine's governor, and the part that must never fail — reaping orphans,
 //! which only PID 1 can do — stays in something small enough to audit by eye.
 //!
-//! No CLI framework. There are two flags and a directory; `clap` would be more
-//! dependencies than behaviour.
+//! No CLI framework. There are two flags, a directory, and a checker;
+//! `clap` would be more dependencies than behaviour.
 
+mod check;
 mod ctl;
 mod init;
 mod sup;
@@ -68,6 +72,18 @@ fn main() -> ExitCode {
             announce_degradation(&format!("zinit {}", zrt::VERSION));
             ExitCode::SUCCESS
         }
+        "check" => {
+            // At most one directory, like `--sup`: an explicit directory is
+            // the whole configuration, otherwise the layers and the
+            // environment decide, exactly as a boot would read them.
+            let dir: Option<PathBuf> = args.next().map(PathBuf::from);
+            if args.next().is_some() {
+                announce_degradation("check takes at most one argument: a directory");
+                usage();
+                return ExitCode::from(2);
+            }
+            check::run(dir.as_deref())
+        }
         other => {
             announce_degradation(&format!("unknown argument `{other}`"));
             usage();
@@ -76,7 +92,9 @@ fn main() -> ExitCode {
     }
 }
 
-/// The two entry points, on stderr, for the same reason as `--version`.
+/// The entry points, on stderr, for the same reason as `--version`.
 fn usage() {
-    announce_degradation("usage: zinit --init | zinit --sup [<services.d>] | zinit --version");
+    announce_degradation(
+        "usage: zinit --init | zinit --sup [<services.d>] | zinit check [<services.d>] | zinit --version",
+    );
 }

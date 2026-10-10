@@ -1,6 +1,16 @@
 # Changelog
 
 ## [Unreleased]
+### `zinit check`
+- Offline validator: `zinit check [<dir>]` loads exactly what a boot (or
+  `reload-all`) would load — layers, drop-ins, generators, merged
+  cross-checks, `user =` resolution, graph order — freezes the plan and
+  throws it away. Silent success (exit 0, the Unix answer), file-qualified
+  refusal on stderr (exit 1), usage errors exit 2. No new crate: one module
+  in the `zinit` binary sharing `resolve_sources`/`load_all`, so the
+  validator cannot diverge from the boot. Binary and log-sink checks are
+  deliberately out of scope: they depend on the supervisor's runtime
+  environment, which an operator shell cannot judge.
 ### Control client
 - `zctl` crate: zero-dep CLI over the C4 protocol (one frame in, one line out,
   exit 0/1, `--socket/--id` flags, `ZINIT_SOCKET` env). Pass-through verbs, no
