@@ -27,9 +27,10 @@ build() {
     local bin="target/$TARGET/$PROFILE/$BIN"
     [ -f "$bin" ] || die "binary not found at $bin"
 
-    # Verify static linking
+    # Verify static linking (`file` says "statically linked" on classic
+    # toolchains, "static-pie linked" on modern ones — both fully static).
     if command -v file &>/dev/null; then
-        file "$bin" | grep -q "statically linked" \
+        file "$bin" | grep -qE "statically linked|static-pie linked" \
             || die "binary is not statically linked"
     fi
 

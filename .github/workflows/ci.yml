@@ -760,7 +760,10 @@ jobs:
           set -euo pipefail
           bin=target/x86_64-unknown-linux-musl/release/zinit
           file "$bin"
-          file "$bin" | grep -q "statically linked" \
+          # `file` prints "statically linked" on classic static builds and
+          # "static-pie linked" on modern toolchains (rust 1.7x+ defaults to
+          # static-PIE for musl): both are fully static, no libc.so needed.
+          file "$bin" | grep -qE "statically linked|static-pie linked" \
             || { echo "::error::zinit is not statically linked"; exit 1; }
       - name: Upload artifact
         uses: actions/upload-artifact@v4
