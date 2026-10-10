@@ -384,8 +384,11 @@ fn demand_start_wakes_on_connection() {
     // Down means down: nothing starts without traffic.
     sleep_ms(500);
     let quiet = scratch.state_of("lazy");
+    let started = quiet
+        .as_deref()
+        .is_some_and(|s| s.contains("state=Running"));
     assert!(
-        quiet.is_none_or(|s| !s.contains("state=Running")),
+        !started,
         "on-demand service started with no connection: {quiet:?}"
     );
 
