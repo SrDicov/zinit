@@ -1796,8 +1796,7 @@ fn load_layers(dirs: &[PathBuf]) -> io::Result<(Plan, Vec<Option<ServiceDesc>>)>
         if desc.kind == zcore::ServiceKind::Console && desc.tty.is_none() {
             announce_degradation(&format!(
                 "{}: console service `{}` has no `tty =`; it will run as an ordinary process without job control",
-                desc.source,
-                desc.name
+                desc.source, desc.name
             ));
         }
     }

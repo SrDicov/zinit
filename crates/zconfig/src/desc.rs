@@ -1074,10 +1074,7 @@ mod overlay_tests {
 
     #[test]
     fn tty_overrides_only_when_explicit() {
-        let mut base = parsed(
-            "svc",
-            "type = console\ncommand = /bin/a\ntty = /dev/tty1\n",
-        );
+        let mut base = parsed("svc", "type = console\ncommand = /bin/a\ntty = /dev/tty1\n");
         let over = parsed("svc", "type = console\ncommand = /bin/a\n");
         base.overlay_onto(over);
         assert_eq!(base.tty.as_deref(), Some("/dev/tty1"));
@@ -1088,7 +1085,8 @@ mod overlay_tests {
     }
 
     #[test]
-    fn restart_merges_field_wise_not_wholesale() {        let mut base = parsed(
+    fn restart_merges_field_wise_not_wholesale() {
+        let mut base = parsed(
             "svc",
             "command = /bin/a\nrestart = on-failure\nrestart-budget = 3 restarts per 10s\n",
         );

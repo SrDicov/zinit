@@ -1095,9 +1095,7 @@ fn expand_instance(desc: &mut ServiceDesc) -> Result<(), ParseError> {
                 "service name `{}` has an unusable instance: write `name@instance` with exactly one `@`",
                 desc.name
             ),
-            String::from(
-                "instances come from the file name (`getty@tty1.conf`); rename the file",
-            ),
+            String::from("instances come from the file name (`getty@tty1.conf`); rename the file"),
         ));
     }
     let instance = desc.name[at + 1..].to_owned();
