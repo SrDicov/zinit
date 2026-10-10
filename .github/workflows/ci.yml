@@ -738,3 +738,33 @@ jobs:
           cargo +nightly miri setup
       - name: Run
         run: cargo +nightly miri test -p zcore --lib
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # Static musl release binary for hardware/VM testing (portado de
+  # `feat/fase-1-cierre`). Produce el `zinit` estático que `scripts/`
+  # `zinit-deploy.sh` empaqueta; el artifact vive 30 días por push.
+  # ══════════════════════════════════════════════════════════════════════════
+  release-musl:
+    name: static musl release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Build static musl release
+        run: cargo build --release --target x86_64-unknown-linux-musl --workspace
+      - name: Verify it is static
+        run: |
+          set -euo pipefail
+          bin=target/x86_64-unknown-linux-musl/release/zinit
+          file "$bin"
+          file "$bin" | grep -q "statically linked" \
+            || { echo "::error::zinit is not statically linked"; exit 1; }
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zinit-musl-x86_64
+          path: target/x86_64-unknown-linux-musl/release/zinit
+          retention-days: 30

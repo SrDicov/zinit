@@ -17,11 +17,27 @@
 | `zcheck` | `zinit check` — valida sin arrancar | ⏳ fase 3 | |
 
 Los binarios son `zinit` y `zctl` (los únicos `[[bin]]` del árbol). El *size
-budget* de CI mide `target/release/zinit` (≤ 500 KiB); `zctl` no entra en el
+budget* de CI mide `target/release/zinit` (≤ 1 MiB); `zctl` no entra en el
 presupuesto porque nunca corre como PID 1.
 
 El supervisor (`zinit --sup`) ya conecta el reactor de `zrt` con el
 reconciliador de `zcore`, sirve el socket de control y vuelca el estado visible.
+
+## Deploy para testing en hardware/VMs
+
+```sh
+# 1. Build + package (local)
+./scripts/zinit-deploy.sh build
+
+# 2a. Deploy via SSH/SCP a un host o VM
+./scripts/zinit-deploy.sh deploy <host> [user]
+
+# 2b. O lanzar directamente en QEMU con zinit como PID 1
+./scripts/zinit-deploy.sh qemu <disk.img> [kernel]
+```
+
+El binario estático musl también se produce en CI (job `release-musl`) y queda
+disponible como artifact de 30 días en cada push.
 
 ## Bugs de producción que la integración destapó
 
