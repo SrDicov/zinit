@@ -173,6 +173,8 @@ pub enum Directive {
     /// `yes` | `no`: whether the first connection to a held socket starts
     /// a stopped service.
     OnDemand,
+    /// `yes` | `no`: whether the service gets a private `/tmp`.
+    PrivateTmp,
     /// Slice name under `zinit.slice`.
     Cgroup,
     /// Soft limit on open file descriptors.
@@ -217,6 +219,7 @@ impl Directive {
             Directive::Critical => "critical",
             Directive::Enabled => "enabled",
             Directive::OnDemand => "on-demand",
+            Directive::PrivateTmp => "private-tmp",
             Directive::Cgroup => "cgroup",
             Directive::RlimitNofile => "rlimit-nofile",
             Directive::RlimitNproc => "rlimit-nproc",
@@ -239,7 +242,7 @@ impl Directive {
     /// hidden property of the service *name* would be a policy nobody could
     /// read off the file. The alternative, refusing to model it at all, means
     /// the runtime has to hardcode the same list somewhere less visible.
-    pub const ALL: [Directive; 27] = [
+    pub const ALL: [Directive; 28] = [
         Directive::Command,
         Directive::Type,
         Directive::Depends,
@@ -256,6 +259,7 @@ impl Directive {
         Directive::Critical,
         Directive::Enabled,
         Directive::OnDemand,
+        Directive::PrivateTmp,
         Directive::Cgroup,
         Directive::RlimitNofile,
         Directive::RlimitNproc,
@@ -900,6 +904,18 @@ pub fn parse_service_with_diagnostics(name: &str, text: &str) -> Result<ParsedSe
                     }
                 };
             }
+            Directive::PrivateTmp => {
+                desc.private_tmp = match parse_bool(value) {
+                    Some(b) => b,
+                    None => {
+                        return Err(bad_value(
+                            directive,
+                            value_span,
+                            "write `yes` or `no`; a private /tmp is opt-in, so yes is an explicit choice",
+                        ));
+                    }
+                };
+            }
             Directive::Cgroup => desc.cgroup = Some(value.to_owned()),
             Directive::RlimitNofile | Directive::RlimitNproc | Directive::RlimitAs => {
                 // The same scanner a `tcp:` port and a `u64` budget capacity
@@ -978,6 +994,7 @@ pub fn parse_service_with_diagnostics(name: &str, text: &str) -> Result<ParsedSe
             Directive::Cgroup,
             Directive::Tty,
             Directive::OnDemand,
+            Directive::PrivateTmp,
         ] {
             if let Some(span) = span_of(&seen, directive) {
                 return Err(virtual_directive_error(directive, desc.kind, span));
@@ -2188,6 +2205,7 @@ rlimit-nofile = 8192
             Directive::Critical => "no",
             Directive::Enabled => "no",
             Directive::OnDemand => "yes",
+            Directive::PrivateTmp => "yes",
             Directive::Cgroup => "web",
             Directive::RlimitNofile | Directive::RlimitNproc | Directive::RlimitAs => "1",
             Directive::PidFile => "/run/x.pid",
@@ -3383,6 +3401,23 @@ mod lifecycle_directive_tests {
         let e = parse_service("svc", "type = target\non-demand = yes\n")
             .expect_err("a target never spawns to be woken");
         assert!(e.message.contains("on-demand"), "wrong error: {}", e.message);
+    }
+
+    #[test]
+    fn private_tmp_is_opt_in_and_refuses_maybe() {
+        assert!(!parsed("command = /bin/x\n").private_tmp);
+        let d = parsed("command = /bin/x\nprivate-tmp = yes\n");
+        assert!(d.private_tmp);
+        let e = parse_service("svc", "command = /bin/x\nprivate-tmp = maybe\n")
+            .expect_err("private-tmp must be yes or no");
+        assert!(e.help.contains("`yes` or `no`"), "wrong help: {}", e.help);
+    }
+
+    #[test]
+    fn private_tmp_on_a_target_is_refused() {
+        let e = parse_service("svc", "type = target\nprivate-tmp = yes\n")
+            .expect_err("a target has no mounts to isolate");
+        assert!(e.message.contains("private-tmp"), "wrong error: {}", e.message);
     }
 
     #[test]

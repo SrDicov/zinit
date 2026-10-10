@@ -360,6 +360,9 @@ pub struct ServiceDesc {
     /// service. Opt-in (`no` unless said); needs `listen`, refused without
     /// it at load.
     pub on_demand: bool,
+    /// Whether the service gets a private `/tmp` (mount namespace +
+    /// tmpfs). Opt-in; Linux-only, refused off Linux at spawn.
+    pub private_tmp: bool,
     /// Slice name under `zinit.slice`, or `None` for "no limit imposed".
     pub cgroup: Option<String>,
     /// Resource limits as `("nofile" | "nproc" | "as", value)`.
@@ -456,6 +459,7 @@ impl Default for ServiceDesc {
             is_critical: true,
             enabled: true,
             on_demand: false,
+            private_tmp: false,
             cgroup: None,
             rlimits: Vec::new(),
             source: String::new(),
@@ -582,6 +586,9 @@ impl ServiceDesc {
         }
         if over.is_explicit(Directive::OnDemand) {
             self.on_demand = over.on_demand;
+        }
+        if over.is_explicit(Directive::PrivateTmp) {
+            self.private_tmp = over.private_tmp;
         }
         if over.is_explicit(Directive::Cgroup) {
             self.cgroup = over.cgroup.clone();
@@ -1088,8 +1095,16 @@ mod overlay_tests {
     }
 
     #[test]
-    fn on_demand_overrides_only_when_explicit() {
-        let mut base = parsed("svc", "command = /bin/a\nlisten = tcp:8080\n");
+    fn private_tmp_overrides_only_when_explicit() {
+        let mut base = parsed("svc", "command = /bin/a\n");
+        assert!(!base.private_tmp);
+        let over = parsed("svc", "command = /bin/a\nprivate-tmp = yes\n");
+        base.overlay_onto(over);
+        assert!(base.private_tmp);
+    }
+
+    #[test]
+    fn on_demand_overrides_only_when_explicit() {        let mut base = parsed("svc", "command = /bin/a\nlisten = tcp:8080\n");
         assert!(!base.on_demand);
         let over = parsed("svc", "command = /bin/a\non-demand = yes\n");
         base.overlay_onto(over);

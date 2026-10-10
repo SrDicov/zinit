@@ -303,7 +303,8 @@ env        = PATH=/usr/bin:/bin SSH_LOG_LEVEL=INFO
 | `pid-file` | ruta | — | sólo `forking`; el pid real tras el doble fork |
 | `tty` | ruta absoluta | — | sólo `console`; sin ella el servicio corre como proceso (aviso, no fatal) |
 | `enabled` | `yes` \| `no` | `yes` | `no` deja `Desired` abajo hasta que un operador lo arranque |
-| `on-demand` | `yes` \| `no` | `no` | con `listen`: la primera conexión arranca un servicio parado || `watchdog-sec` | segundos ≥1 | — | sólo con `ready = notify`; `WATCHDOG=1` por el fd 3 |
+| `on-demand` | `yes` \| `no` | `no` | con `listen`: la primera conexión arranca un servicio parado |
+| `private-tmp` | `yes` \| `no` | `no` | nombres de montaje + tmpfs en `/tmp`; Linux, si no ⇒ rechazo || `watchdog-sec` | segundos ≥1 | — | sólo con `ready = notify`; `WATCHDOG=1` por el fd 3 |
 | `listen` | `tcp:<puerto>[:<nombre>]` \| `unix:<ruta>`, repetible | — | pre-bind en 127.0.0.1; `$LISTEN_FDS/$LISTEN_PID/$LISTEN_FDNAMES` desde fd 3 |
 | `drop-capabilities` | nombres (`sys_admin`…) | — | irreversible (`PR_CAPBSET_DROP`); Linux, si no ⇒ el spawn se rechaza |
 | `syscall-filter` | `enforce` \| `errno` \| `off` | — | seccomp-bpf manual; Linux, si no ⇒ el spawn se rechaza |
