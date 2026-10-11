@@ -139,8 +139,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-        with:
-          fetch-tags: true
       - uses: actions/download-artifact@v4
         with:
           path: dist
