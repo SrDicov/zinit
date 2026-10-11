@@ -1,0 +1,7 @@
+init=dinit
+boot_ms=154
+rss_kb_steady=4004
+rss_kb_after_idle=4004
+idle_ticks_60s=0
+respawn_ms=24
+cage_du_kb=16276

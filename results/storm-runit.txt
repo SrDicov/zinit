@@ -1,0 +1,4 @@
+init=runit
+storm_boot_ms=69
+storm_lines_10s=11
+supervisor_alive=yes

@@ -1,0 +1,7 @@
+init=runit
+boot_ms=86
+rss_kb_steady=2720
+rss_kb_after_idle=2720
+idle_ticks_60s=16
+respawn_ms=15
+cage_du_kb=13124

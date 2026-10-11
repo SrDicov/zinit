@@ -1,0 +1,4 @@
+init=s6
+storm_boot_ms=65
+storm_lines_10s=11
+supervisor_alive=yes

@@ -1,0 +1,7 @@
+init=zinit
+boot_ms=85
+rss_kb_steady=2368
+rss_kb_after_idle=2372
+idle_ticks_60s=6
+respawn_ms=24
+cage_du_kb=10624

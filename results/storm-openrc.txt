@@ -1,0 +1,4 @@
+init=openrc
+storm_boot_ms=500
+storm_lines_10s=1
+supervisor_alive=yes

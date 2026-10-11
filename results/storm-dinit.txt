@@ -1,0 +1,4 @@
+init=dinit
+storm_boot_ms=66
+storm_lines_10s=4
+supervisor_alive=yes

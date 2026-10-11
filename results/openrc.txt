@@ -1,0 +1,7 @@
+init=openrc
+boot_ms=500
+rss_kb_steady=3032
+rss_kb_after_idle=3032
+idle_ticks_60s=0
+respawn_ms=TIMEOUT
+cage_du_kb=14820

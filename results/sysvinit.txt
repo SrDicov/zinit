@@ -1,0 +1,7 @@
+init=sysvinit
+boot_ms=69
+rss_kb_steady=1936
+rss_kb_after_idle=1936
+idle_ticks_60s=0
+respawn_ms=1048
+cage_du_kb=9864

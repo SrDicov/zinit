@@ -1,0 +1,4 @@
+init=zinit
+storm_boot_ms=66
+storm_lines_10s=41
+supervisor_alive=yes
