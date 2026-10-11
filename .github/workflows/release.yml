@@ -74,9 +74,10 @@ jobs:
       - name: Install zig (for zigbuild)
         if: matrix.zig != ''
         run: |
-          python3 -m pip install --user ziglang
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/zig" version
+          curl -sSfL -o /tmp/zig.tar.xz 'https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz'
+          mkdir -p "$HOME/zig" && tar xf /tmp/zig.tar.xz -C "$HOME/zig" --strip-components=1
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+          "$HOME/zig/zig" version
 
       - name: Install zigbuild (riscv64 musl sysroot)
         if: matrix.zig != ''
