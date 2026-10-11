@@ -2473,8 +2473,8 @@ mod tests {
         let base = scratch("arm-idle");
         let sock = base.join("ctl");
         let state = base.join("state");
-        let gen = base.join("gen");
-        let _ = std::fs::create_dir_all(&gen);
+        let gen_dir = base.join("gen");
+        let _ = std::fs::create_dir_all(&gen_dir);
         // SAFETY: no other test in this binary reads `ZINIT_SOCKET` or
         // `ZINIT_STATE_DIR` — only child-process integration tests use them,
         // and those are separate processes — so no thread can observe the
@@ -2492,7 +2492,7 @@ mod tests {
         )
         .expect("write");
         let (plan, descs) = load(&quiet).expect("quiet loads");
-        let mut sup = Sup::new(plan, descs, vec![quiet.clone()], gen.clone())
+        let mut sup = Sup::new(plan, descs, vec![quiet.clone()], gen_dir.clone())
             .expect("supervisor builds");
         assert!(
             sup.arm(1_000_000) > 3_600_000,
@@ -2504,7 +2504,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&eager);
         write_conf(&eager, "e");
         let (plan, descs) = load(&eager).expect("eager loads");
-        let mut sup = Sup::new(plan, descs, vec![eager.clone()], gen.clone())
+        let mut sup = Sup::new(plan, descs, vec![eager.clone()], gen_dir.clone())
             .expect("supervisor builds");
         assert!(
             sup.arm(1_000_000) <= WAIT_CAP_MS,
