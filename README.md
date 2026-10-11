@@ -31,6 +31,18 @@ estáticos `zinit` + `zctl`, más `install.sh`) con su `.sha256`, para
 Sin RISC-V 32 bits (Rust no lo ofrece con `std`) ni BSD (requiere
 builder nativo); ver `release.yml`.
 
+## Plataformas
+
+| Objetivo | Estado |
+|---|---|
+| Linux `x86_64` / `i686` / `aarch64` / `armv7` / `riscv64` (musl estático) | ✅ artefactos en cada tag |
+| Linux `riscv32` | ⏳ upstream Rust, sin target con `std` ([#19](https://github.com/SrDicov/zinit/issues/19)) |
+| FreeBSD (`kqueue` ya implementado en `zrt`) | ⏳ requiere activar la App Cirrus (`.cirrus.yml` listo) |
+| macOS | 🛠️ compila y testea en CI, no es objetivo PID 1 |
+
+Las interfaces que estos puertos consumen están congeladas en
+[`CONTRACTS.md`](CONTRACTS.md) desde v0.0.1.
+
 ```sh
 tar xzf zinit-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz
 cd zinit-vX.Y.Z-x86_64-unknown-linux-musl
@@ -70,6 +82,8 @@ Cuatro de ellos eran invisibles sin los tests de integración, y los cuatro eran
   ahí sobreviviría al `stop-timeout` y a cada `SIGKILL` posterior.
 
 El diseño completo está en [`DESIGN.md`](DESIGN.md). Este README es el estado y el índice.
+Las siete fronteras con el exterior están congeladas desde v0.0.1 en
+[`CONTRACTS.md`](CONTRACTS.md): lo que tocan se mantiene compatible.
 
 ## La idea
 

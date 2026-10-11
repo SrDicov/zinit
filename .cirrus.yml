@@ -24,4 +24,44 @@ freebsd_task:
     - export PATH="$HOME/.cargo/bin:$PATH"
     - cargo --version && rustc --version
     - cargo build --workspace --all-targets
-    - cargo test --workspace
+    - cargo test --workspace --release
+
+# Release artefact on tags: same optimised profile as Linux
+# (`lto`, `strip`, `opt-s`), stripped again for the road, packed with
+# its checksum. Uploaded to the tag's GitHub release *if it exists* —
+# the Linux `release` job usually publishes first; if the FreeBSD leg
+# wins the race the tarball stays in the Cirrus UI instead of failing
+# the tag red over ordering.
+#
+# Needs one repo secret the maintainers add once in the Cirrus web UI
+# (Settings → Secrets): GITHUB_TOKEN with `contents: write`, exposed
+# below. Without it the task still builds and packs; only the upload
+# is skipped, loudly.
+freebsd_release_task:
+  depends_on: freebsd_task
+  only_if: $CIRRUS_TAG != ''
+  freebsd_instance:
+    image_family: freebsd-14-2
+    cpu: 4
+    memory: 4G
+
+  env:
+    GH_TOKEN: $GITHUB_TOKEN
+
+  install_script:
+    - pkg install -y curl gh
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+
+  script:
+    - export PATH="$HOME/.cargo/bin:$PATH"
+    - cargo build --release -p zinit -p zctl
+    - strip target/release/zinit target/release/zctl
+    - dir="zinit-$CIRRUS_TAG-freebsd-x86_64" && mkdir -p "$dir"
+    - cp target/release/zinit target/release/zctl scripts/install.sh "$dir/"
+    - tar czf "$dir.tar.gz" "$dir" && sha256 -q "$dir.tar.gz" > "$dir.tar.gz.sha256"
+    - if [ -z "${GH_TOKEN:-}" ]; then echo "no GITHUB_TOKEN secret: tarball kept in Cirrus UI only"; exit 0; fi
+    - if gh release view "$CIRRUS_TAG" >/dev/null 2>&1; then gh release upload "$CIRRUS_TAG" "$dir.tar.gz" "$dir.tar.gz.sha256"; else echo "release $CIRRUS_TAG not published yet: tarball kept in Cirrus UI"; fi
+
+  artifacts:
+    tarball:
+      path: "zinit-*.tar.gz*"
