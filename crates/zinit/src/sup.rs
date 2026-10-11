@@ -435,6 +435,19 @@ impl Sup {
             self.reap(now);
             self.poll(now);
             self.serve_ctl(now);
+            // A stop the operator asked for on this very pass. `serve_ctl`
+            // only flips `Desired`; the `SIGTERM` comes from `begin_stop`,
+            // which `poll` already ran *before* the command arrived. Without
+            // this, a settled machine would sleep past the stop: `arm` sees
+            // no deadline yet because none is armed until `begin_stop` runs,
+            // and no descriptor fires because the child is still (rightly)
+            // running. This ordering gap is what the old once-a-second cap
+            // papered over. Idempotent: after it fires the service is
+            // `Stopping` with a deadline, and a second call returns on the
+            // state guard.
+            for idx in 0..self.runtime.len() {
+                self.begin_stop(idx, now);
+            }
             let tick = self.reconcile_now(now);
             self.execute(&tick.actions, now);
             if !tick.changed.is_empty() {
