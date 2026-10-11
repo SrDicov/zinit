@@ -1,6 +1,12 @@
 # Changelog
 
 ## [Unreleased]
+### Reposo sin despertares (bench P1)
+- `arm()` no debe nada: sin sondas, watchdogs, demanda ni reinicios
+  pendientes devuelve espera máxima en vez del tope de 1 s. Los fds
+  siguen registrados, así que un evento despierta igual de rápido y el
+  idle cae de ~8 ticks a ~0 por minuto (dinit/openrc/sysvinit leen 0).
+  Test `arm_sleeps_forever_when_settled_and_wakes_for_a_start_owed`.
 ### libFuzzer real (Fase E)
 - `fuzz/` (crate aislada, fuera del workspace: libfuzzer-sys nunca toca
   el gate de dependencias): target `parse_service` (cuerpo arbitrario,
