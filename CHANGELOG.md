@@ -1,6 +1,12 @@
 # Changelog
 
 ## [Unreleased]
+### Reaper bloqueante (bench F2)
+- `init` espera con `waitpid` bloqueante en vez de sondear cada 50 ms:
+  0 ticks en reposo (medido: 6 en debug) y relanzo del supervisor
+  inmediato ante su muerte, sin signalfd, hilo ni timer. El `sleep` solo
+  queda para el caso sin hijos (`ECHILD`: reaper pelado o forks
+  fallando), que antes giraba en vacío.
 ### Reposo sin despertares (bench P1)
 - `arm()` no debe nada: sin sondas, watchdogs, demanda ni reinicios
   pendientes devuelve espera máxima en vez del tope de 1 s. Los fds
