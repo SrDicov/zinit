@@ -449,12 +449,18 @@ impl Graph {
         }
 
         let mut sorted: Vec<&ServiceDesc> = descs.iter().collect();
-        sorted.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
-        // A stable tie-break on the *source* keeps the "which definition won"
-        // message stable when two files declare the same name. Both keys
-        // together are a total order, so the sort is deterministic whatever the
-        // readdir handed us.
-        sorted.sort_by(|a, b| a.source.cmp(&b.source));
+        // Name first, source second, in ONE sort: `by_name` is binary-searched
+        // and duplicates are detected by adjacency, so both rest on name order
+        // holding after this line. A second stable sort by source alone would
+        // silently re-establish source order and break both (a service `a`
+        // depending on `a-early` resolves to nothing whenever `a-early.conf`
+        // sorts before `a.conf`, which it does: `-` < `.`).
+        sorted.sort_by(|a, b| {
+            a.name
+                .as_bytes()
+                .cmp(b.name.as_bytes())
+                .then_with(|| a.source.cmp(&b.source))
+        });
 
         let n = sorted.len();
         let mut owned: Vec<ServiceDesc> = Vec::with_capacity(n);
@@ -864,6 +870,23 @@ mod tests {
         assert_eq!(g.index_of("alpha"), Some(0));
         assert_eq!(g.index_of("zebra"), Some(2));
         assert_eq!(g.index_of("nope"), None);
+    }
+
+    /// Name order must survive the source tie-break, or binary search misses.
+    ///
+    /// The loader once sorted by name and then re-sorted by source alone, so
+    /// `by_name` ended up in source order. A service `a` depending on
+    /// `a-early` then resolved to nothing whenever `a-early.conf` sorted
+    /// before `a.conf` (it does: `-` < `.`), while `suggest` still saw the
+    /// name and echoed it back. The Chimera corpus tripped it with
+    /// `early-cryptdisks` depending on `early-cryptdisks-early`.
+    #[test]
+    fn resolution_does_not_depend_on_source_order() {
+        let provider = desc("a-early");
+        let dependent = desc_with("a", ServiceKind::Process, &["a-early"], &[]);
+        let g = Graph::build(&[dependent, provider]).expect("edge must resolve");
+        let i = g.index_of("a").expect("dependent indexed");
+        assert_eq!(edge_names(&g, i), ["a-early"]);
     }
 
     #[test]
