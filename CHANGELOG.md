@@ -1,6 +1,25 @@
 # Changelog
 
 ## [Unreleased]
+
+## [v0.0.1] - 2026-10-11
+### Release
+- Cinco artefactos musl estáticos (`x86_64`, `i686`, `aarch64`,
+  `armv7`, `riscv64` + `zctl` + `install.sh` + `.sha256`) desde el
+  workflow `release` en cada tag `v*`. Perfil ya optimizado
+  (`lto`, `strip`, `opt-s`, `codegen-units = 1`, `panic = "abort"`).
+### Reaper bloqueante (bench F2)
+- `init` espera con `waitpid` bloqueante en vez de sondear cada 50 ms:
+  0 ticks en reposo (medido: 6 en debug) y relanzo del supervisor
+  inmediato ante su muerte, sin signalfd, hilo ni timer. El `sleep` solo
+  queda para el caso sin hijos (`ECHILD`: reaper pelado o forks
+  fallando), que antes giraba en vacío.
+### Reposo sin despertares (bench P1)
+- `arm()` no debe nada: sin sondas, watchdogs, demanda ni reinicios
+  pendientes devuelve espera máxima en vez del tope de 1 s. Los fds
+  siguen registrados, así que un evento despierta igual de rápido y el
+  idle cae de ~8 ticks a ~0 por minuto (dinit/openrc/sysvinit leen 0).
+  Test `arm_sleeps_forever_when_settled_and_wakes_for_a_start_owed`.
 ### libFuzzer real (Fase E)
 - `fuzz/` (crate aislada, fuera del workspace: libfuzzer-sys nunca toca
   el gate de dependencias): target `parse_service` (cuerpo arbitrario,

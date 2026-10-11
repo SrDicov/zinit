@@ -1,0 +1,7 @@
+init=s6
+boot_ms=70
+rss_kb_steady=3656
+rss_kb_after_idle=3660
+idle_ticks_60s=16
+respawn_ms=1046
+cage_du_kb=14700

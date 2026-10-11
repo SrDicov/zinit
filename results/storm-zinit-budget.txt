@@ -1,0 +1,4 @@
+init=zinit-budget
+storm_boot_ms=64
+storm_lines_10s=6
+supervisor_alive=yes

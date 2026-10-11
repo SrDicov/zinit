@@ -57,9 +57,11 @@ use crate::ctl::{self, Command};
 /// Ceiling on one `reactor.wait`, in milliseconds.
 ///
 /// Not a tuning knob, a correctness one: the loop wakes at least this often
-/// whether or not anything is registered, so a descriptor that never made it
-/// into the reactor costs a service latency instead of its lifetime. The nearest
-/// real deadline always wins over this cap.
+/// while anything could be due, so a descriptor that never made it into the
+/// reactor costs a service latency instead of its lifetime. The nearest real
+/// deadline always wins over this cap, and a machine with nothing due at all
+/// skips the cap entirely (see `arm`): its fds stay registered, so an event
+/// still wakes it at once.
 const WAIT_CAP_MS: u64 = 1_000;
 
 /// Shortest gap between two passes while a service is waiting out a restart
@@ -408,7 +410,7 @@ impl Sup {
             // ever wake this loop up.
             let timeout = if first_pass {
                 first_pass = false;
-                0
+                Some(0)
             } else {
                 self.arm(now)
             };
@@ -420,7 +422,7 @@ impl Sup {
             // What the registrations in `arm` buy is *latency*: a notify that
             // arrives makes `wait` return at once instead of at the next
             // deadline.
-            let _ready = match self.reactor.wait(Some(timeout)) {
+            let _ready = match self.reactor.wait(timeout) {
                 Ok(events) => events,
                 // Not retryable: a loop that cannot wait cannot supervise.
                 // Exiting non-zero is what PID 1 is for, and the services stay
@@ -433,6 +435,19 @@ impl Sup {
             self.reap(now);
             self.poll(now);
             self.serve_ctl(now);
+            // A stop the operator asked for on this very pass. `serve_ctl`
+            // only flips `Desired`; the `SIGTERM` comes from `begin_stop`,
+            // which `poll` already ran *before* the command arrived. Without
+            // this, a settled machine would sleep past the stop: `arm` sees
+            // no deadline yet because none is armed until `begin_stop` runs,
+            // and no descriptor fires because the child is still (rightly)
+            // running. This ordering gap is what the old once-a-second cap
+            // papered over. Idempotent: after it fires the service is
+            // `Stopping` with a deadline, and a second call returns on the
+            // state guard.
+            for idx in 0..self.runtime.len() {
+                self.begin_stop(idx, now);
+            }
             let tick = self.reconcile_now(now);
             self.execute(&tick.actions, now);
             if !tick.changed.is_empty() {
@@ -456,13 +471,25 @@ impl Sup {
     /// need no descriptor, only a moment to retry, and ignoring the `timeout_ms`
     /// half is what makes them work for the first 250 ms and then stop working
     /// forever. The cap is the floor under all of it.
-    fn arm(&mut self, now: u64) -> u64 {
+    ///
+    /// `None` — no deadline at all — means sleep until a descriptor fires.
+    /// A settled machine takes it: the registrations above stay in place,
+    /// so latency is unchanged and the idle burn goes to ~zero. It is an
+    /// `Option`, not a huge number, because the backends narrow timeouts to
+    /// their own integer widths: a fake-huge deadline wraps a kqueue
+    /// `tv_sec` negative and the wait fails instead of sleeping.
+    fn arm(&mut self, now: u64) -> Option<u64> {
         let mut deadline = now.saturating_add(WAIT_CAP_MS);
+        // True while nothing the loop can see asks to wake it: everything
+        // running or done, no probes, no watchdogs, no demand listeners,
+        // no restart owed.
+        let mut settled = true;
         for idx in 0..self.runtime.len() {
             let need = self.slots[idx].svc.poll_need(now);
             self.resync(idx, need.fd);
             if let Some(at) = need.timeout_ms {
                 deadline = deadline.min(at);
+                settled = false;
             }
             let core = self.runtime.get(idx);
             for at in [core.ready_due_at, core.start_due_at, core.stop_due_at]
@@ -470,6 +497,7 @@ impl Sup {
                 .flatten()
             {
                 deadline = deadline.min(at);
+                settled = false;
             }
             // A restart the core is holding back. `Bucket` does not say when its
             // delay expires, but the plan does — and waking one `delay_ms` from
@@ -491,6 +519,7 @@ impl Sup {
             if waiting {
                 let delay = sp.restart_budget.delay_ms.max(MIN_RESTART_TICK_MS);
                 deadline = deadline.min(now.saturating_add(delay));
+                settled = false;
             }
             // A watchdog that expires unnoticed is a hung service kept
             // running: wake in time to catch it, like any other deadline the
@@ -500,6 +529,7 @@ impl Sup {
                 if matches!(core.state, State::Running | State::Starting) {
                     let last = core.last_watchdog_ms.or(core.started_at).unwrap_or(now);
                     deadline = deadline.min(last.saturating_add(secs.saturating_mul(1000)));
+                    settled = false;
                 }
             }
             // A down on-demand service is a connection away from work: cap
@@ -507,9 +537,13 @@ impl Sup {
             // `DEMAND_TICK_MS`, not within a whole idle cap.
             if sp.on_demand && core.desired == Desired::Down && core.state == State::Stopped {
                 deadline = deadline.min(now.saturating_add(DEMAND_TICK_MS));
+                settled = false;
             }
         }
-        deadline.saturating_sub(now)
+        if settled {
+            return None;
+        }
+        Some(deadline.saturating_sub(now))
     }
 
     /// Point the reactor at whatever descriptor service `idx` needs now, and at
@@ -2443,6 +2477,64 @@ mod tests {
         assert!(written.is_empty(), "garbage must not become a file");
         let _ = std::fs::remove_dir_all(&gendir);
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// A settled machine sleeps until a descriptor fires instead of once a
+    /// second, and a start owed still wakes the loop on its restart delay:
+    /// `arm` returns no deadline when nothing pends. The registrations stay
+    /// in place either way, so this buys idle without costing latency.
+    #[test]
+    fn arm_sleeps_forever_when_settled_and_wakes_for_a_start_owed() {
+        let base = scratch("arm-idle");
+        let sock = base.join("ctl");
+        let state = base.join("state");
+        let gen_dir = base.join("gen");
+        let _ = std::fs::create_dir_all(&gen_dir);
+        // SAFETY: no other test in this binary reads `ZINIT_SOCKET` or
+        // `ZINIT_STATE_DIR` — only child-process integration tests use them,
+        // and those are separate processes — so no thread can observe the
+        // swap mid-flight. Removed before return either way.
+        unsafe {
+            std::env::set_var(ctl::SOCKET_ENV, &sock);
+            std::env::set_var(ctl::STATE_DIR_ENV, &state);
+        }
+        // Settled: the one service wants nothing (disabled at boot).
+        let quiet = base.join("quiet");
+        let _ = std::fs::create_dir_all(&quiet);
+        std::fs::write(
+            quiet.join("q.conf"),
+            "command = /bin/true\nready = none\nenabled = no\n",
+        )
+        .expect("write");
+        let (plan, descs) = load(&quiet).expect("quiet loads");
+        let mut sup =
+            Sup::new(plan, descs, vec![quiet.clone()], gen_dir.clone()).expect("supervisor builds");
+        assert_eq!(
+            sup.arm(1_000_000),
+            None,
+            "a settled machine must not wake on a timer"
+        );
+        drop(sup);
+        // Owed: an enabled service that never ran wants up from pass one.
+        let eager = base.join("eager");
+        let _ = std::fs::create_dir_all(&eager);
+        write_conf(&eager, "e");
+        let (plan, descs) = load(&eager).expect("eager loads");
+        let mut sup =
+            Sup::new(plan, descs, vec![eager.clone()], gen_dir.clone()).expect("supervisor builds");
+        let wait = sup
+            .arm(1_000_000)
+            .expect("a start owed must wake the loop on its delay");
+        assert!(
+            wait <= WAIT_CAP_MS,
+            "a start owed must wake the loop on its delay"
+        );
+        drop(sup);
+        unsafe {
+            std::env::remove_var(ctl::SOCKET_ENV);
+            std::env::remove_var(ctl::STATE_DIR_ENV);
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A fresh, empty scratch directory named after `tag`.

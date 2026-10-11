@@ -18,11 +18,15 @@ use std::os::unix::ffi::OsStrExt;
 
 use zrt::report::announce_degradation;
 
-/// Idle tick of the reaper: the upper bound on how long a crashed supervisor
-/// stays down, and the cost of not having SIGCHLD-as-data yet.
-// ponytail: a 50 ms poll, not a signalfd. Waking 20×/s is cheaper than the
-// spare process a dedicated `SIGCHLD` thread would need; the supervisor's
-// event loop is where that belongs.
+/// Idle sleep when there is nothing to wait for. Reachable only with no
+/// children at all — a bare reaper, or every fork failing — where a
+/// blocking wait would answer `ECHILD` instantly, forever. It also paces
+/// supervisor relaunch attempts while forks fail.
+// ponytail: the steady state below does not poll. A blocking `waitpid` is
+// the wakeup source — a dead child returns it at once — so the reaper
+// burns nothing and a crashed supervisor is relaunched immediately, with
+// no signalfd, no thread and no timer. The 50 ms loop this replaces cost
+// a tick a minute and delayed every relaunch by up to a tick.
 const IDLE_MS: u64 = 50;
 
 /// Become PID 1. Diverges, and never panics.
@@ -82,11 +86,13 @@ pub fn run() -> ! {
             }
         }
 
-        match (sup, zrt::sys::waitpid_nohang(-1)) {
+        match (sup, zrt::sys::waitpid_blocking(-1)) {
             // The supervisor died. Say how, then let the top of the loop
-            // relaunch it. Never fatal: a machine without a supervisor is
-            // ungoverned, a machine whose init exited is halted.
-            (Some(pid), Ok(Some(w))) if w.pid == pid => {
+            // relaunch it at once: the wait above already slept until the
+            // death, so there is no tick to wait out. Never fatal: a machine
+            // without a supervisor is ungoverned, a machine whose init
+            // exited is halted.
+            (Some(pid), Ok(w)) if w.pid == pid => {
                 let code = w.status.code();
                 announce_once(
                     &mut last_exit,
@@ -98,13 +104,10 @@ pub fn run() -> ! {
             // Any other child of ours — an orphan the kernel re-parented to
             // PID 1 when its parent died. It means nothing here beyond the
             // obligation to reap it, which is why this arm does nothing.
-            (_, Ok(Some(_))) => {}
-            // Nothing has exited yet (`WNOHANG` returned 0) or there is no
-            // child at all (`ECHILD`, folded into `None` by `zrt`). Both are
-            // the normal idle case.
-            (_, Ok(None)) => {
-                let _ = zrt::clock::sleep_ms(IDLE_MS);
-            }
+            (_, Ok(_)) => {}
+            // No children at all (`ECHILD`): bare reaper, or every fork
+            // failing. Sleep instead of spinning; the top of the loop
+            // retries the spawn past transient fork failures.
             (_, Err(e)) => {
                 announce_once(
                     &mut last_errno,

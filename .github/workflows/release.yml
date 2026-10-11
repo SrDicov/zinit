@@ -1,0 +1,123 @@
+name: release
+
+# Distribution: static musl binaries — one artifact per Linux ISA the
+# project measures, all runnable on any distro (glibc or musl: static
+# needs no host libc). No cross linkers beyond what `ci.yml` already
+# proves: x86_64/i686 need none (self-contained), the rest take the
+# same apt drivers as the `linux-musl-cross` job.
+#
+# Five targets, not six: Rust has no 32-bit RISC-V Linux target, only
+# bare-metal `riscv32*-unknown-none-elf` (no `std`, unusable here).
+# BSD artifacts need a native builder (Cirrus); Linux cannot link them.
+#
+# A tag push (`v*`) builds, packs and publishes. `workflow_dispatch`
+# builds and uploads artifacts without publishing, for pre-tag smokes.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  artifacts:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: i686-unknown-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            apt: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+            apt: gcc-arm-linux-gnueabihf
+            linker: arm-linux-gnueabihf-gcc
+          - os: ubuntu-latest
+            target: riscv64gc-unknown-linux-musl
+            apt: gcc-riscv64-linux-gnu
+            linker: riscv64-linux-gnu-gcc
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install target-aware link driver
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+          echo "CARGO_TARGET_$(echo ${{ matrix.target }} | tr a-z- A-Z_)_LINKER=${{ matrix.linker }}" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: release-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-${{ runner.os }}-${{ matrix.target }}-
+
+      - name: Build
+        run: cargo build --release -p zinit -p zctl --target ${{ matrix.target }}
+
+      - name: Verify static
+        run: |
+          file target/${{ matrix.target }}/release/zinit | tee /tmp/file-zinit
+          grep -qE 'statically linked|static-pie linked' /tmp/file-zinit
+          file target/${{ matrix.target }}/release/zctl | tee /tmp/file-zctl
+          grep -qE 'statically linked|static-pie linked' /tmp/file-zctl
+
+      - name: Smoke (native arch only)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: target/${{ matrix.target }}/release/zinit --version
+
+      - name: Package
+        run: |
+          tag="${GITHUB_REF_NAME:-untagged}"
+          dir="zinit-${tag}-${{ matrix.target }}"
+          mkdir -p "$dir"
+          cp target/${{ matrix.target }}/release/zinit target/${{ matrix.target }}/release/zctl "$dir/"
+          cp scripts/install.sh "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+          sha256sum "$dir.tar.gz" > "$dir.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: zinit-*.tar.gz*
+
+  publish:
+    name: publish
+    needs: artifacts
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" --generate-notes dist/zinit-*.tar.gz dist/zinit-*.sha256
