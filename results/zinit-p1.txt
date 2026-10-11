@@ -1,0 +1,8 @@
+init=zinit-p1
+boot_ms=84
+rss_kb_steady=4276
+rss_kb_after_idle=4276
+idle_ticks_60s=6
+respawn_ms=18
+cage_du_kb=22800
+note=debug-musl-binary-with-P1-not-stripped-release

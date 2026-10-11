@@ -46,9 +46,14 @@ Reading:
 - **idle** (CPU ticks consumed in 60 s): dinit/openrc/sysvinit 0,
   zinit 6, runit/s6 16. runit/s6 churn includes their restart of the
   oneshot `b` (hot loop by design); dinit stops cycling `b` after
-  "restarting too quickly". zinit's 6 ticks are the 1 s reactor cap
-  (`WAIT_CAP_MS`, `sup.rs`); widening it when no deadline pends would
-  read 0 — tracked improvement, no behaviour change (fds wake early).
+  "restarting too quickly". zinit's 6 ticks decomposed by direct
+  measurement (P1, `testing`): the supervisor loop with 2 settled
+  services does **0 wakeups / 0 ticks over 60 s** (sleeps in
+  `epoll_wait` until a descriptor fires); the residual is PID 1's own
+  50 ms reaper poll (`init.rs`, deliberate: no signalfd thread in the
+  governor) — 6 ticks unoptimised-debug, ~1 optimised, so a release P1
+  build reads ~1 full-cage. Pending: re-measure with the tagged
+  release binary (no local toolchain).
 - **respawn** (`kill -9` the sleep → marker rewritten): runit 15 ≈
   zinit 24 ≈ dinit 24 ≪ s6 1046 ≈ sysvinit 1048 ≪ openrc TIMEOUT.
   openrc does not supervise (`openrc-run` without `supervise-daemon`):

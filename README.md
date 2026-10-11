@@ -3,7 +3,7 @@
 > Un init con **un solo concepto** — *estado deseado* — y un reconciliador que lo cumple.
 > Sin shell para la lógica, sin grafos mutables en runtime, sin acuses que falten.
 
-**Estado**: núcleo, configuración y servicio cerrados. **524 tests, 0 warnings de clippy,
+**Estado**: núcleo, configuración y servicio cerrados. **525 tests, 0 warnings de clippy,
 `cargo doc` limpio.**
 
 | Crate | Qué es | Estado | Tests |
@@ -12,7 +12,7 @@
 | `zconfig` | Parser de descripciones, grafo, plan congelado. | ✅ | 296 |
 | `zrt` | `libc`: reactor ×3, señales, seguimiento de hijos, detección de capacidades. | ✅ | 53 |
 | `zservice` | Ciclo de vida, readiness, identidad, rotación de logs. | ✅ | 76 |
-| `zinit` | Binario: `--init` (PID 1) y `--sup` (supervisor) | ✅ | 20 + 12 integración |
+| `zinit` | Binario: `--init` (PID 1) y `--sup` (supervisor) | ✅ | 21 + 12 integración |
 | `zctl` | CLI sobre el socket de control (una trama dentro, una línea fuera) | ✅ | 4 |
 | `zcheck` | `zinit check` — valida sin arrancar | ✅ | 6 |
 
@@ -22,6 +22,19 @@ presupuesto porque nunca corre como PID 1.
 
 El supervisor (`zinit --sup`) ya conecta el reactor de `zrt` con el
 reconciliador de `zcore`, sirve el socket de control y vuelca el estado visible.
+
+## Instalar desde un release
+
+Cada tag `v*` publica `zinit-<tag>-<target>.tar.gz` (binarios musl
+estáticos `zinit` + `zctl`, más `install.sh`) con su `.sha256`, para
+`x86_64` y `aarch64` (workflow `release`).
+
+```sh
+tar xzf zinit-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz
+cd zinit-vX.Y.Z-x86_64-unknown-linux-musl
+./install.sh            # root; --prefix/--destdir disponibles
+zinit check /etc/zinit/services.d
+```
 
 ## Deploy para testing en hardware/VMs
 
@@ -35,9 +48,6 @@ reconciliador de `zcore`, sirve el socket de control y vuelca el estado visible.
 # 2b. O lanzar directamente en QEMU con zinit como PID 1
 ./scripts/zinit-deploy.sh qemu <disk.img> [kernel]
 ```
-
-El binario estático musl también se produce en CI (job `release-musl`) y queda
-disponible como artifact de 30 días en cada push.
 
 ## Bugs de producción que la integración destapó
 
