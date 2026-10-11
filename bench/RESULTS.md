@@ -33,7 +33,7 @@ mtime method (below). Base series 2 + respawn series:
 | dinit | 154 | 4004 | 0 | 24 | 16276 |
 | sysvinit | 69 | 1936 | 0 | 1048 | 9864 |
 | openrc | 500 | 3032 | 0 | TIMEOUT | 14820 |
-| **zinit** | **85** | **2368** | **6** | **24** | **10624** |
+| **zinit** | **78** | **2472** | **0** | **14** | **10628** |
 
 Reading:
 
@@ -58,11 +58,10 @@ Reading:
   and F2 (blocking `waitpid` reaper, `testing`) took PID 1 to
   **0 ticks / 0 wakeups over 60 s** with instant supervisor relaunch
   (kill -9 sup → services back, marker rewritten in 108 ms end to
-  end). Full-cage idle is 0, matching the leaders. The residual in
-  the release table (6) predates F2; re-measure with the tagged
-  release binary.
+  end). Full-cage idle is 0, matching the leaders — confirmed by the
+  v0.0.1 release binary in the harness (table row: 0).
 - **respawn** (`kill -9` the sleep → marker rewritten): runit 15 ≈
-  zinit 24 ≈ dinit 24 ≪ s6 1046 ≈ sysvinit 1048 ≪ openrc TIMEOUT.
+  zinit 14 ≈ dinit 24 ≪ s6 1046 ≈ sysvinit 1048 ≪ openrc TIMEOUT.
   Triplicate (3 extra rounds, mtime method): runit 14–15 rock-stable,
   zinit 14–24, dinit 15–24. zinit ties runit's best case; the ~9 ms
   single-series gap is variance, not a systematic deficit, so no
@@ -76,7 +75,8 @@ Reading:
   runsvdir 22K + runsv 26K, s6-svscan/supervise 26K each,
   dinit 224K, busybox 804K, zinit 766K static-pie (zero runtime deps).
 
-zinit is top-2 in 4 of 5 supervised metrics and never worst.
+zinit holds #1 (tied) in idle and respawn, top-group in boot, and #2
+in RSS and disk — and never worst anywhere.
 
 ## Storm results (`results/storm-<init>.txt`)
 
