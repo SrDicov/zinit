@@ -410,7 +410,7 @@ impl Sup {
             // ever wake this loop up.
             let timeout = if first_pass {
                 first_pass = false;
-                0
+                Some(0)
             } else {
                 self.arm(now)
             };
@@ -422,7 +422,7 @@ impl Sup {
             // What the registrations in `arm` buy is *latency*: a notify that
             // arrives makes `wait` return at once instead of at the next
             // deadline.
-            let _ready = match self.reactor.wait(Some(timeout)) {
+            let _ready = match self.reactor.wait(timeout) {
                 Ok(events) => events,
                 // Not retryable: a loop that cannot wait cannot supervise.
                 // Exiting non-zero is what PID 1 is for, and the services stay
@@ -471,16 +471,18 @@ impl Sup {
     /// need no descriptor, only a moment to retry, and ignoring the `timeout_ms`
     /// half is what makes them work for the first 250 ms and then stop working
     /// forever. The cap is the floor under all of it.
-    fn arm(&mut self, now: u64) -> u64 {
+    ///
+    /// `None` — no deadline at all — means sleep until a descriptor fires.
+    /// A settled machine takes it: the registrations above stay in place,
+    /// so latency is unchanged and the idle burn goes to ~zero. It is an
+    /// `Option`, not a huge number, because the backends narrow timeouts to
+    /// their own integer widths: a fake-huge deadline wraps a kqueue
+    /// `tv_sec` negative and the wait fails instead of sleeping.
+    fn arm(&mut self, now: u64) -> Option<u64> {
         let mut deadline = now.saturating_add(WAIT_CAP_MS);
-        // True while nothing the loop can see asks to wake it. A settled
-        // machine — everything running or done, no probes, no watchdogs,
-        // no demand listeners, no restart owed — then sleeps until a
-        // descriptor fires instead of once a second: the registrations
-        // above stay in place either way, so latency is unchanged and the
-        // idle burn goes to ~zero. The reactor clamps the resulting
-        // `u64::MAX` to its longest finite wait and still returns early on
-        // any event.
+        // True while nothing the loop can see asks to wake it: everything
+        // running or done, no probes, no watchdogs, no demand listeners,
+        // no restart owed.
         let mut settled = true;
         for idx in 0..self.runtime.len() {
             let need = self.slots[idx].svc.poll_need(now);
@@ -539,9 +541,9 @@ impl Sup {
             }
         }
         if settled {
-            return u64::MAX;
+            return None;
         }
-        deadline.saturating_sub(now)
+        Some(deadline.saturating_sub(now))
     }
 
     /// Point the reactor at whatever descriptor service `idx` needs now, and at
@@ -2505,10 +2507,11 @@ mod tests {
         )
         .expect("write");
         let (plan, descs) = load(&quiet).expect("quiet loads");
-        let mut sup = Sup::new(plan, descs, vec![quiet.clone()], gen_dir.clone())
-            .expect("supervisor builds");
-        assert!(
-            sup.arm(1_000_000) > 3_600_000,
+        let mut sup =
+            Sup::new(plan, descs, vec![quiet.clone()], gen_dir.clone()).expect("supervisor builds");
+        assert_eq!(
+            sup.arm(1_000_000),
+            None,
             "a settled machine must not wake on a timer"
         );
         drop(sup);
@@ -2517,10 +2520,13 @@ mod tests {
         let _ = std::fs::create_dir_all(&eager);
         write_conf(&eager, "e");
         let (plan, descs) = load(&eager).expect("eager loads");
-        let mut sup = Sup::new(plan, descs, vec![eager.clone()], gen_dir.clone())
-            .expect("supervisor builds");
+        let mut sup =
+            Sup::new(plan, descs, vec![eager.clone()], gen_dir.clone()).expect("supervisor builds");
+        let wait = sup
+            .arm(1_000_000)
+            .expect("a start owed must wake the loop on its delay");
         assert!(
-            sup.arm(1_000_000) <= WAIT_CAP_MS,
+            wait <= WAIT_CAP_MS,
             "a start owed must wake the loop on its delay"
         );
         drop(sup);
