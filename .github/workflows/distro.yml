@@ -92,3 +92,13 @@ jobs:
           && export PATH="$HOME/.cargo/bin:$PATH"
           && cargo build --workspace --all-targets
           && cargo test --workspace'
+      # The Alpine container builds real musl. Publish its supervisor binary
+      # so a cage can measure it: the artifact is how benchmark claims about
+      # new supervisor code get re-proven without a local toolchain. Debug
+      # profile on purpose — idle-tick and respawn behaviour do not depend
+      # on optimisation, and release numbers ship with tagged releases.
+      - uses: actions/upload-artifact@v4
+        if: matrix.name == 'alpine'
+        with:
+          name: zinit-alpine-debug
+          path: target/debug/zinit
