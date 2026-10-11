@@ -1,6 +1,13 @@
 # Changelog
 
 ## [Unreleased]
+
+## [v0.0.1] - 2026-10-11
+### Release
+- Cinco artefactos musl estáticos (`x86_64`, `i686`, `aarch64`,
+  `armv7`, `riscv64` + `zctl` + `install.sh` + `.sha256`) desde el
+  workflow `release` en cada tag `v*`. Perfil ya optimizado
+  (`lto`, `strip`, `opt-s`, `codegen-units = 1`, `panic = "abort"`).
 ### Reaper bloqueante (bench F2)
 - `init` espera con `waitpid` bloqueante en vez de sondear cada 50 ms:
   0 ticks en reposo (medido: 6 en debug) y relanzo del supervisor

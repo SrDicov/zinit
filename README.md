@@ -27,7 +27,9 @@ reconciliador de `zcore`, sirve el socket de control y vuelca el estado visible.
 
 Cada tag `v*` publica `zinit-<tag>-<target>.tar.gz` (binarios musl
 estáticos `zinit` + `zctl`, más `install.sh`) con su `.sha256`, para
-`x86_64` y `aarch64` (workflow `release`).
+`x86_64`, `i686`, `aarch64`, `armv7` y `riscv64` (workflow `release`).
+Sin RISC-V 32 bits (Rust no lo ofrece con `std`) ni BSD (requiere
+builder nativo); ver `release.yml`.
 
 ```sh
 tar xzf zinit-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz
