@@ -43,19 +43,31 @@ Reading:
   constant container setup (`unshare`+`chroot`), identical for all.
 - **rss** (whole tree: supervisor + helpers + daemons): sysvinit 1936 <
   zinit 2368 < runit 2720 < openrc 3032 < s6 3656 < dinit 4004.
+  Per-process dissection: sysvinit = init 956 + sleep 1048; zinit =
+  reaper 640 + sup 728 + sleep 872. The sup is dominated by binary
+  text (766 KB static-pie, profile already maxed: lto/strip/opt-s/
+  codegen-units-1); retained heap is second-order. Honest ceiling:
+  dieting closes toward ~2100, but #1 stays out of reach without
+  cutting the two-process architecture or the feature set (control
+  plane, readiness, sandboxing, generators) that the 432 KB pays for.
 - **idle** (CPU ticks consumed in 60 s): dinit/openrc/sysvinit 0,
   zinit 6, runit/s6 16. runit/s6 churn includes their restart of the
   oneshot `b` (hot loop by design); dinit stops cycling `b` after
-  "restarting too quickly". zinit's 6 ticks decomposed by direct
-  measurement (P1, `testing`): the supervisor loop with 2 settled
-  services does **0 wakeups / 0 ticks over 60 s** (sleeps in
-  `epoll_wait` until a descriptor fires); the residual is PID 1's own
-  50 ms reaper poll (`init.rs`, deliberate: no signalfd thread in the
-  governor) — 6 ticks unoptimised-debug, ~1 optimised, so a release P1
-  build reads ~1 full-cage. Pending: re-measure with the tagged
-  release binary (no local toolchain).
+  "restarting too quickly". zinit decomposed by direct measurement:
+  P1 took the supervisor loop to **0 wakeups / 0 ticks over 60 s**,
+  and F2 (blocking `waitpid` reaper, `testing`) took PID 1 to
+  **0 ticks / 0 wakeups over 60 s** with instant supervisor relaunch
+  (kill -9 sup → services back, marker rewritten in 108 ms end to
+  end). Full-cage idle is 0, matching the leaders. The residual in
+  the release table (6) predates F2; re-measure with the tagged
+  release binary.
 - **respawn** (`kill -9` the sleep → marker rewritten): runit 15 ≈
   zinit 24 ≈ dinit 24 ≪ s6 1046 ≈ sysvinit 1048 ≪ openrc TIMEOUT.
+  Triplicate (3 extra rounds, mtime method): runit 14–15 rock-stable,
+  zinit 14–24, dinit 15–24. zinit ties runit's best case; the ~9 ms
+  single-series gap is variance, not a systematic deficit, so no
+  reconciler fast-path: skipping the topological passes would trade
+  ordering guarantees for noise-level milliseconds. Rejected by data.
   openrc does not supervise (`openrc-run` without `supervise-daemon`):
   TIMEOUT is the honest answer, not a harness failure. s6/sysvinit
   pace restarts at ~1 Hz by their own cadence.
