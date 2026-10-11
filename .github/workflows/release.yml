@@ -71,6 +71,13 @@ jobs:
           sudo apt-get install -y ${{ matrix.apt }}
           echo "CARGO_TARGET_$(echo ${{ matrix.target }} | tr a-z- A-Z_)_LINKER=${{ matrix.linker }}" >> "$GITHUB_ENV"
 
+      - name: Install zig (for zigbuild)
+        if: matrix.zig != ''
+        run: |
+          python3 -m pip install --user ziglang
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/zig" version
+
       - name: Install zigbuild (riscv64 musl sysroot)
         if: matrix.zig != ''
         run: cargo install --locked cargo-zigbuild
