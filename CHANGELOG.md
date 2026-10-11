@@ -1,6 +1,14 @@
 # Changelog
 
 ## [Unreleased]
+### Cierre v0.0.1: contratos congelados + BSD preparado
+- `CONTRACTS.md`: C1–C7 congelados (sintaxis y capas, generadores,
+  `wants/`, socket de control, entorno del hijo, estado visible,
+  superficie del operador). Cambio incompatible = versión mayor.
+- RV32-Linux cerrado como `blocked-by-upstream` (issue #19): sin
+  target con `std` en Rust, sin hacks.
+- `.cirrus.yml`: test en `--release` + tarea de artefacto FreeBSD en
+  tags (requiere secreto `GITHUB_TOKEN` una vez en la web de Cirrus).
 
 ## [v0.0.1] - 2026-10-11
 ### Release
