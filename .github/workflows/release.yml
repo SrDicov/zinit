@@ -8,10 +8,11 @@ name: release
 #
 # Five targets, not six: Rust has no 32-bit RISC-V Linux target, only
 # bare-metal `riscv32*-unknown-none-elf` (no `std`, unusable here).
-# riscv64 needs a real musl cross toolchain (musl.cc): its apt glibc
-# driver links glibc-dynamic despite the musl target, which the
-# fail-closed `Verify static` step refuses to ship. BSD artifacts need
-# a native builder (Cirrus); Linux cannot link them.
+# riscv64 links through `cargo-zigbuild`: its apt glibc driver links
+# glibc-dynamic despite the musl target (refused by `Verify static`),
+# and musl.cc is unreachable from CI runners. zig ships a real musl
+# sysroot for riscv64, so the artifact is genuine musl-static.
+# BSD artifacts need a native builder (Cirrus); Linux cannot link them.
 #
 # A tag push (`v*`) builds, packs and publishes. `workflow_dispatch`
 # builds and uploads artifacts without publishing, for pre-tag smokes.
@@ -55,7 +56,7 @@ jobs:
             linker: arm-linux-gnueabihf-gcc
           - os: ubuntu-latest
             target: riscv64gc-unknown-linux-musl
-            muslcc: riscv64-linux-musl
+            zig: yes
 
     steps:
       - uses: actions/checkout@v5
@@ -70,13 +71,9 @@ jobs:
           sudo apt-get install -y ${{ matrix.apt }}
           echo "CARGO_TARGET_$(echo ${{ matrix.target }} | tr a-z- A-Z_)_LINKER=${{ matrix.linker }}" >> "$GITHUB_ENV"
 
-      - name: Install musl.cc cross toolchain
-        if: matrix.muslcc != ''
-        run: |
-          curl -sSfL -o /tmp/muslcc.tgz 'https://musl.cc/${{ matrix.muslcc }}-cross.tgz'
-          mkdir -p "$HOME/muslcc" && tar xzf /tmp/muslcc.tgz -C "$HOME/muslcc"
-          echo "$HOME/muslcc/${{ matrix.muslcc }}-cross/bin" >> "$GITHUB_PATH"
-          echo "CARGO_TARGET_$(echo ${{ matrix.target }} | tr a-z- A-Z_)_LINKER=${{ matrix.muslcc }}-gcc" >> "$GITHUB_ENV"
+      - name: Install zigbuild (riscv64 musl sysroot)
+        if: matrix.zig != ''
+        run: cargo install --locked cargo-zigbuild
 
       - uses: actions/cache@v4
         with:
@@ -87,7 +84,12 @@ jobs:
           restore-keys: release-${{ runner.os }}-${{ matrix.target }}-
 
       - name: Build
+        if: matrix.zig == ''
         run: cargo build --release -p zinit -p zctl --target ${{ matrix.target }}
+
+      - name: Build (zigbuild)
+        if: matrix.zig != ''
+        run: cargo zigbuild --release -p zinit -p zctl --target ${{ matrix.target }}
 
       - name: Verify static
         run: |
@@ -95,6 +97,12 @@ jobs:
           grep -qE 'statically linked|static-pie linked' /tmp/file-zinit
           file target/${{ matrix.target }}/release/zctl | tee /tmp/file-zctl
           grep -qE 'statically linked|static-pie linked' /tmp/file-zctl
+          # Static *glibc* would also match above and then break `user =`
+          # (NSS needs dynamic modules): refuse any GNU/dynamic trace.
+          if grep -qE 'for GNU/Linux|interpreter' /tmp/file-zinit /tmp/file-zctl; then
+            echo "::error::glibc contamination in a musl artifact"
+            exit 1
+          fi
 
       - name: Smoke (native arch only)
         if: matrix.target == 'x86_64-unknown-linux-musl'
