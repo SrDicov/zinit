@@ -353,6 +353,23 @@ impl ChildTracker for PidfdTracker {
                 out.push((waited.pid, waited.status));
             }
         }
+        // Orphans: reparented children and double-forked daemons have no
+        // pidfd, so the epoll above never sees them — yet the trait promises
+        // *every* finished child, and under a subreaper an unreaped orphan
+        // is a zombie forever. `waitpid(-1)` only ever returns our own
+        // children; a tracked pid won here first leaves the map, so its
+        // later pidfd firing finds nothing to report (no double-report).
+        // ponytail: the kqueue backend shares this hole; same sweep belongs
+        // there once a BSD leg exists to prove it.
+        loop {
+            match sys::waitpid_nohang(-1)? {
+                Some(waited) => {
+                    self.tracked.remove(&waited.pid);
+                    out.push((waited.pid, waited.status));
+                }
+                None => break,
+            }
+        }
         Ok(out)
     }
 
