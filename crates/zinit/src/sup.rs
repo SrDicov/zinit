@@ -621,13 +621,34 @@ impl Sup {
 
     /// Reap every child that has finished, and hand the fact to the core.
     fn reap(&mut self, now: u64) {
-        let dead = match self.children.reap() {
+        let mut dead = match self.children.reap() {
             Ok(dead) => dead,
             Err(e) => {
                 announce_degradation(&format!("cannot reap children: {e}"));
                 return;
             }
         };
+        // Orphans: reparented children and double-forked daemons have no
+        // pidfd/knote, so the tracker never sees them — yet we are the
+        // subreaper, and an unreaped orphan is a zombie forever.
+        // `waitpid(-1)` only ever returns our own children; unknown pids
+        // fall through to the silent `untrack` below (absent pid is Ok),
+        // so this releases them with no log spam. A tracked pid won here
+        // first still travels the normal slot path, and its later backend
+        // firing finds nothing left to report.
+        // ponytail: one extra syscall per pass when childless (it returns
+        // at once); a dedicated orphan fd would save it at the cost of a
+        // fourth backend to maintain.
+        loop {
+            match zrt::sys::waitpid_nohang(-1) {
+                Ok(Some(waited)) => dead.push((waited.pid, waited.status)),
+                Ok(None) => break,
+                Err(e) => {
+                    announce_degradation(&format!("cannot sweep orphans: {e}"));
+                    break;
+                }
+            }
+        }
         for (pid, status) in dead {
             let idx = self.slots.iter().position(|s| s.svc.pid() == Some(pid));
             if let Some(idx) = idx {

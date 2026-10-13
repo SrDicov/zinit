@@ -616,3 +616,33 @@ fn an_unparseable_config_refuses_to_start() {
     assert_refused(&status, &stderr, "an unparseable service description");
     assert_nothing_left_running(&scratch, &["good.pid"]);
 }
+
+/// An orphaned grandchild must be reaped, not left a zombie.
+///
+/// The supervisor is the child subreaper, so a service that forks and exits
+/// leaves its child to us. The pidfd backend only watches pids it started;
+/// the reap loop must additionally sweep `waitpid(-1)` or the orphan answers
+/// `kill(pid, 0)` forever. `pid_gone` (ESRCH) is the whole assertion: a
+/// zombie still answers liveness probes, so "alive" would pass on a corpse.
+#[test]
+fn a_reparented_orphan_is_reaped_not_left_a_zombie() {
+    let _one = serial();
+    let scratch = Scratch::new("orphan");
+    scratch.conf(
+        "forker.conf",
+        &desc(
+            &format!("sleep 30 & echo $! > {}", scratch.at("gc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    let gc = sup.await_live_pid("gc.pid", START_DEADLINE_MS);
+    // The service exited at once; the grandchild belongs to the supervisor
+    // now. Kill it and require collection, not a corpse.
+    signal(gc, libc::SIGKILL);
+    assert!(
+        wait_until(REAP_DEADLINE_MS, || pid_gone(gc)),
+        "orphan {gc} was never reaped: it still answers kill(0), \
+         so a zombie is sitting under the supervisor"
+    );
+}
