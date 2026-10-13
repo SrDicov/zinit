@@ -623,6 +623,16 @@ jobs:
             exit 1
           fi
           echo "tree is workspace crates + libc only"
+      - name: Build the control client too
+        run: cargo build -p zctl --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zinit-linux-x86_64-glibc
+          path: |
+            target/release/zinit
+            target/release/zctl
+          if-no-files-found: error
+          retention-days: 14
 
   # ══════════════════════════════════════════════════════════════════════════
   # 9. MSRV, docs, and a nightly smoke build.
