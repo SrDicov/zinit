@@ -1131,10 +1131,13 @@ impl Sup {
             } else {
                 let log = open_log(sp);
                 // A reload during an operator stop must not resurrect: new
-                // services join the stop, they do not outvote it.
+                // services join the stop, they do not outvote it. Otherwise a
+                // newcomer follows the same rule as boot: only `enabled`
+                // services want up (an `enabled = no` service arriving via
+                // reload-all stays down until an operator starts it).
                 if self.stopping {
                     new_runtime.set_desired(new_idx, Desired::Down);
-                } else {
+                } else if new_plan.services[new_idx].enabled {
                     new_runtime.set_desired(new_idx, Desired::Up);
                 }
                 new_slots.push(Slot {

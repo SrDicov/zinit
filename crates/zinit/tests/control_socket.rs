@@ -359,6 +359,54 @@ fn reload_all_preserves_live_pids() {
     assert!(pid_alive(before), "reload took the survivor with it");
 }
 
+/// A reload newcomer with `enabled = no` stays down: the boot rule (only
+/// `enabled` services want up) applies to arrivals, not just to the first
+/// load — otherwise a convert+reload on a live system would start services
+/// (sshd and friends) that dinit never pulled.
+#[test]
+fn reload_newcomer_honors_enabled() {
+    let scratch = Scratch::new("reload-enabled");
+    let pid_a = scratch.dir.join("a.pid");
+    scratch.conf("a.conf", &sleeper(&pid_a.display().to_string(), 30));
+    let mut sup = Sup::start(&scratch);
+    assert!(
+        wait_until(START_DEADLINE_MS, || pidfile_pid(&pid_a).is_some()),
+        "service a never started"
+    );
+    sup.services.push(pidfile_pid(&pid_a).expect("pidfile has a pid"));
+
+    // b arrives disabled, c arrives enabled: same reload, opposite fates.
+    let pid_b = scratch.dir.join("b.pid");
+    let pid_c = scratch.dir.join("c.pid");
+    scratch.conf(
+        "b.conf",
+        &(sleeper(&pid_b.display().to_string(), 30) + "enabled = no\n"),
+    );
+    scratch.conf("c.conf", &sleeper(&pid_c.display().to_string(), 30));
+    let mut ctl = Ctl::connect(&scratch.sock());
+    let reply = ctl.ask("C 1 reload-all\n");
+    assert_eq!(reply, "R 1 0 3 services", "reload reply: {reply}");
+
+    assert!(
+        wait_until(START_DEADLINE_MS, || pidfile_pid(&pid_c).is_some()),
+        "enabled newcomer c never started"
+    );
+    sup.services.push(pidfile_pid(&pid_c).expect("pidfile has a pid"));
+
+    // Down means down: half a second is an eternity for a service that
+    // wants up, and b must not even have a pid.
+    sleep_ms(500);
+    assert!(
+        pidfile_pid(&pid_b).is_none(),
+        "disabled newcomer b started anyway"
+    );
+    let reply = ctl.ask("C 2 status b\n");
+    assert!(
+        reply.contains("stopped") && reply.contains("desired=down"),
+        "disabled newcomer status: {reply}"
+    );
+}
+
 #[test]
 fn demand_start_wakes_on_connection() {
     use std::net::TcpStream;
