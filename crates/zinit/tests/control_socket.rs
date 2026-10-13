@@ -373,7 +373,8 @@ fn reload_newcomer_honors_enabled() {
         wait_until(START_DEADLINE_MS, || pidfile_pid(&pid_a).is_some()),
         "service a never started"
     );
-    sup.services.push(pidfile_pid(&pid_a).expect("pidfile has a pid"));
+    sup.services
+        .push(pidfile_pid(&pid_a).expect("pidfile has a pid"));
 
     // b arrives disabled, c arrives enabled: same reload, opposite fates.
     let pid_b = scratch.dir.join("b.pid");
@@ -391,7 +392,8 @@ fn reload_newcomer_honors_enabled() {
         wait_until(START_DEADLINE_MS, || pidfile_pid(&pid_c).is_some()),
         "enabled newcomer c never started"
     );
-    sup.services.push(pidfile_pid(&pid_c).expect("pidfile has a pid"));
+    sup.services
+        .push(pidfile_pid(&pid_c).expect("pidfile has a pid"));
 
     // Down means down: half a second is an eternity for a service that
     // wants up, and b must not even have a pid.
