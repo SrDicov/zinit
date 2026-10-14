@@ -316,7 +316,10 @@ mod tests {
     fn a_stopped_service_with_a_stale_deadline_is_caught() {
         let mut s = ServiceState::new();
         s.stop_due_at = Some(500);
-        assert!(!s.invariants_hold(false, true), "a stale timer must be caught");
+        assert!(
+            !s.invariants_hold(false, true),
+            "a stale timer must be caught"
+        );
     }
 
     #[test]
