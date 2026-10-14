@@ -304,12 +304,15 @@ impl Sup {
         }
 
         let mut slots = Vec::with_capacity(plan.services.len());
-        for (idx, (sp, desc)) in plan.services.iter().zip(descs).enumerate() {
-            let log = open_log(sp);
+        for (idx, (_sp, desc)) in plan.services.iter().zip(descs).enumerate() {
+            // ponytail: the log opens on first use, not here. Ninety open
+            // log files pin the rootfs busy and break an early
+            // remount,ro (root-ro); dinit opens per-service at start for
+            // the same reason. See log_line.
             slots.push(Slot {
                 svc: ManagedService::new(idx),
                 desc,
-                log,
+                log: None,
                 registered: None,
             });
         }
@@ -1150,7 +1153,8 @@ impl Sup {
                 slot.desc = new_descs[new_idx].take();
                 new_slots.push(slot);
             } else {
-                let log = open_log(sp);
+                // Log opens lazily (see the boot path): pre-opening every
+                // newcomer's sink would re-pin the rootfs the same way.
                 // A reload during an operator stop must not resurrect: new
                 // services join the stop, they do not outvote it. Otherwise a
                 // newcomer follows the same rule as boot: only `enabled`
@@ -1164,7 +1168,7 @@ impl Sup {
                 new_slots.push(Slot {
                     svc: ManagedService::new(new_idx),
                     desc: new_descs[new_idx].take(),
-                    log,
+                    log: None,
                     registered: None,
                 });
             }
@@ -1438,8 +1442,15 @@ impl Sup {
         let Some(slot) = self.slots.get_mut(idx) else {
             return;
         };
+        if slot.log.is_none() {
+            // First use opens the sink (see the boot path). A failing
+            // sink announces on each attempt until one succeeds; those
+            // attempts only happen on lifecycle events, which the restart
+            // budget already throttles, so this cannot flood.
+            let sp = &self.plan.services[idx];
+            slot.log = open_log(sp);
+        }
         let Some(handle) = slot.log.as_mut() else {
-            // No sink: the failure to open it was announced once, at load time.
             return;
         };
         if let Err(e) = write_line(handle, line.as_bytes()) {
