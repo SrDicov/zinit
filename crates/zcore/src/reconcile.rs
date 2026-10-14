@@ -335,6 +335,10 @@ mod tests {
             !t.actions.iter().any(|a| matches!(a, Action::Spawn(0))),
             "a target must never fork: {t:?}"
         );
+        assert!(
+            rt.check_invariants(&p).is_empty(),
+            "a Running target with no pid is by design, not a violation"
+        );
     }
 
     #[test]

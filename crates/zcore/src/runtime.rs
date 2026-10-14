@@ -117,7 +117,11 @@ impl ServiceState {
     ///
     /// Checked after every transition; a violation is always a core bug and
     /// is surfaced rather than papered over.
-    pub fn invariants_hold(&self, ready_is_handshook: bool) -> bool {
+    ///
+    /// `has_process` is the service's kind (`ServiceKind::has_process`): a
+    /// target is Running with no pid by design, and must not trip the
+    /// pid check that catches a real process losing track of its child.
+    pub fn invariants_hold(&self, ready_is_handshook: bool, has_process: bool) -> bool {
         match self.state {
             State::Stopped => {
                 // Nothing may be set that implies a live process or a pending
@@ -140,7 +144,7 @@ impl ServiceState {
                     && (self.ready_due_at.is_some() == ready_is_handshook)
             }
             State::Running => {
-                self.pid.is_some()
+                (self.pid.is_some() || !has_process)
                     && self.started_at.is_some()
                     && self.ready_due_at.is_none()
                     && self.start_due_at.is_none()
@@ -242,7 +246,7 @@ impl Runtime {
             .iter()
             .enumerate()
             .filter(|(idx, sp)| {
-                !self.services[*idx].invariants_hold(sp.ready.is_handshake())
+                !self.services[*idx].invariants_hold(sp.ready.is_handshake(), sp.kind.has_process())
                     // Completion is a oneshot-only fact. Anywhere else it
                     // means the machine recorded a meaning the plan never gave.
                     || (self.services[*idx].completed && sp.kind != ServiceKind::Oneshot)
@@ -304,35 +308,35 @@ mod tests {
     fn fresh_service_is_stopped_and_clean() {
         let s = ServiceState::new();
         assert_eq!(s.state, State::Stopped);
-        assert!(s.invariants_hold(false));
-        assert!(s.invariants_hold(true));
+        assert!(s.invariants_hold(false, true));
+        assert!(s.invariants_hold(true, true));
     }
 
     #[test]
     fn a_stopped_service_with_a_stale_deadline_is_caught() {
         let mut s = ServiceState::new();
         s.stop_due_at = Some(500);
-        assert!(!s.invariants_hold(false), "a stale timer must be caught");
+        assert!(!s.invariants_hold(false, true), "a stale timer must be caught");
     }
 
     #[test]
     fn starting_requires_a_pid_and_a_start_deadline() {
         let mut s = ServiceState::new();
         s.state = State::Starting;
-        assert!(!s.invariants_hold(false), "no pid yet");
+        assert!(!s.invariants_hold(false, true), "no pid yet");
         s.pid = Some(42);
         s.started_at = Some(0);
         s.start_due_at = Some(100);
         assert!(
-            s.invariants_hold(false),
+            s.invariants_hold(false, true),
             "no handshake, so no ready deadline"
         );
         s.ready_due_at = Some(50);
         assert!(
-            !s.invariants_hold(false),
+            !s.invariants_hold(false, true),
             "ready deadline needs a handshake"
         );
-        assert!(s.invariants_hold(true));
+        assert!(s.invariants_hold(true, true));
     }
 
     #[test]
