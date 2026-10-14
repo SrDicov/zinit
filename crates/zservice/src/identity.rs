@@ -343,6 +343,23 @@ pub fn ensure_cgroup(service: &str, cgroup: &str) -> io::Result<PathBuf> {
                 return Err(e);
             }
         }
+        // The directory existing says nothing: on a plain directory
+        // (cgroup2 not mounted) the child's open of cgroup.procs fails
+        // with a bare ENOENT far from here. Fail now, loudly, naming
+        // the actual cause, while the service name is still attached.
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .open(&procs)
+            .is_err()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "service `{service}`: {} not writable; is a cgroup2 filesystem mounted on /sys/fs/cgroup?",
+                    procs.display()
+                ),
+            ));
+        }
         Ok(procs)
     }
 }
@@ -484,6 +501,23 @@ mod tests {
     fn unknown_user_is_not_found() {
         let e = resolve_user("zinit-no-such-user-xyz").expect_err("must fail");
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn cgroup_without_a_cgroupfs_fails_loudly() {
+        // A plain directory is not a cgroup hierarchy: the child's open
+        // of cgroup.procs would die with a bare ENOENT far from any
+        // context. The parent must name the cause while it still can.
+        let dir = std::env::temp_dir().join(format!("zinit-cgroup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let e = ensure_cgroup("probe", dir.to_str().expect("tmpdir is UTF-8"))
+            .expect_err("plain dir, no cgroup.procs inside");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("cgroup2"),
+            "must name the missing filesystem, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
