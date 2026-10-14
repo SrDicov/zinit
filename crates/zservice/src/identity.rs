@@ -504,6 +504,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn cgroup_without_a_cgroupfs_fails_loudly() {
         // A plain directory is not a cgroup hierarchy: the child's open
         // of cgroup.procs would die with a bare ENOENT far from any
