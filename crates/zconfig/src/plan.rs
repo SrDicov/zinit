@@ -169,7 +169,7 @@ fn freeze(graph: &Graph, findings: &mut Vec<Diagnostic>) -> core::result::Result
     // Order-only cycles hang the boot worse than required cycles do (two
     // services waiting on each other's first attempt, forever, with no error
     // to report), so they are fatal here too, with the same path report.
-    if let Some(err) = check_after_acyclic(graph) {
+    if let Some(err) = check_order_acyclic(graph) {
         return Err(err);
     }
     let mut order_down = order_up.clone();
@@ -428,17 +428,18 @@ fn find_cycle(graph: &Graph, placed: &[bool]) -> Vec<Idx> {
     vec![start]
 }
 
-/// `Some(GraphError::Cycle { path })` if `graph` has an order-only (`after`)
-/// cycle, with the actual cycle in it.
+/// `Some(GraphError::Cycle { path })` if `graph` has an order deadlock:
+/// a cycle in required ∪ after edges, with the actual cycle in it.
 ///
-/// Required cycles break the topological order, so Kahn finds them. `after`
-/// edges never enter the indegree, so a mutual wait (`a` after `b`, `b` after
-/// `a`) would pass ordering and then hang the boot: two services waiting on
-/// each other's first attempt, forever, with no error to report. Fatal here,
-/// with the same path report, for the same reason. Iterative DFS over the
-/// after-CSR; a self-edge is already rejected at parse (E016), so any loop
-/// found here has length ≥ 2.
-fn check_after_acyclic(graph: &Graph) -> Option<GraphError> {
+/// Required-only cycles break the topological order, so Kahn finds them
+/// first; `after`-only mutual waits (`a` after `b`, `b` after `a`) would
+/// pass ordering and then hang the boot, and so would a mixed loop (a
+/// required edge one way, an order-only edge back: each side waits on the
+/// other and neither ever attempts). Fatal here, with the same path
+/// report, for the same reason. Iterative DFS over both CSRs, required
+/// rows before after rows; a self-edge is already rejected at parse
+/// (E016), so any loop found here has length ≥ 2.
+fn check_order_acyclic(graph: &Graph) -> Option<GraphError> {
     let n = graph.len();
     // 0 = unvisited, 1 = on stack, 2 = done. `step` resumes each node's
     // adjacency scan after a descent, so the walk is iterative.
@@ -452,9 +453,15 @@ fn check_after_acyclic(graph: &Graph) -> Option<GraphError> {
         stack.push(start);
         mark[start] = 1;
         while let Some(&i) = stack.last() {
-            let deps = graph.after_of(i);
-            if step[i] < deps.len() {
-                let d = deps[step[i]];
+            let req = graph.required_of(i);
+            let aft = graph.after_of(i);
+            let total = req.len() + aft.len();
+            if step[i] < total {
+                let d = if step[i] < req.len() {
+                    req[step[i]]
+                } else {
+                    aft[step[i] - req.len()]
+                };
                 step[i] += 1;
                 if mark[d] == 1 {
                     let at = stack.iter().position(|&p| p == d).unwrap_or(0);
@@ -478,6 +485,7 @@ fn check_after_acyclic(graph: &Graph) -> Option<GraphError> {
     }
     None
 }
+
 /// Freeze one service: description + resolved indices + resolved policy.
 fn service_plan(graph: &Graph, i: Idx, findings: &mut Vec<Diagnostic>) -> ServicePlan {
     let d = graph.desc(i);
@@ -1275,6 +1283,23 @@ mod tests {
             GraphError::Cycle { path } => {
                 assert_eq!(path.first(), path.last(), "a cycle must close: {path:?}");
                 assert!(path.contains(&String::from("a")) && path.contains(&String::from("b")));
+            }
+            other => panic!("expected Cycle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_mixed_required_after_loop_is_fatal() {
+        // Required one way, order-only back: each side waits on the other
+        // (one for Running, one for the first attempt) and neither ever
+        // attempts. Same hang as a pure cycle, same fatal report.
+        let a = desc_with("a", ServiceKind::Process, &["b"], &[]);
+        let mut b = desc_with("b", ServiceKind::Process, &[], &[]);
+        b.depends_after = vec![String::from("a")];
+        let err = build_plan(&[a, b]).expect_err("mixed loop must not freeze");
+        match err {
+            GraphError::Cycle { path } => {
+                assert_eq!(path.first(), path.last(), "a cycle must close: {path:?}");
             }
             other => panic!("expected Cycle, got {other:?}"),
         }

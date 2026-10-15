@@ -237,18 +237,23 @@ impl Runtime {
 
     /// Order-only gate: every `after` edge must have been *attempted*.
     ///
-    /// Attempted is deliberately weaker than up: completed, running,
-    /// starting, stopping, failed (`failed_starts`/`last_exit`), suppressed,
-    /// and operator-stopped (`Desired::Down`, i.e. disabled at load) all
-    /// release the waiter. Only a dependency that is wanted, never ran, and
-    /// could still run holds the gate. That is what makes `after` ordering
-    /// without gating: a dead early oneshot delays its followers, it never
-    /// wedges them — unlike a failed *required* dependency, which does.
+    /// Weaker than up, stronger than forked: a started daemon releases
+    /// (its effects unfold over its lifetime, as under dinit), while a
+    /// started *oneshot* does not — its effects land at completion, and
+    /// releasing on `Starting` races them (the Artix ro→rw remount lost
+    /// to a waiter that spawned mid-`mount`). Completed, running, failed,
+    /// suppressed, and operator-stopped (`Desired::Down`, i.e. disabled
+    /// at load) all release: a failed dependency releases even when a
+    /// retry is coming, so the waiter runs alongside the retry instead
+    /// of wedging behind it. Only a dependency that is wanted and never
+    /// attempted, or is a mid-flight oneshot, holds the gate.
     pub fn after_satisfied(&self, idx: Idx, plan: &Plan) -> bool {
         plan.services[idx].after.iter().all(|&d| {
             let s = &self.services[d];
+            let oneshot = plan.services[d].kind == ServiceKind::Oneshot;
             s.completed
-                || matches!(s.state, State::Starting | State::Running | State::Stopping)
+                || matches!(s.state, State::Running | State::Stopping)
+                || (s.state == State::Starting && !oneshot)
                 || s.desired == Desired::Down
                 || s.restart_suppressed
                 || s.failed_starts > 0

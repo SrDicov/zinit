@@ -352,6 +352,26 @@ mod tests {
     }
 
     #[test]
+    fn after_holds_while_a_oneshot_is_mid_flight() {
+        // A started daemon releases (effects unfold over its lifetime),
+        // but a started oneshot does not: its effects land at completion.
+        // Releasing on Starting raced the Artix ro→rw remount.
+        let mut p = build(&[("a", &[]), ("b", &[])]);
+        let (a, b) = (p.index_of("a").unwrap(), p.index_of("b").unwrap());
+        p.services[a].kind = ServiceKind::Oneshot;
+        p.services[b].after = vec![a];
+        let mut rt = Runtime::from_plan(&p);
+        rt.set_desired(a, Desired::Up);
+        rt.set_desired(b, Desired::Up);
+        rt.get_mut(a).state = State::Starting;
+        let t = reconcile(&mut rt, &p, 0);
+        assert!(spawned(&t).is_empty(), "mid-oneshot holds b: {t:?}");
+        rt.get_mut(a).completed = true;
+        let t = reconcile(&mut rt, &p, 0);
+        assert_eq!(spawned(&t), vec![b], "completed oneshot releases b: {t:?}");
+    }
+
+    #[test]
     fn after_releases_on_terminal_outcomes() {
         // Completed, failed, suppressed, and disabled all release: order
         // without gating, so a dead early oneshot delays followers but
@@ -363,7 +383,7 @@ mod tests {
             |rt: &mut Runtime, a: Idx| rt.get_mut(a).failed_starts = 1,
             |rt: &mut Runtime, a: Idx| rt.get_mut(a).restart_suppressed = true,
         ];
-        for (n, setup) in terminals.iter().enumerate() {
+        for setup in terminals {
             let mut p = build(&[("a", &[]), ("b", &[])]);
             let (a, b) = (p.index_of("a").unwrap(), p.index_of("b").unwrap());
             p.services[a].kind = ServiceKind::Oneshot;
@@ -374,9 +394,10 @@ mod tests {
             setup(&mut rt, a);
             let t = reconcile(&mut rt, &p, 0);
             let got = spawned(&t);
-            assert!(got.contains(&b), "case {n}: terminal a releases b: {t:?}");
-            if n != 1 {
-                assert_eq!(got, vec![b], "case {n}: settled a stays down: {t:?}");
+            assert!(got.contains(&b), "terminal a releases b: {t:?}");
+            if got.contains(&a) {
+                // The failed (retryable) case also respawns a itself.
+                assert_eq!(got, vec![a, b], "retry rides along: {t:?}");
             }
         }
         // Disabled (desired down) releases too.
