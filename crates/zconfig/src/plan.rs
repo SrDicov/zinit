@@ -1272,8 +1272,7 @@ mod tests {
         // A mutual wait hangs the boot with no error to report, so like a
         // required cycle it fails at load, naming the loop.
         let err = build_plan(&[after_desc("a", &["b"]), after_desc("b", &["a"])])
-            .err()
-            .expect("mutual after must not freeze");
+            .expect_err("mutual after must not freeze");
         match err {
             GraphError::Cycle { path } => {
                 assert_eq!(path.first(), path.last(), "a cycle must close: {path:?}");
