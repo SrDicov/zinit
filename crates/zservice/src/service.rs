@@ -360,11 +360,11 @@ impl ManagedService {
     /// Drain the exec-error pipe once.
     ///
     /// `Some(ExecOk)` on `EOF` (the image was replaced — the first point at
-    /// which the process counts as real), `Some(SpawnFailed{errno})` on four
-    /// bytes (whatever failed in the child, with its errno; a second
-    /// diagnostic word naming the step may follow and is discarded here),
-    /// `None` while inconclusive. The pipe is closed on the first conclusive
-    /// read; later calls answer `None` without touching the kernel.
+    /// which the process counts as real), `Some(SpawnFailed{errno, step})`
+    /// on eight bytes (whatever failed in the child, with its errno and its
+    /// pre-exec step tag; see `spawn::child_step_name`), `None` while
+    /// inconclusive. The pipe is closed on the first conclusive read; later
+    /// calls answer `None` without touching the kernel.
     ///
     /// Known race, documented: a child killed between `fork` and `exec` also
     /// reads as `EOF`. The supervisor correlates with the reaper — a
@@ -376,7 +376,7 @@ impl ManagedService {
             Some(f) => f,
             None => return Ok(None),
         };
-        let mut buf = [0u8; 4];
+        let mut buf = [0u8; 8];
         let mut got = 0;
         loop {
             let mut one = [0u8; 1];
@@ -398,12 +398,14 @@ impl ManagedService {
                 Ok(_) => {
                     buf[got] = one[0];
                     got += 1;
-                    if got == 4 {
-                        let errno = u32::from_le_bytes(buf) as i32;
+                    if got == 8 {
+                        let errno = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as i32;
+                        let step = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
                         self.close_exec_fd();
                         return Ok(Some(Event::SpawnFailed {
                             idx: self.idx,
                             errno,
+                            step,
                         }));
                     }
                 }

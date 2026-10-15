@@ -809,9 +809,9 @@ fn child_main(p: ChildPlan) -> ! {
 /// budget on it like any other failed start. Never silent, never special.
 ///
 /// Eight bytes go down the pipe: the errno first, then the failing step
-/// (see `CHILD_STEP_*`). Production readers (`poll_exec`) consume the first
-/// four and close — the step word is diagnostic only, discarded with the
-/// close — while tests drain all eight to name the culprit.
+/// (see `CHILD_STEP_*`). Production readers (`poll_exec`) consume all
+/// eight and report both; the supervisor announces the step name for the
+/// operator's log.
 fn child_fail(exec_w: RawFd, step: u32) -> ! {
     let errno = io::Error::last_os_error()
         .raw_os_error()
@@ -838,6 +838,30 @@ fn child_fail(exec_w: RawFd, step: u32) -> ! {
 /// Numbers, not names: the child may not allocate or format. Order follows
 /// `child_main`.
 const CHILD_STEP_SIGMASK: u32 = 1;
+/// Name a pre-exec child step for the operator's log.
+///
+/// The inverse of nothing: the child reports numbers through the exec-error
+/// pipe (see `CHILD_STEP_*`), and this turns them back into the step that
+/// died. Unknown numbers (a newer child than this supervisor) report as
+/// `"child"`, never panic: the number is data, and data does not get to
+/// crash PID 1's deputy.
+pub fn child_step_name(step: u32) -> &'static str {
+    match step {
+        CHILD_STEP_SIGMASK => "sigmask",
+        CHILD_STEP_SESSION => "session",
+        CHILD_STEP_FDS => "fds",
+        CHILD_STEP_CHDIR => "chdir",
+        CHILD_STEP_RLIMITS => "rlimits",
+        CHILD_STEP_CGROUP => "cgroup",
+        CHILD_STEP_IDS => "ids",
+        CHILD_STEP_CAPDROP => "capdrop",
+        CHILD_STEP_CTTY => "ctty",
+        CHILD_STEP_SECCOMP => "seccomp",
+        CHILD_STEP_EXECVE => "execve",
+        CHILD_STEP_MOUNT => "mount",
+        _ => "child",
+    }
+}
 const CHILD_STEP_SESSION: u32 = 2;
 const CHILD_STEP_FDS: u32 = 3;
 const CHILD_STEP_CHDIR: u32 = 4;

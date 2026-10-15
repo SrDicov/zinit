@@ -697,6 +697,19 @@ impl Sup {
                 }
             };
             if let Some(event) = exec {
+                // A child that died on the way to execve names its step
+                // through the pipe; say it once (the announce record
+                // dedups repeats) so the log holds more than an errno.
+                if let Event::SpawnFailed { errno, step, .. } = &event {
+                    if *step != 0 {
+                        let name = self.name_of(idx);
+                        let cause = std::io::Error::from_raw_os_error(*errno);
+                        announce_degradation(&format!(
+                            "{name}: child failed at {} ({cause})",
+                            zservice::spawn::child_step_name(*step)
+                        ));
+                    }
+                }
                 self.feed(&event, now);
             }
 
@@ -1360,7 +1373,14 @@ impl Sup {
             let errno = e.raw_os_error().unwrap_or(libc::EIO);
             let name = self.name_of(idx);
             announce_degradation(&format!("{name}: cannot bind listen sockets ({e})"));
-            self.feed(&Event::SpawnFailed { idx, errno }, now);
+            self.feed(
+                &Event::SpawnFailed {
+                    idx,
+                    errno,
+                    step: 0,
+                },
+                now,
+            );
             return;
         }
         let sp = &self.plan.services[idx];
@@ -1410,7 +1430,14 @@ impl Sup {
             };
             let name = self.name_of(idx);
             announce_degradation(&format!("{name}: cannot spawn ({e})"));
-            self.feed(&Event::SpawnFailed { idx, errno }, now);
+            self.feed(
+                &Event::SpawnFailed {
+                    idx,
+                    errno,
+                    step: 0,
+                },
+                now,
+            );
             return;
         }
         // The announcement record stands: "backing off" was already said for

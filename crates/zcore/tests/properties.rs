@@ -166,6 +166,7 @@ fn random_event(rng: &mut Rng, rt: &Runtime, plan: &Plan) -> Event {
             2 => Event::SpawnFailed {
                 idx,
                 errno: 11 + rng.below(5) as i32,
+                step: 0,
             },
             _ => Event::BudgetExhausted(idx),
         },
