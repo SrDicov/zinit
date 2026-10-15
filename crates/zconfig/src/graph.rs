@@ -690,7 +690,9 @@ fn resolve(
                             "{}: unknown order-only dependency {dep:?}, ignored; did you mean {s:?}?",
                             d.name
                         ),
-                        None => format!("{}: unknown order-only dependency {dep:?}, ignored", d.name),
+                        None => {
+                            format!("{}: unknown order-only dependency {dep:?}, ignored", d.name)
+                        }
                     };
                     findings.push(finding(Severity::Warning, d, "W102", message, None));
                 }

@@ -478,8 +478,6 @@ fn check_after_acyclic(graph: &Graph) -> Option<GraphError> {
     }
     None
 }
-
-
 /// Freeze one service: description + resolved indices + resolved policy.
 fn service_plan(graph: &Graph, i: Idx, findings: &mut Vec<Diagnostic>) -> ServicePlan {
     let d = graph.desc(i);

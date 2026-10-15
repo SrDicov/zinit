@@ -1566,9 +1566,8 @@ fn parse_depends(
         let in_required = desc.requires(name);
         let in_optional = desc.depends_optional.iter().any(|n| n == name);
         let in_after = desc.depends_after.iter().any(|n| n == name);
-        let same = (class == 0 && in_required)
-            || (class == 1 && in_optional)
-            || (class == 2 && in_after);
+        let same =
+            (class == 0 && in_required) || (class == 1 && in_optional) || (class == 2 && in_after);
         if same {
             continue;
         }
@@ -1582,13 +1581,19 @@ fn parse_depends(
             // is the failure mode where a typo turns into an outage under
             // load); a fresh name just pushes below.
             if in_optional || in_after {
-                let first = if in_optional { "optional" } else { "order-only" };
+                let first = if in_optional {
+                    "optional"
+                } else {
+                    "order-only"
+                };
                 return Err(ParseError::new(
                     ParseErrorKind::BadList,
                     "E010",
                     entry_span,
                     format!("`{name}` is already declared {first} and is now declared required"),
-                    String::from("pick one: a dependency either gates startup, orders it, or does neither"),
+                    String::from(
+                        "pick one: a dependency either gates startup, orders it, or does neither",
+                    ),
                 ));
             }
         } else if in_optional || in_after {
@@ -2730,10 +2735,19 @@ rlimit-nofile = 8192
     #[test]
     fn soft_lists_contradict_each_other() {
         // opt: ignores, after: waits: no first-wins, the file cannot mean both.
-        assert_eq!(err("command = /bin/true\ndepends = opt:a, after:a\n").code, "E010");
-        assert_eq!(err("command = /bin/true\ndepends = after:a, opt:a\n").code, "E010");
+        assert_eq!(
+            err("command = /bin/true\ndepends = opt:a, after:a\n").code,
+            "E010"
+        );
+        assert_eq!(
+            err("command = /bin/true\ndepends = after:a, opt:a\n").code,
+            "E010"
+        );
         // Required still escalates loudly when second, silently when first.
-        assert_eq!(err("command = /bin/true\ndepends = after:a, a\n").code, "E010");
+        assert_eq!(
+            err("command = /bin/true\ndepends = after:a, a\n").code,
+            "E010"
+        );
         let d = ok("command = /bin/true\ndepends = a, after:a\n");
         assert_eq!(d.depends_required, ["a"]);
         assert!(d.depends_after.is_empty());

@@ -248,10 +248,7 @@ impl Runtime {
         plan.services[idx].after.iter().all(|&d| {
             let s = &self.services[d];
             s.completed
-                || matches!(
-                    s.state,
-                    State::Starting | State::Running | State::Stopping
-                )
+                || matches!(s.state, State::Starting | State::Running | State::Stopping)
                 || s.desired == Desired::Down
                 || s.restart_suppressed
                 || s.failed_starts > 0
