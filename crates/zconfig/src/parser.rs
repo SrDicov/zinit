@@ -1572,8 +1572,16 @@ fn parse_depends(
         if same {
             continue;
         }
-        if in_required || class == 0 {
-            if class == 0 {
+        if in_required {
+            // Required already claimed it: silent, required wins.
+            continue;
+        }
+        if class == 0 {
+            // Required second: E010 only when a soft list claimed it
+            // first (silently upgrading a soft edge to a boot-gating one
+            // is the failure mode where a typo turns into an outage under
+            // load); a fresh name just pushes below.
+            if in_optional || in_after {
                 let first = if in_optional { "optional" } else { "order-only" };
                 return Err(ParseError::new(
                     ParseErrorKind::BadList,
@@ -1583,9 +1591,10 @@ fn parse_depends(
                     String::from("pick one: a dependency either gates startup, orders it, or does neither"),
                 ));
             }
-            continue;
-        }
-        if in_optional || in_after {
+        } else if in_optional || in_after {
+            // `opt:` vs `after:` with no required involved: "ignore it"
+            // and "wait for it" are contradictory instructions the file
+            // cannot resolve.
             return Err(ParseError::new(
                 ParseErrorKind::BadList,
                 "E010",
