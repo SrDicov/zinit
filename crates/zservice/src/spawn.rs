@@ -1054,12 +1054,17 @@ fn child_step_cgroup(p: ChildPlan) -> bool {
         }
         let pid = libc::getpid();
         let (buf, len) = pid_ascii(pid);
+        // Digits are right-aligned (see `pid_range`): writing from zero
+        // would send NUL padding the kernel rejects with EINVAL — every
+        // cgroup= service died pre-exec this way while manual joins
+        // (real digits) worked.
+        let (start, count) = pid_range(&buf, len);
         let mut done = 0;
-        while done < len {
+        while done < count {
             let n = libc::write(
                 fd,
-                buf.as_ptr().add(done).cast::<libc::c_void>(),
-                len - done,
+                buf.as_ptr().add(start + done).cast::<libc::c_void>(),
+                count - done,
             );
             if n <= 0 {
                 libc::close(fd);
@@ -1073,6 +1078,13 @@ fn child_step_cgroup(p: ChildPlan) -> bool {
 }
 
 /// Format a pid as ASCII, on the stack. No allocation, no std.
+/// Byte range of the pid digits in a [`pid_ascii`] buffer: right-aligned,
+///
+/// so the caller writes `buf[start..start + count]` and nothing else.
+fn pid_range(buf: &[u8; 12], len: usize) -> (usize, usize) {
+    (buf.len() - len, len)
+}
+
 fn pid_ascii(pid: i32) -> ([u8; 12], usize) {
     let mut buf = [0u8; 12];
     let mut n = pid as i64;
@@ -1870,29 +1882,15 @@ mod tests {
             let (buf, len) = pid_ascii(n);
             // The digits are right-aligned at the end of the buffer.
             assert_eq!(&buf[buf.len() - len..], want.as_bytes(), "pid {n}");
+            // …and the range the child actually writes holds exactly them.
+            let (start, count) = pid_range(&buf, len);
+            assert_eq!(&buf[start..start + count], want.as_bytes(), "range {n}");
         }
     }
 
     /// Drain the exec-error pipe for a failure message: eight bytes are
     /// `errno` + failing step (see `CHILD_STEP_*`); EOF is a clean exec.
     fn exec_verdict(exec: RawFd) -> String {
-        fn step_name(step: u32) -> &'static str {
-            match step {
-                1 => "sigmask",
-                2 => "session",
-                3 => "fds",
-                4 => "chdir",
-                5 => "rlimits",
-                6 => "cgroup",
-                7 => "ids",
-                8 => "capdrop",
-                9 => "ctty",
-                10 => "seccomp",
-                11 => "execve",
-                12 => "mount",
-                _ => "unknown-step",
-            }
-        }
         let mut ebuf = [0u8; 8];
         let mut egot = 0;
         loop {
@@ -1906,7 +1904,7 @@ mod tests {
                     if egot >= 8 {
                         let errno = u32::from_le_bytes(ebuf[..4].try_into().expect("slice"));
                         let step = u32::from_le_bytes(ebuf[4..].try_into().expect("slice"));
-                        break format!("exec failed at {}: errno {errno}", step_name(step));
+                        break format!("exec failed at {}: errno {errno}", child_step_name(step));
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
