@@ -512,6 +512,14 @@ pub struct ServicePlan {
     pub kind: ServiceKind,
     /// Dependencies that must be `Running` before this service may start.
     pub required: Vec<Idx>,
+    /// Order-only dependencies: this service may not start until each of
+    /// these has been attempted at least once, but their outcome never
+    /// gates it. A failed, suppressed, completed, or disabled `after`
+    /// releases the waiter — otherwise a dead early oneshot would wedge
+    /// the boot exactly the way a missing one would. This is dinit's
+    /// `after`/`waits-for`/`before` semantics; `opt:` (wants/) edges are
+    /// the ones that neither order nor block.
+    pub after: Vec<Idx>,
     pub restart: Restart,
     pub ready: Ready,
     /// Deadline for the process to exist and be confirmed alive.
@@ -576,6 +584,7 @@ impl ServicePlan {
             name,
             kind: ServiceKind::Process,
             required: Vec::new(),
+            after: Vec::new(),
             restart: Restart::default(),
             ready: Ready::default(),
             start_timeout_ms: 60_000,

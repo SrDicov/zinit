@@ -67,7 +67,7 @@ pub fn reconcile(runtime: &mut Runtime, plan: &Plan, now_ms: u64) -> Tick {
         // Targets have no process: they are up exactly when their required
         // dependencies are. No spawn, no budget, no readiness.
         if !sp.kind.has_process() {
-            let deps_ok = runtime.deps_satisfied(idx, plan);
+            let deps_ok = runtime.deps_satisfied(idx, plan) && runtime.after_satisfied(idx, plan);
             let cur = runtime.get(idx).state;
             if deps_ok && cur != State::Running {
                 runtime.get_mut(idx).state = State::Running;
@@ -94,6 +94,11 @@ pub fn reconcile(runtime: &mut Runtime, plan: &Plan, now_ms: u64) -> Tick {
             State::Stopped => {
                 // Should this service be running at all right now?
                 if !runtime.deps_satisfied(idx, plan) {
+                    continue;
+                }
+                // Order-only edges: wait for the first attempt, never for
+                // success. See `after_satisfied` for the release rule.
+                if !runtime.after_satisfied(idx, plan) {
                     continue;
                 }
                 // A death the policy refused to retry. `Desired` is still
@@ -318,6 +323,70 @@ mod tests {
             .collect();
         assert_eq!(spawned.len(), 1, "only 'a' may spawn first: {t:?}");
         assert_eq!(spawned[0], p.index_of("a").unwrap());
+    }
+
+    fn spawned(t: &Tick) -> Vec<Idx> {
+        t.actions
+            .iter()
+            .filter_map(|a| match *a {
+                Action::Spawn(i) => Some(i),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn after_edge_holds_spawn_until_first_attempt() {
+        let mut p = build(&[("a", &[]), ("b", &[])]);
+        let (a, b) = (p.index_of("a").unwrap(), p.index_of("b").unwrap());
+        p.services[b].after = vec![a];
+        let mut rt = Runtime::from_plan(&p);
+        rt.set_desired(a, Desired::Up);
+        rt.set_desired(b, Desired::Up);
+        let t = reconcile(&mut rt, &p, 0);
+        assert_eq!(spawned(&t), vec![a], "b waits for a's attempt: {t:?}");
+        // A mere start (attempt in flight) releases the waiter.
+        rt.get_mut(a).state = State::Starting;
+        let t = reconcile(&mut rt, &p, 0);
+        assert_eq!(spawned(&t), vec![b], "a started, b goes: {t:?}");
+    }
+
+    #[test]
+    fn after_releases_on_terminal_outcomes() {
+        // Completed, failed, suppressed, and disabled all release: order
+        // without gating, so a dead early oneshot delays followers but
+        // never wedges them. A failed (retryable) dependency still spawns
+        // itself alongside the released waiter; completed and suppressed
+        // ones stay down.
+        let terminals: [fn(&mut Runtime, Idx); 3] = [
+            |rt: &mut Runtime, a: Idx| rt.get_mut(a).completed = true,
+            |rt: &mut Runtime, a: Idx| rt.get_mut(a).failed_starts = 1,
+            |rt: &mut Runtime, a: Idx| rt.get_mut(a).restart_suppressed = true,
+        ];
+        for (n, setup) in terminals.iter().enumerate() {
+            let mut p = build(&[("a", &[]), ("b", &[])]);
+            let (a, b) = (p.index_of("a").unwrap(), p.index_of("b").unwrap());
+            p.services[a].kind = ServiceKind::Oneshot;
+            p.services[b].after = vec![a];
+            let mut rt = Runtime::from_plan(&p);
+            rt.set_desired(a, Desired::Up);
+            rt.set_desired(b, Desired::Up);
+            setup(&mut rt, a);
+            let t = reconcile(&mut rt, &p, 0);
+            let got = spawned(&t);
+            assert!(got.contains(&b), "case {n}: terminal a releases b: {t:?}");
+            if n != 1 {
+                assert_eq!(got, vec![b], "case {n}: settled a stays down: {t:?}");
+            }
+        }
+        // Disabled (desired down) releases too.
+        let mut p = build(&[("a", &[]), ("b", &[])]);
+        let (a, b) = (p.index_of("a").unwrap(), p.index_of("b").unwrap());
+        p.services[b].after = vec![a];
+        let mut rt = Runtime::from_plan(&p);
+        rt.set_desired(b, Desired::Up);
+        let t = reconcile(&mut rt, &p, 0);
+        assert_eq!(spawned(&t), vec![b], "down a releases b: {t:?}");
     }
 
     #[test]

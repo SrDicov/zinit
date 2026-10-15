@@ -361,6 +361,11 @@ enum Class {
     /// Waited for, but its absence is tolerated. An unresolved edge here is a
     /// finding and the edge is dropped.
     Optional,
+    /// Orders startup without gating it. An unresolved edge here is a finding
+    /// and the edge is dropped, like optional: dinit tolerates dangling
+    /// `after` targets, and failing the boot over one would trade a delay
+    /// for an outage.
+    After,
 }
 
 /// Deduplicated edges, in index order.
@@ -412,6 +417,11 @@ pub struct Graph {
     /// gate my start" and "which edges do I wait for but survive" are different
     /// questions, and merging them would make the answer unrecoverable.
     optional: Edges,
+    /// Order-only edges, CSR, built the same way.
+    ///
+    /// Third list for the same reason: "wait for the first attempt" is
+    /// neither gating nor ignoring, and the reconciler needs it separately.
+    after: Edges,
 }
 
 impl Graph {
@@ -510,6 +520,7 @@ impl Graph {
         let mut findings: Vec<Diagnostic> = Vec::new();
         let required = resolve(&owned, &by_name, Class::Required, &mut findings)?;
         let optional = resolve(&owned, &by_name, Class::Optional, &mut findings)?;
+        let after = resolve(&owned, &by_name, Class::After, &mut findings)?;
         report_double_qualified_edges(&owned, &required, &optional, &mut findings);
 
         let graph = Graph {
@@ -517,8 +528,10 @@ impl Graph {
             by_name,
             required,
             optional,
+            after,
         };
         debug_assert_eq!(graph.required.offsets.len(), graph.optional.offsets.len());
+        debug_assert_eq!(graph.required.offsets.len(), graph.after.offsets.len());
         Ok((graph, findings))
     }
 
@@ -563,6 +576,11 @@ impl Graph {
     /// Optional edges of a service, deduplicated, ascending.
     pub fn optional_of(&self, idx: Idx) -> &[Idx] {
         self.optional.of(idx)
+    }
+
+    /// Order-only edges of a service, deduplicated, ascending.
+    pub fn after_of(&self, idx: Idx) -> &[Idx] {
+        self.after.of(idx)
     }
 
     /// Every service that declares `dep` as a required dependency.
@@ -617,6 +635,7 @@ fn resolve(
 ) -> core::result::Result<Edges, GraphError> {
     let n = descs.len();
     let optional = class == Class::Optional;
+    let after = class == Class::After;
 
     // `offsets` has `n + 1` entries: the leading 0 makes `of(0)` well defined
     // even when service 0 has no edges at all.
@@ -626,7 +645,9 @@ fn resolve(
     offsets.push(0);
 
     for (i, d) in descs.iter().enumerate() {
-        let names: &Vec<String> = if optional {
+        let names: &Vec<String> = if after {
+            &d.depends_after
+        } else if optional {
             &d.depends_optional
         } else {
             &d.depends_required
@@ -659,6 +680,20 @@ fn resolve(
                     });
                 }
                 Some(target) => row.push(target),
+                None if after => {
+                    // Order-only and unresolvable: waiting on a ghost would
+                    // wedge the waiter, so the edge is dropped with a warning,
+                    // like an unknown optional.
+                    let suggestion = suggest(dep, by_name);
+                    let message = match &suggestion {
+                        Some(s) => format!(
+                            "{}: unknown order-only dependency {dep:?}, ignored; did you mean {s:?}?",
+                            d.name
+                        ),
+                        None => format!("{}: unknown order-only dependency {dep:?}, ignored", d.name),
+                    };
+                    findings.push(finding(Severity::Warning, d, "W102", message, None));
+                }
                 None if optional => {
                     // Optional and unresolvable: tolerable by design, dropped
                     // from the plan, reported to the operator.
@@ -1237,6 +1272,18 @@ mod tests {
             rendered.contains("did you mean"),
             "offers the fix: {rendered}"
         );
+    }
+
+    #[test]
+    fn an_unknown_after_dependency_is_a_warning_not_an_error() {
+        // Dangling order-only edges release immediately at runtime, so like
+        // unknown optionals they warn (W102) and drop, never fail the build.
+        let mut d = desc_with("app", ServiceKind::Process, &[], &[]);
+        d.depends_after.push(String::from("ghost"));
+        let (g, findings) = Graph::build_with_findings(&[d]).expect("only a warning");
+        let app = g.index_of("app").unwrap();
+        assert!(g.after_of(app).is_empty(), "the dangling edge is dropped");
+        assert_eq!(codes(&findings), ["W102"]);
     }
 
     #[test]

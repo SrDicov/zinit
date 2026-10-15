@@ -235,6 +235,30 @@ impl Runtime {
         })
     }
 
+    /// Order-only gate: every `after` edge must have been *attempted*.
+    ///
+    /// Attempted is deliberately weaker than up: completed, running,
+    /// starting, stopping, failed (`failed_starts`/`last_exit`), suppressed,
+    /// and operator-stopped (`Desired::Down`, i.e. disabled at load) all
+    /// release the waiter. Only a dependency that is wanted, never ran, and
+    /// could still run holds the gate. That is what makes `after` ordering
+    /// without gating: a dead early oneshot delays its followers, it never
+    /// wedges them — unlike a failed *required* dependency, which does.
+    pub fn after_satisfied(&self, idx: Idx, plan: &Plan) -> bool {
+        plan.services[idx].after.iter().all(|&d| {
+            let s = &self.services[d];
+            s.completed
+                || matches!(
+                    s.state,
+                    State::Starting | State::Running | State::Stopping
+                )
+                || s.desired == Desired::Down
+                || s.restart_suppressed
+                || s.failed_starts > 0
+                || s.last_exit.is_some()
+        })
+    }
+
     /// Convenience: set the desired state of a service.
     pub fn set_desired(&mut self, idx: Idx, desired: Desired) {
         self.services[idx].desired = desired;

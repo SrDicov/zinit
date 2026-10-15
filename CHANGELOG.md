@@ -1,6 +1,12 @@
 # Changelog
 
 ## [Unreleased]
+### Aristas solo-orden `after:`
+- `depends = after:x` ordena sin bloquear: el servicio espera el primer
+  intento de `x`, nunca su éxito (completado, fallido, suprimido o
+  deshabilitado liberan). Es la semántica de `after`/`waits-for`/`before`
+  de dinit; `opt:` sigue siendo la arista que ni ordena ni bloquea.
+  Ciclos `after` son fatales al cargar, como los requeridos.
 ### Cierre v0.0.1: contratos congelados + BSD preparado
 - `CONTRACTS.md`: C1–C7 congelados (sintaxis y capas, generadores,
   `wants/`, socket de control, entorno del hijo, estado visible,
