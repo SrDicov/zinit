@@ -22,20 +22,22 @@ yet runs from boot, pulled by `agetty`'s live required edge. `enabled = no`
 off the closure remains the convert policy (it decides the model, not
 the run-time rule).
 
-## `on-fatal = reboot` lands stop-all-idle
+## `on-fatal = reboot` reboots for real now
 
-There is no reboot/power path in this build (same reason an
-operator SIGTERM stays idle), so a `reboot`-marked terminal failure
-stops every service and announces the gap loudly instead of
-pretending. See `docs/fatal-policy.md`. A reboot-capable runtime
-replaces that arm, not the core action.
+Power verbs landed (`zctl poweroff|reboot|halt|suspend`, C4, orderly
+stop-all + deadline + breadcrumb in `/var/log/zinit-power.log`), so a
+`reboot`-marked terminal failure stops every service and reboots through
+the same epilogue. `hibernate` stays refused (no resume target).
+See `docs/fatal-policy.md`.
 
 ## compatd answers NAK where dinit acts
 
-`unload`, `SOFTREBOOT`, `KEXEC`, and shutdown verbs are refused
-honestly. TERM to PID 1 is ignored by design (shutdown goes to
-`--sup`: stop-all, stay idle, no poweroff path). Clients that
-reboot via the bus will see the refusal, not a reboot.
+`unload`, `SOFTREBOOT`, `KEXEC` are refused honestly (`hibernate` joins
+them: no resume target). Shutdown verbs now act: HALT/POWEROFF/REBOOT go
+through the supervisor (orderly stop-all + deadline + breadcrumb), and
+`reboot`/`poweroff`/`halt` binaries work again via the socket. TERM to
+PID 1 stays stop-all-stay-idle by design (a Ctrl-C storm must never
+power the machine off); power is an explicit verb, never a signal.
 
 ## Probe-style scripts read "held", not "completed"
 

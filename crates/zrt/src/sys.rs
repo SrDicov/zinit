@@ -181,6 +181,100 @@ pub fn kill_group(pid: i32, sig: Signal) -> io::Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Machine power
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `sync(2)`: flush filesystem buffers before powering off, rebooting, or
+/// sleeping. Cannot fail in any observable way, so there is no `Result` to
+/// check — but the call itself must still happen, which is why it is a
+/// named function and not a comment saying "sync here".
+pub fn sync() {
+    // SAFETY: `sync` takes no arguments and has no preconditions.
+    unsafe {
+        libc::sync();
+    }
+}
+
+/// `reboot(LINUX_REBOOT_CMD_POWER_OFF)`. Only returns on failure.
+pub fn power_off() -> io::Result<()> {
+    // SAFETY: the constant is the kernel's own power-off command; no
+    // pointers cross the boundary.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        if unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        if unsafe { libc::reboot(libc::RB_POWEROFF, core::ptr::null()) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd"
+    )))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "power off needs Linux or FreeBSD",
+        ))
+    }
+}
+
+/// `reboot(LINUX_REBOOT_CMD_RESTART)`. Only returns on failure.
+pub fn reboot() -> io::Result<()> {
+    // SAFETY: as above.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        if unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_RESTART) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // SAFETY: `reboot` takes an int command and a null boot string;
+        // both BSD families share the shape, only the constants differ.
+        if unsafe { libc::reboot(libc::RB_AUTOBOOT, core::ptr::null()) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+/// `reboot(LINUX_REBOOT_CMD_HALT)`: stop the CPU, leave the power on.
+/// Only returns on failure.
+pub fn halt() -> io::Result<()> {
+    // SAFETY: as above.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        if unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_HALT) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // SAFETY: as above.
+        if unsafe { libc::reboot(libc::RB_HALT, core::ptr::null()) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // File descriptors
 // ─────────────────────────────────────────────────────────────────────────────
 

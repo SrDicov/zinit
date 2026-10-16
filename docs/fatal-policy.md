@@ -27,9 +27,10 @@ spawns) with a loud `W103` warning at load naming the ghost. The
 service reads as stopped; its dependents see unmet requirements and
 hold as well. The boot is never failed over it.
 
-## Current limitation
+## Power verbs (landed)
 
-`on-fatal = reboot` stops everything and stays idle: this build has
-no reboot path (same reason SIGTERM stays idle), so it announces the
-gap loudly instead of pretending. A reboot-capable runtime replaces
-that arm, not the core action.
+`on-fatal = reboot` stops everything, then reboots through the power
+epilogue: orderly stop-all (slowest `stop-timeout` + 10s grace), breadcrumb
+in `/var/log/zinit-power.log`, `sync`, then the syscall. Same path as an
+operator `zctl reboot`. SIGTERM stays stop-all-stay-idle: power is explicit
+verbs, never signals.
