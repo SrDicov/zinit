@@ -196,6 +196,11 @@ pub fn sync() {
 }
 
 /// `reboot(LINUX_REBOOT_CMD_POWER_OFF)`. Only returns on failure.
+///
+/// Linux-only: the BSD `reboot()` shapes differ per OS and macOS lacks the
+/// call, so anywhere else this answers Unsupported honestly instead of
+/// guessing FFI (CI proved guessing wrong). Power verbs parse everywhere;
+/// they act where the kernel interface exists.
 pub fn power_off() -> io::Result<()> {
     // SAFETY: the constant is the kernel's own power-off command; no
     // pointers cross the boundary.
@@ -207,24 +212,18 @@ pub fn power_off() -> io::Result<()> {
             Err(io::Error::last_os_error())
         }
     }
-    #[cfg(target_os = "freebsd")]
-    {
-        if unsafe { libc::reboot(libc::RB_POWEROFF, core::ptr::null()) } == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "power off needs Linux or FreeBSD",
+            "power off needs Linux",
         ))
     }
 }
 
 /// `reboot(LINUX_REBOOT_CMD_RESTART)`. Only returns on failure.
+///
+/// Linux-only, like [`power_off`].
 pub fn reboot() -> io::Result<()> {
     // SAFETY: as above.
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -237,18 +236,17 @@ pub fn reboot() -> io::Result<()> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        // SAFETY: `reboot` takes an int command and a null boot string;
-        // both BSD families share the shape, only the constants differ.
-        if unsafe { libc::reboot(libc::RB_AUTOBOOT, core::ptr::null()) } == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "reboot needs Linux",
+        ))
     }
 }
 
 /// `reboot(LINUX_REBOOT_CMD_HALT)`: stop the CPU, leave the power on.
 /// Only returns on failure.
+///
+/// Linux-only, like [`power_off`].
 pub fn halt() -> io::Result<()> {
     // SAFETY: as above.
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -261,12 +259,10 @@ pub fn halt() -> io::Result<()> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        // SAFETY: as above.
-        if unsafe { libc::reboot(libc::RB_HALT, core::ptr::null()) } == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "halt needs Linux",
+        ))
     }
 }
 

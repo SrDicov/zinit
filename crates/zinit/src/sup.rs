@@ -1292,11 +1292,7 @@ impl Sup {
                 };
                 self.reply_ctl(client, &frame);
             }
-            Command::Power {
-                client,
-                id,
-                action,
-            } => {
+            Command::Power { client, id, action } => {
                 let frame = self.request_power(&id, action, now);
                 self.reply_ctl(client, &frame);
             }
