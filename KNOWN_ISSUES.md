@@ -3,22 +3,22 @@
 Everything here was observed in a VM, not reasoned about. Each entry
 says what breaks, what does not, and what replaces the missing piece.
 
-## No demand-start (runtime edges to disabled services hold)
+## Demand-start (implemented)
 
-A required edge to a `desired=down` service never fires: the
-requirer holds, it never pulls. dinit starts dependencies on demand;
-zinit starts per plan only. Observed 2026-10-16 on Artix: live
-`dep_add` edges `agetty → getty@tty1..6` (console management, added
-by dinit-protocol clients after convert) held `agetty`, which held
-`system` (`after:agetty`), which held `boot` — while dinit runs all
-of them (dinit-ref: `agetty`/`boot`/`system`/`getty@tty1..6` STARTED).
-Manual `zctl start getty@ttyN` converges to full parity (`agetty`/
-`system`/`boot` complete), so the reconciler is correct and only the
-automation is missing. Console gettys on a tty-less VM are
-functionally null (serial+ssh unaffected); the scar is protocol-
-visible (`boot` reads stopped, dinit says started). Follow-up, not
-a boot blocker. `enabled = no` outside the boot closure remains the
-convert policy; a required edge added later does not re-enable.
+A required edge to a `desired=down` service now fires pull-on-demand:
+when a service that declares such an edge is actually running on a
+pass, every **disabled** (`enabled = false` at load) dependency that
+edge points at becomes `Wanted::Up` and joins the same pass. Mirrors
+dinit\'s `depends-on` activation. Operator-stopped services (desired=Down
+on an `enabled=true` one) are never re-armed, so `zctl stop` still wins.
+
+Observed cause (Artix): live `dep_add` edges `agetty → getty@tty1..6`
+held `agetty`, `system` (`after:agetty`) and `boot`. With the
+reconciler\'s pool rule in place (see `Test in
+`crates/zcore/src/reconcile.rs::demand_start_single_pass`), the same
+chain now converges in one pass without the manual `zctl start`. `enabled = no`
+off the closure remains the convert policy (it decides the model, not
+the run-time rule).
 
 ## `on-fatal = reboot` lands stop-all-idle
 
