@@ -527,6 +527,47 @@ fn supervisor_reaps_the_service_on_stop() {
     );
 }
 
+/// A demand-pulled service that exits immediately keeps flapping.
+///
+/// Live 2026-10-16: `agetty-service@tty1` (disabled at boot, pulled by the
+/// running `agetty` oneshot) spawned once and stayed `Running` with a dead
+/// pid forever — exactly one attempt, `restarts = 0`, no respawn. This test
+/// is that shape (requirer up, disabled instance dep, instant death) and
+/// asserts the only honest outcomes: repeated attempts. One attempt ever
+/// means the death vanished between spawn and account.
+#[test]
+fn a_demand_pulled_instant_death_keeps_flapping() {
+    let _one = serial();
+    let scratch = Scratch::new("demandflap");
+    let puller = format!(
+        "{}\ndepends = flapper@tty1\n",
+        desc(&announce_then_sleep(&scratch.at("a.pid"), 30), "")
+    );
+    scratch.conf("a.conf", &puller);
+    let command = format!(
+        "echo $$ > {}; echo x >> {}; exit 1",
+        scratch.at("b.pid"),
+        scratch.at("attempts")
+    );
+    let body = format!(
+        "type = script\ncommand = {command}\nready = none\nlog = none\nenabled = no\nrestart = always\nrestart-delay = 100ms\n"
+    );
+    scratch.conf("flapper@tty1.conf", &body);
+
+    let mut sup = Sup::start(&scratch);
+    assert!(
+        wait_until(5_000, || scratch.lines("attempts") >= 4),
+        "demand-pulled flapper died instantly and `restart = always` should have \
+         started it again, but there were only {} attempts in 5s: the death went \
+         stale (live: Running with a dead pid, restarts 0)",
+        scratch.lines("attempts")
+    );
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor itself died while a demand-pulled service flapped"
+    );
+}
+
 /// A service that exits immediately is restarted — several times, and at a rate
 /// a human can still read the log for.
 ///
