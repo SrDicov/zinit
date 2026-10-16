@@ -481,11 +481,7 @@ mod tests {
         // Pass A: puller spawns, lazy activated (still stopped).
         let t1 = reconcile(&mut rt, &p, 0);
         assert!(spawned(&t1).contains(&puller), "puller spawns: {t1:?}");
-        assert!(
-            tick_extras(&rt, lazy),
-            "lazy now wants up: {}",
-            rt.get(lazy).desired
-        );
+        assert!(tick_extras(&rt, lazy), "lazy now wants up");
         assert_eq!(rt.state_at(lazy), State::Stopped);
         // Pass B: puller Running, lazy now Up and spawns.
         rt.get_mut(puller).state = State::Running;
