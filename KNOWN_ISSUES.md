@@ -59,6 +59,25 @@ written, exit 0). Benign test artifact, not a failure. Audit rule:
 - Slirp: hostfwd delivers to the guest's `.15`. Static configs must
   target `10.0.2.15/24` via `10.0.2.2`.
 
+## Live-Chimera findings (2026-10-16, coexistence, sup alongside dinit)
+
+- Fast-dying child goes stale: a service whose child exits instantly is
+  reported `Running` with the dead pid forever (`restarts = 0/3`, no log,
+  no SpawnFailed surface). Observed live: synthesized
+  `agetty-service@tty1` (pid 3899/4287/4379, all reaped, sup still
+  `Running`). Suspected track race (death between spawn and track, reap
+  discards unknown pid) — needs a zinit-side root-cause session with a
+  regression test, not a compatd change. `%i` expansion itself is correct.
+- compatd v7 vs dinit 0.22.0 clients: real `dinitctl is-started/status`
+  hangs (RC=124) against the compatd socket; the C4 shim answers
+  instantly. Known gap (see generator HANDOFF), blocks PID1 console
+  (dinit-agetty's foreground add-dep) until fixed or shimmed in PATH.
+- Runtime-activated services have no static edge: bluetoothd, rtkit,
+  power-profiles-daemon run under dinit but nothing pulls them, so a
+  PID1 boot leaves them down (no D-Bus activation provider under zinit
+  yet). Console gettys are the same class but recoverable via
+  agetty-script + compatd synthesis once the two items above close.
+
 ## Soak scope
 
 PSS/FD/zombie numbers are the `zinit --sup` process alone (PID 1 is
