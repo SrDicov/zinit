@@ -480,11 +480,21 @@ mod tests {
         p.services[lazy].enabled = false; // disabled at boot
         let mut rt = Runtime::from_plan(&p);
         rt.set_desired(puller, Desired::Up);
-        // Pass A: puller and lazy both converge in one pass (udisable chain).
+        // Pass A: the blocked puller flips its disabled dep up and the
+        // dep spawns in the same pass; the puller itself rightly waits
+        // for the dep to be Running (dep gate, unchanged).
         let t1 = reconcile(&mut rt, &p, 0);
-        assert!(spawned(&t1).contains(&puller), "puller spawns: {t1:?}");
-        assert!(spawned(&t1).contains(&lazy), "pulled lazy spawns: {t1:?}");
         assert!(rt.get(lazy).desired == Desired::Up, "lazy pulled up");
+        assert!(spawned(&t1).contains(&lazy), "pulled lazy spawns: {t1:?}");
+        assert!(
+            !spawned(&t1).contains(&puller),
+            "puller waits for running dep: {t1:?}"
+        );
+        // Pass B: dep Running -> puller spawns.
+        rt.get_mut(lazy).state = State::Running;
+        rt.get_mut(lazy).pid = Some(10);
+        let t2 = reconcile(&mut rt, &p, 0);
+        assert!(spawned(&t2).contains(&puller), "puller follows: {t2:?}");
     }
 
     #[test]
