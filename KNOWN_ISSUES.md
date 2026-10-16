@@ -16,7 +16,9 @@ Observed cause (Artix): live `dep_add` edges `agetty → getty@tty1..6`
 held `agetty`, `system` (`after:agetty`) and `boot`. With the
 reconciler\'s pool rule in place (see `Test in
 `crates/zcore/src/reconcile.rs::demand_start_single_pass`), the same
-chain now converges in one pass without the manual `zctl start`. `enabled = no`
+chain now converges without any manual `zctl start`: live proof on P1
+(binary c11f5fee) where `getty@tty6.conf` carries `enabled = no` on disk
+yet runs from boot, pulled by `agetty`'s live required edge. `enabled = no`
 off the closure remains the convert policy (it decides the model, not
 the run-time rule).
 
