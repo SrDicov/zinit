@@ -215,11 +215,7 @@ pub fn power_off() -> io::Result<()> {
             Err(io::Error::last_os_error())
         }
     }
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "freebsd"
-    )))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
     {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
