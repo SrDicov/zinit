@@ -1,6 +1,15 @@
 # Changelog
 
 ## [Unreleased]
+### Demand-start (2026-10-16)
+- A boot-disabled (`enabled = no`) dependency now becomes `Wanted::Up` the moment a
+  service that declares it `required` is actually running: dinit's `depends-on`
+  activation, inside the reconciler, one pass (`Reconcile::demand_start_single_pass`).
+  Operator stops are preserved (only boot-disabled services participate).
+- Release candidate `v0.2.0-rc1`: full matrix booted with PID1=zinit; live
+  dinit→zinit handoff on Artix verified (30 min coexistence + 1h window,
+  0 failed, 0 zombies). Soak 24h underway (baseline PSS 948 kB,
+  so far 1297/1309/1209 kB/h, all <100 kB/h influctuation; verdict pending).
 ### Fatal policy (`on-fatal`, tolerate by default)
 - New `depends = after:`-style knob `on-fatal = ignore|warn|halt|reboot`
   (default `warn`): terminal failures hold one service, never the boot.
