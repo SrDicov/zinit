@@ -52,6 +52,39 @@ impl Tick {
 pub fn reconcile(runtime: &mut Runtime, plan: &Plan, now_ms: u64) -> Tick {
     let mut tick = Tick::default();
 
+    // ── Pass 0: demand-start (dinit's `depends-on` activation) ────────────
+    //
+    // A dependency that was disabled at boot (`enabled = no`, believed
+    // unreachable by the convert closure) becomes wanted-up exactly when
+    // a service that really pulls it is actually running — mirrors dinit's
+    // activation propagation instead of only the static plan. Only services
+    // that were disabled at *load* participate (operator-stopped services
+    // keep `enabled = true`, so `zctl stop` is never overridden by a
+    // future dependent going up). `ponytail:` racy rescan is O(services*
+    // edges) per tick; promote to a dirty flag when a reload adds an edge.
+    for i in 0..runtime.len() {
+        if runtime.get(i).desired != Desired::Up {
+            continue;
+        }
+        if !matches!(runtime.get(i).state, State::Running | State::Starting) {
+            continue;
+        }
+        for &d in &plan.services[i].required {
+            if plan.services[d].enabled {
+                continue;
+            }
+            let dr = runtime.get(d);
+            if dr.desired != Desired::Down || dr.restart_suppressed {
+                continue;
+            }
+            if dr.state != State::Stopped {
+                continue;
+            }
+            runtime.set_desired(d, Desired::Up);
+            tick.changed.push(d);
+        }
+    }
+
     // ── Pass 1: start, in topological order ───────────────────────────────
     //
     // Walking `order_up` forward means every dependency has already been
@@ -266,7 +299,7 @@ pub fn due_events(runtime: &Runtime, plan: &Plan, now_ms: u64) -> Vec<crate::Eve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ServiceKind, ServicePlan};
+    use crate::types::{Desired, ServiceKind, ServicePlan};
     use alloc::{vec, vec::Vec};
     use std::string::String;
 
@@ -430,6 +463,39 @@ mod tests {
         rt.set_desired(f, Desired::Up);
         let t = reconcile(&mut rt, &p, 0);
         assert_eq!(spawned(&t), alloc::vec![f], "only the healthy spawn: {t:?}");
+    }
+
+    #[test]
+    fn demand_start_single_pass() {
+        // A boot-enabled "base" reports that it running, and a disabled
+        // "extra" that it wants pulls become wanted-up via activation:
+        // one reconcile pass flips the want-state, spawning needs a
+        // second pass (consistent with the synchronous model -- never
+        // "magic eager spawning"). en<rfl:parameter name="kment reinits the pull story.
+        let mut p = build(&[("puller", &[]), ("lazy", &[])]);
+        let (puller, lazy) = (p.index_of("puller").unwrap(), p.index_of("lazy").unwrap());
+        p.services[puller].required = vec![lazy];
+        p.services[lazy].enabled = false; // disabled at boot
+        let mut rt = Runtime::from_plan(&p);
+        rt.set_desired(puller, Desired::Up);
+        // Pass A: puller spawns, lazy activated (still stopped).
+        let t1 = reconcile(&mut rt, &p, 0);
+        assert!(spawned(&t1).contains(&puller), "puller spawns: {t1:?}");
+        assert!(
+            tick_extras(&rt, lazy),
+            "lazy now wants up: {}",
+            rt.get(lazy).desired
+        );
+        assert_eq!(rt.state_at(lazy), State::Stopped);
+        // Pass B: puller Running, lazy now Up and spawns.
+        rt.get_mut(puller).state = State::Running;
+        rt.get_mut(puller).pid = Some(10);
+        let t2 = reconcile(&mut rt, &p, 0);
+        assert!(spawned(&t2).contains(&lazy), "pulled lazy spawns: {t2:?}");
+    }
+
+    fn tick_extras(rt: &Runtime, idx: Idx) -> bool {
+        rt.get(idx).desired == Desired::Up
     }
 
     #[test]
