@@ -66,9 +66,11 @@ pub fn reconcile(runtime: &mut Runtime, plan: &Plan, now_ms: u64) -> Tick {
         if runtime.get(i).desired != Desired::Up {
             continue;
         }
-        if !matches!(runtime.get(i).state, State::Running | State::Starting) {
-            continue;
-        }
+        // No state gate on the dependent: a service that is wanted up but
+        // blocked behind a disabled dep must be allowed to pull that dep
+        // even while still Stopped. Otherwise the enable never fires (the
+        // trigger can only pull; it may not spawn), and the disabled service
+        // stays down forever — exactly the Artix agetty chain.
         for &d in &plan.services[i].required {
             if plan.services[d].enabled {
                 continue;
@@ -478,16 +480,11 @@ mod tests {
         p.services[lazy].enabled = false; // disabled at boot
         let mut rt = Runtime::from_plan(&p);
         rt.set_desired(puller, Desired::Up);
-        // Pass A: puller spawns, lazy activated (still stopped).
+        // Pass A: puller and lazy both converge in one pass (udisable chain).
         let t1 = reconcile(&mut rt, &p, 0);
         assert!(spawned(&t1).contains(&puller), "puller spawns: {t1:?}");
-        assert!(tick_extras(&rt, lazy), "lazy now wants up");
-        assert_eq!(rt.state_at(lazy), State::Stopped);
-        // Pass B: puller Running, lazy now Up and spawns.
-        rt.get_mut(puller).state = State::Running;
-        rt.get_mut(puller).pid = Some(10);
-        let t2 = reconcile(&mut rt, &p, 0);
-        assert!(spawned(&t2).contains(&lazy), "pulled lazy spawns: {t2:?}");
+        assert!(spawned(&t1).contains(&lazy), "pulled lazy spawns: {t1:?}");
+        assert!(rt.get(lazy).desired == Desired::Up, "lazy pulled up");
     }
 
     fn tick_extras(rt: &Runtime, idx: Idx) -> bool {
