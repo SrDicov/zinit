@@ -61,22 +61,32 @@ written, exit 0). Benign test artifact, not a failure. Audit rule:
 
 ## Live-Chimera findings (2026-10-16, coexistence, sup alongside dinit)
 
-- Fast-dying child goes stale: a service whose child exits instantly is
-  reported `Running` with the dead pid forever (`restarts = 0/3`, no log,
-  no SpawnFailed surface). Observed live: synthesized
-  `agetty-service@tty1` (pid 3899/4287/4379, all reaped, sup still
-  `Running`). Suspected track race (death between spawn and track, reap
-  discards unknown pid) — needs a zinit-side root-cause session with a
-  regression test, not a compatd change. `%i` expansion itself is correct.
-- compatd v7 vs dinit 0.22.0 clients: real `dinitctl is-started/status`
-  hangs (RC=124) against the compatd socket; the C4 shim answers
-  instantly. Known gap (see generator HANDOFF), blocks PID1 console
-  (dinit-agetty's foreground add-dep) until fixed or shimmed in PATH.
-- Runtime-activated services have no static edge: bluetoothd, rtkit,
-  power-profiles-daemon run under dinit but nothing pulls them, so a
-  PID1 boot leaves them down (no D-Bus activation provider under zinit
-  yet). Console gettys are the same class but recoverable via
-  agetty-script + compatd synthesis once the two items above close.
+- Fast-dying child goes stale (single occurrence, NOT reproduced):
+  synthesized `agetty-service@tty1` (pid 3899/4287/4379) was reported
+  `Running` with dead pids, `restarts = 0/3`, no log. Since then:
+  demand-pull + instant-death + instance + C4-wake + direct-exec were all
+  reproduced live and in CI (`demand_pulled_instant_death_keeps_flapping`,
+  green) and all flap correctly; getty instances synthesized later run
+  healthy for 15+ min. A reap-path audit (Oct 2026) showed reap-before-
+  track is mechanically impossible (SIGCHLD blocked, nothing reaps between
+  fork and track) and pointed at the forking hold-window
+  (`on_waitpid(forking, unadopted)` holds the death while `cleanup()` wipes
+  state) or a lookup-miss discard. Needs the directed root-cause session,
+  not more documentation.
+- compatd v7 vs dinit 0.22.0 clients: CLOSED. The RC=124 hangs were
+  head-of-line blocking (single-threaded accept + one silent holder),
+  fixed by one-thread-per-connection with shared handles (generator
+  d9a5c2a). Proven live twice: real `dinitctl is-started/status` answer
+  instantly. Open minor: after the unexplained 12:44 reboot compatd was
+  found stopped (desired=down, restarts=0) with the socket file present
+  but unserved; manual `zctl start` restored it. Why it was down is
+  unknown (operator action during the poweroff tests, or boot ordering).
+- Runtime-activated services: HALF CLOSED by evidence. rtkit and
+  power-profiles-daemon run healthy under zinit PID1 (restarts 0),
+  pulled at runtime — the dbus-Exec + compatd path works. Only
+  bluetoothd stays stopped until something requests org.bluez (same
+  path, not yet observed firing). No provider to build; the remaining
+  work is observing one activation, not implementing one.
 
 ## Soak scope
 
