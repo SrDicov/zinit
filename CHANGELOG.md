@@ -1,6 +1,14 @@
 # Changelog
 
 ## [Unreleased]
+### Fatal policy (`on-fatal`, tolerate by default)
+- New `depends = after:`-style knob `on-fatal = ignore|warn|halt|reboot`
+  (default `warn`): terminal failures hold one service, never the boot.
+- Unknown required deps hold their service with a loud `W103` warning
+  instead of failing the whole load (the agetty ghost that bricked a
+  boot). `GraphError::UnknownDependency` removed.
+- `on-fatal = reboot` currently lands stop-all-idle with an explicit
+  announcement: no reboot path exists yet (see `docs/fatal-policy.md`).
 ### Aristas solo-orden `after:`
 - `depends = after:x` ordena sin bloquear: el servicio espera el primer
   intento de `x`, nunca su éxito (completado, fallido, suprimido o

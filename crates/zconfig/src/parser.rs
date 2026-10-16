@@ -102,7 +102,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use zcore::{SeccompAction, ServiceKind};
+use zcore::{OnFatal, SeccompAction, ServiceKind};
 
 use crate::desc::{ServiceDesc, validate_service_name};
 use crate::diagnostic::{Diagnostic, DiagnosticBag, Span};
@@ -169,6 +169,8 @@ pub enum Directive {
     Log,
     /// `yes` | `no`: whether a failure takes the system down.
     Critical,
+    /// `ignore` | `warn` | `halt` | `reboot`: what a terminal failure means.
+    OnFatal,
     /// `yes` | `no`: whether the service starts at boot.
     Enabled,
     /// `yes` | `no`: whether the first connection to a held socket starts
@@ -218,6 +220,7 @@ impl Directive {
             Directive::Env => "env",
             Directive::Log => "log",
             Directive::Critical => "critical",
+            Directive::OnFatal => "on-fatal",
             Directive::Enabled => "enabled",
             Directive::OnDemand => "on-demand",
             Directive::PrivateTmp => "private-tmp",
@@ -243,7 +246,7 @@ impl Directive {
     /// hidden property of the service *name* would be a policy nobody could
     /// read off the file. The alternative, refusing to model it at all, means
     /// the runtime has to hardcode the same list somewhere less visible.
-    pub const ALL: [Directive; 28] = [
+    pub const ALL: [Directive; 29] = [
         Directive::Command,
         Directive::Type,
         Directive::Depends,
@@ -258,6 +261,7 @@ impl Directive {
         Directive::Env,
         Directive::Log,
         Directive::Critical,
+        Directive::OnFatal,
         Directive::Enabled,
         Directive::OnDemand,
         Directive::PrivateTmp,
@@ -877,6 +881,21 @@ pub fn parse_service_with_diagnostics(name: &str, text: &str) -> Result<ParsedSe
                             directive,
                             value_span,
                             "write `yes` or `no`; the default is yes, so a non-critical service is an explicit choice",
+                        ));
+                    }
+                };
+            }
+            Directive::OnFatal => {
+                desc.on_fatal = match value.trim() {
+                    "ignore" => OnFatal::Ignore,
+                    "warn" => OnFatal::Warn,
+                    "halt" => OnFatal::Halt,
+                    "reboot" => OnFatal::Reboot,
+                    _ => {
+                        return Err(bad_value(
+                            directive,
+                            value_span,
+                            "write `ignore`, `warn`, `halt`, or `reboot`; the default is warn, so anything else is explicit",
                         ));
                     }
                 };
@@ -2751,6 +2770,26 @@ rlimit-nofile = 8192
         let d = ok("command = /bin/true\ndepends = a, after:a\n");
         assert_eq!(d.depends_required, ["a"]);
         assert!(d.depends_after.is_empty());
+    }
+
+    #[test]
+    fn on_fatal_parses_all_four_policies() {
+        use zcore::OnFatal;
+        assert_eq!(ok("command = /bin/true\n").on_fatal, OnFatal::Warn);
+        assert_eq!(
+            ok("command = /bin/true\non-fatal = ignore\n").on_fatal,
+            OnFatal::Ignore
+        );
+        assert_eq!(
+            ok("command = /bin/true\non-fatal = halt\n").on_fatal,
+            OnFatal::Halt
+        );
+        assert_eq!(
+            ok("command = /bin/true\non-fatal = reboot\n").on_fatal,
+            OnFatal::Reboot
+        );
+        let e = err("command = /bin/true\non-fatal = explode\n");
+        assert_eq!(e.code, "E007");
     }
 
     #[test]

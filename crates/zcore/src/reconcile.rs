@@ -65,9 +65,13 @@ pub fn reconcile(runtime: &mut Runtime, plan: &Plan, now_ms: u64) -> Tick {
         }
 
         // Targets have no process: they are up exactly when their required
-        // dependencies are. No spawn, no budget, no readiness.
+        // dependencies are. No spawn, no budget, no readiness. A dangling
+        // required edge holds the target like any unmet requirement, loudly
+        // at load and quietly here — never the boot.
         if !sp.kind.has_process() {
-            let deps_ok = runtime.deps_satisfied(idx, plan) && runtime.after_satisfied(idx, plan);
+            let deps_ok = runtime.deps_satisfied(idx, plan)
+                && runtime.after_satisfied(idx, plan)
+                && sp.missing_required.is_empty();
             let cur = runtime.get(idx).state;
             if deps_ok && cur != State::Running {
                 runtime.get_mut(idx).state = State::Running;
@@ -99,6 +103,10 @@ pub fn reconcile(runtime: &mut Runtime, plan: &Plan, now_ms: u64) -> Tick {
                 // Order-only edges: wait for the first attempt, never for
                 // success. See `after_satisfied` for the release rule.
                 if !runtime.after_satisfied(idx, plan) {
+                    continue;
+                }
+                // Dangling required edges: hold, never spawn into the void.
+                if !sp.missing_required.is_empty() {
                     continue;
                 }
                 // A death the policy refused to retry. `Desired` is still
@@ -408,6 +416,20 @@ mod tests {
         rt.set_desired(b, Desired::Up);
         let t = reconcile(&mut rt, &p, 0);
         assert_eq!(spawned(&t), vec![b], "down a releases b: {t:?}");
+    }
+
+    #[test]
+    fn missing_required_holds_spawn_but_not_the_boot() {
+        // A dangling required edge holds its service (never spawns) while
+        // everything else converges: the agetty ghost that bricked a boot.
+        let mut p = build(&[("ghosted", &[]), ("free", &[])]);
+        let (g, f) = (p.index_of("ghosted").unwrap(), p.index_of("free").unwrap());
+        p.services[g].missing_required = alloc::vec![String::from("ghost")];
+        let mut rt = Runtime::from_plan(&p);
+        rt.set_desired(g, Desired::Up);
+        rt.set_desired(f, Desired::Up);
+        let t = reconcile(&mut rt, &p, 0);
+        assert_eq!(spawned(&t), alloc::vec![f], "only the healthy spawn: {t:?}");
     }
 
     #[test]

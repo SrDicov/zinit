@@ -62,7 +62,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use zcore::{Budget, ListenAddr, Restart, SeccompAction, ServiceKind};
+use zcore::{Budget, ListenAddr, OnFatal, Restart, SeccompAction, ServiceKind};
 
 use crate::parser::Directive;
 use crate::value::{LogSpec, ReadySpec, ReadySpecKind, RestartSpec, RunAs};
@@ -321,6 +321,8 @@ pub struct ServiceDesc {
     /// precisely so the two numbers cannot drift apart, and splitting the delay
     /// out into a `ServiceDesc` field would put it back in a place where it can.
     pub restart: RestartSpec,
+    /// What a terminal failure of this service means for the machine.
+    pub on_fatal: OnFatal,
     /// Readiness strategy.
     pub ready: ReadySpec,
     /// How long to wait for a clean stop before `SIGKILL`.
@@ -449,6 +451,7 @@ impl Default for ServiceDesc {
             depends_optional: Vec::new(),
             depends_after: Vec::new(),
             restart: RestartSpec::default(),
+            on_fatal: OnFatal::Warn,
             ready: ReadySpec {
                 kind: ReadySpecKind::Notify,
                 arg: String::new(),
@@ -559,6 +562,9 @@ impl ServiceDesc {
         }
         if over.is_explicit(Directive::Restart) {
             self.restart.policy = over.restart.policy;
+        }
+        if over.is_explicit(Directive::OnFatal) {
+            self.on_fatal = over.on_fatal;
         }
         if over.is_explicit(Directive::RestartBudget) {
             self.restart.budget.capacity = over.restart.budget.capacity;

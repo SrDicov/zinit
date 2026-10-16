@@ -77,6 +77,18 @@ pub enum Action {
 
     /// The service is pinned; ignore pending stop requests.
     Unpin(Idx),
+
+    /// Stop every service and stay idle, like an operator SIGTERM.
+    ///
+    /// Only ever emitted for a service whose `on-fatal` says `Halt`: a
+    /// failure nobody marked machine-critical must never halt the boot.
+    Halt { idx: Idx },
+
+    /// Reboot the machine.
+    ///
+    /// Only ever emitted for a service whose `on-fatal` says `Reboot`,
+    /// for the same reason as `Halt`.
+    Reboot { idx: Idx },
 }
 
 impl Action {
@@ -94,6 +106,8 @@ impl Action {
             Action::Signal { idx, .. } => idx,
             Action::Log { idx, .. } => idx,
             Action::CascadeStop { idx, .. } => idx,
+            Action::Halt { idx } => idx,
+            Action::Reboot { idx } => idx,
         }
     }
 }
@@ -131,10 +145,12 @@ mod tests {
             Action::GrantConsole(7),
             Action::RevokeConsole(7),
             Action::Unpin(7),
+            Action::Halt { idx: 7 },
+            Action::Reboot { idx: 7 },
         ];
         for a in &actions {
             assert_eq!(a.idx(), 7, "{a:?} reported the wrong index");
         }
-        assert_eq!(actions.len(), 11, "a variant was added without a test case");
+        assert_eq!(actions.len(), 13, "a variant was added without a test case");
     }
 }

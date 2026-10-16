@@ -18,7 +18,6 @@
 //! | [`GraphError::InvalidName`] | a name is a key everywhere: service names, log file paths, cgroup names. `/`, `..`, spaces and a leading `.`/`@` all let a description address something outside its own directory. This is the dinit `validate_service_name` `return true` bug. The *rules* live in [`crate::desc::validate_service_name`]; this module only decides that they are applied, and to which strings. |
 //! | [`GraphError::InvalidDependencyName`] | the same rule, applied to the *other* end of an edge. `depends = ../../../etc/shadow` is the identical attack with a different entry point, and validating only the service's own name would leave it open. |
 //! | [`GraphError::DuplicateName`] | two definitions, one key. Picking "the last one wins" hides a typo'd file. |
-//! | [`GraphError::UnknownDependency`] | a required dependency that resolves to nothing means the machine silently boots without a service. |
 //! | [`GraphError::SelfDependency`] | reported separately from [`GraphError::Cycle`] because `a depends on a` is a typo, not a design. |
 //! | [`GraphError::Cycle`] | fatal, and the message carries the actual cycle. |
 //! | [`GraphError::NoCommand`] | a `process`/`script`/`console` with no `command` cannot be spawned. A `target` legitimately has none. |
@@ -135,19 +134,6 @@ pub enum GraphError {
         /// File of the definition that was rejected.
         second: String,
     },
-    /// A required dependency names a service that does not exist.
-    ///
-    /// An unknown *optional* edge is never this error: it is a `W100` finding,
-    /// so a `true` on "the graph is being abandoned" is implied by the variant
-    /// itself and there is no flag to get wrong.
-    UnknownDependency {
-        /// The service that carries the dependency.
-        service: String,
-        /// The name it depends on, which resolves to nothing.
-        dep: String,
-        /// Closest real service name, if one is near enough.
-        suggestion: Option<String>,
-    },
     /// A service depends on itself.
     ///
     /// Distinct from [`GraphError::Cycle`] on purpose: `a depends on a` is
@@ -232,17 +218,6 @@ impl fmt::Display for GraphError {
                 f,
                 "duplicate service {name:?}: defined in both {first} and {second}"
             ),
-            GraphError::UnknownDependency {
-                service,
-                dep,
-                suggestion,
-            } => {
-                write!(f, "{service}: unknown required dependency {dep:?}")?;
-                if let Some(s) = suggestion {
-                    write!(f, "; did you mean {s:?}?")?;
-                }
-                Ok(())
-            }
             GraphError::SelfDependency {
                 service,
                 source,
@@ -286,7 +261,6 @@ impl GraphError {
             | GraphError::SelfDependency { line, .. }
             | GraphError::NoCommand { line, .. } => *line,
             GraphError::DuplicateName { .. }
-            | GraphError::UnknownDependency { .. }
             | GraphError::Cycle { .. }
             | GraphError::TooManyServices { .. } => return None,
         };
@@ -422,6 +396,10 @@ pub struct Graph {
     /// Third list for the same reason: "wait for the first attempt" is
     /// neither gating nor ignoring, and the reconciler needs it separately.
     after: Edges,
+    /// Required names that resolved to nothing, per service, in
+    /// declaration order. The service holds (never spawns) but the boot
+    /// continues; a W103 finding names every entry loudly at load.
+    missing: Vec<Vec<String>>,
 }
 
 impl Graph {
@@ -518,9 +496,9 @@ impl Graph {
             .collect();
 
         let mut findings: Vec<Diagnostic> = Vec::new();
-        let required = resolve(&owned, &by_name, Class::Required, &mut findings)?;
-        let optional = resolve(&owned, &by_name, Class::Optional, &mut findings)?;
-        let after = resolve(&owned, &by_name, Class::After, &mut findings)?;
+        let (required, missing) = resolve(&owned, &by_name, Class::Required, &mut findings)?;
+        let (optional, _) = resolve(&owned, &by_name, Class::Optional, &mut findings)?;
+        let (after, _) = resolve(&owned, &by_name, Class::After, &mut findings)?;
         report_double_qualified_edges(&owned, &required, &optional, &mut findings);
 
         let graph = Graph {
@@ -529,6 +507,7 @@ impl Graph {
             required,
             optional,
             after,
+            missing,
         };
         debug_assert_eq!(graph.required.offsets.len(), graph.optional.offsets.len());
         debug_assert_eq!(graph.required.offsets.len(), graph.after.offsets.len());
@@ -583,6 +562,11 @@ impl Graph {
         self.after.of(idx)
     }
 
+    /// Required names that resolved to nothing, in declaration order.
+    pub fn missing_of(&self, idx: Idx) -> &[String] {
+        &self.missing[idx]
+    }
+
     /// Every service that declares `dep` as a required dependency.
     ///
     /// Linear per query, which is fine because it is a load-time diagnostic
@@ -632,7 +616,7 @@ fn resolve(
     by_name: &[(String, Idx)],
     class: Class,
     findings: &mut Vec<Diagnostic>,
-) -> core::result::Result<Edges, GraphError> {
+) -> core::result::Result<(Edges, Vec<Vec<String>>), GraphError> {
     let n = descs.len();
     let optional = class == Class::Optional;
     let after = class == Class::After;
@@ -643,6 +627,10 @@ fn resolve(
     let mut to: Vec<Idx> = Vec::new();
     let mut row: Vec<Idx> = Vec::new();
     offsets.push(0);
+    // Required names that resolved to nothing, per service. Only the
+    // Required class records here: optional/after misses warn and drop
+    // without a trace in the plan.
+    let mut missing: Vec<Vec<String>> = vec![Vec::new(); n];
 
     for (i, d) in descs.iter().enumerate() {
         let names: &Vec<String> = if after {
@@ -715,13 +703,20 @@ fn resolve(
                     findings.push(finding(Severity::Warning, d, "W100", message, help));
                 }
                 None => {
-                    // Required and unresolvable: the boot would silently lose a
-                    // service, so this is fatal.
-                    return Err(GraphError::UnknownDependency {
-                        service: d.name.clone(),
-                        dep: dep.clone(),
-                        suggestion: suggest(dep, by_name),
-                    });
+                    // Required and unresolvable: hold the service, never
+                    // the boot. The missing name stays in the plan so the
+                    // reconciler (and `zctl status`) can say what is
+                    // missing; a W103 finding names it loudly at load.
+                    let suggestion = suggest(dep, by_name);
+                    let message = match &suggestion {
+                        Some(s) => format!(
+                            "{}: unknown required dependency {dep:?}, held; did you mean {s}?",
+                            d.name
+                        ),
+                        None => format!("{}: unknown required dependency {dep:?}, held", d.name),
+                    };
+                    findings.push(finding(Severity::Warning, d, "W103", message, None));
+                    missing[i].push(dep.clone());
                 }
             }
         }
@@ -736,7 +731,7 @@ fn resolve(
         offsets.push(to.len());
     }
 
-    Ok(Edges { offsets, to })
+    Ok((Edges { offsets, to }, missing))
 }
 
 /// `W101`: a name declared both required and optional is two instructions for
@@ -1211,27 +1206,29 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_required_dependency_suggests_the_nearest_name() {
-        match Graph::build(&[
+    fn an_unknown_required_dependency_holds_with_a_warning() {
+        // The agetty ghost: a dangling required edge holds its service
+        // (recorded, warned) but never the boot.
+        let (g, findings) = Graph::build_with_findings(&[
             desc_with("networkd", ServiceKind::Process, &[], &[]),
             desc_with("sshd", ServiceKind::Process, &["netwrok"], &[]),
-        ]) {
-            Err(GraphError::UnknownDependency {
-                service,
-                dep,
-                suggestion,
-            }) => {
-                assert_eq!(service, "sshd");
-                assert_eq!(dep, "netwrok");
-                assert_eq!(suggestion.as_deref(), Some("networkd"));
-            }
-            other => panic!("expected UnknownDependency, got {other:?}"),
-        }
+        ])
+        .expect("a dangling required edge must not fail the build");
+        let sshd = g.index_of("sshd").unwrap();
+        assert!(g.required_of(sshd).is_empty(), "dropped from the plan");
+        assert_eq!(g.missing_of(sshd), [String::from("netwrok")]);
+        assert_eq!(codes(&findings), ["W103"]);
+        let rendered = findings[0].render("sshd.conf");
+        assert!(rendered.contains("netwrok"), "names the ghost: {rendered}");
+        assert!(
+            rendered.contains("did you mean"),
+            "offers the fix: {rendered}"
+        );
     }
 
     #[test]
     fn a_wildly_wrong_name_gets_no_suggestion() {
-        match Graph::build(&[
+        let (g, findings) = Graph::build_with_findings(&[
             desc_with("a", ServiceKind::Process, &[], &[]),
             desc_with(
                 "b",
@@ -1239,10 +1236,18 @@ mod tests {
                 &["completely_different_thing"],
                 &[],
             ),
-        ]) {
-            Err(GraphError::UnknownDependency { suggestion, .. }) => assert_eq!(suggestion, None),
-            other => panic!("expected UnknownDependency, got {other:?}"),
-        }
+        ])
+        .expect("a dangling required edge must not fail the build");
+        let b = g.index_of("b").unwrap();
+        assert_eq!(
+            g.missing_of(b),
+            [String::from("completely_different_thing")]
+        );
+        assert_eq!(codes(&findings), ["W103"]);
+        assert!(
+            !findings[0].render("b.conf").contains("did you mean"),
+            "nothing near enough to suggest"
+        );
     }
 
     #[test]

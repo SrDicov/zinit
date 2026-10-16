@@ -189,6 +189,26 @@ impl Restart {
     }
 }
 
+/// What a terminal service failure means for the machine.
+///
+/// Decided by the operator per service (`on-fatal`), defaulting to `Warn`:
+/// dinit tolerates a dead service and boots the rest, so zinit does too —
+/// never halt or reboot the machine over a failure nobody marked as
+/// machine-critical. `Ignore` logs at info level, `Warn` logs loudly;
+/// both hold the service (only an operator `kick` re-arms it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum OnFatal {
+    /// Log at info, hold. For services whose death is routine noise.
+    Ignore,
+    /// Log loudly, hold. The default: visible, never fatal.
+    #[default]
+    Warn,
+    /// Stop every service and stay idle, like an operator SIGTERM.
+    Halt,
+    /// Reboot the machine.
+    Reboot,
+}
+
 /// How the supervisor learns a service is actually usable.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub enum Ready {
@@ -574,6 +594,15 @@ pub struct ServicePlan {
     /// start` still starts it. Reloads never flip a live desire; only a
     /// fresh boot (and `kick`-style explicit intent) consults this.
     pub enabled: bool,
+    /// Required dependencies named at load that resolved to nothing.
+    ///
+    /// A dangling edge holds the service (it never spawns) but never the
+    /// boot: dinit starts the rest, so zinit does too. Loud at load
+    /// (a warning names every missing edge); quiet at runtime, where the
+    /// service simply reads as stopped with unmet requirements.
+    pub missing_required: Vec<String>,
+    /// What a terminal failure of this service means for the machine.
+    pub on_fatal: OnFatal,
 }
 
 impl ServicePlan {
@@ -601,6 +630,8 @@ impl ServicePlan {
             enabled: true,
             on_demand: false,
             private_tmp: false,
+            missing_required: Vec::new(),
+            on_fatal: OnFatal::Warn,
         }
     }
 }

@@ -607,6 +607,40 @@ impl Sup {
     /// control socket to be told what the operator meant, and assuming that a
     /// `SIGTERM` means "power the machine off" would turn every `Ctrl-C` at a
     /// console into a reboot.
+    /// An `on-fatal = halt` service failed terminally: everything
+    /// wanted down, and the reconciler converges from there. Same
+    /// landing as [`Self::request_stop`], named for the service that
+    /// asked for it.
+    fn request_halt(&mut self, name: &str) {
+        if self.stopping {
+            return;
+        }
+        self.stopping = true;
+        for idx in 0..self.runtime.len() {
+            self.runtime.set_desired(idx, Desired::Down);
+        }
+        announce_degradation(&format!(
+            "{name} failed (on-fatal = halt): stopping every service.              The machine stays up and idle afterwards"
+        ));
+    }
+
+    /// An `on-fatal = reboot` service failed terminally. There is no
+    /// reboot path in this build, so this is `request_halt` with an
+    /// honest announcement: the machine stays idle and says why,
+    /// instead of silently degrading a reboot into a halt.
+    fn request_reboot(&mut self, name: &str) {
+        if self.stopping {
+            return;
+        }
+        self.stopping = true;
+        for idx in 0..self.runtime.len() {
+            self.runtime.set_desired(idx, Desired::Down);
+        }
+        announce_degradation(&format!(
+            "{name} failed (on-fatal = reboot): no reboot path in this              build, stopping every service instead. The machine stays up              and idle afterwards"
+        ));
+    }
+
     fn request_stop(&mut self, sig: Signal) {
         if self.stopping {
             return;
@@ -1340,6 +1374,22 @@ impl Sup {
                 | Action::DepsChanged(_)
                 | Action::CascadeStop { .. }
                 | Action::Unpin(_) => {}
+                // `on-fatal = halt`: the operator marked this failure
+                // machine-critical. Same landing as SIGTERM (everything
+                // down, idle afterwards), named for the service.
+                Action::Halt { idx } => {
+                    let name = self.name_of(*idx).to_owned();
+                    self.request_halt(&name);
+                }
+                // `on-fatal = reboot`: honoring it for real needs a power
+                // path this build does not have (same reason SIGTERM stays
+                // idle), so this stops everything and says so loudly
+                // rather than pretending to reboot. A reboot-capable
+                // runtime replaces this arm, not the core action.
+                Action::Reboot { idx } => {
+                    let name = self.name_of(*idx).to_owned();
+                    self.request_reboot(&name);
+                }
                 // ponytail: no controlling terminal in this phase — no getty and
                 // no `type = console` handover, so there is nothing to grant or
                 // revoke. `SpawnCtx::tty` is the hook; wire it when the console

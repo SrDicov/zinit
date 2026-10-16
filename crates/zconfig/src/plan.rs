@@ -494,11 +494,14 @@ fn service_plan(graph: &Graph, i: Idx, findings: &mut Vec<Diagnostic>) -> Servic
     // owned `ServicePlan` is built.
     let required: Vec<Idx> = graph.required_of(i).to_vec();
     let after: Vec<Idx> = graph.after_of(i).to_vec();
+    let missing: Vec<String> = graph.missing_of(i).to_vec();
 
     let mut sp = ServicePlan::new(d.name.clone());
     sp.kind = d.kind;
     sp.required = required;
     sp.after = after;
+    sp.missing_required = missing;
+    sp.on_fatal = d.on_fatal;
     sp.restart = d.restart.policy;
     sp.ready = d.ready.into_ready();
     sp.start_timeout_ms = timeout_or(d.start_timeout_ms, DEFAULT_START_TIMEOUT_MS);
@@ -1563,13 +1566,15 @@ mod tests {
     }
 
     #[test]
-    fn a_build_error_never_yields_a_plan() {
+    fn a_dangling_required_edge_holds_instead_of_failing() {
+        // The plan builds; the service holds at runtime with its ghost
+        // recorded. Findings carry the loud warning.
         let descs = vec![desc_with("a", ServiceKind::Process, &["ghost"], &[])];
-        assert!(matches!(
-            build_plan(&descs),
-            Err(GraphError::UnknownDependency { .. })
-        ));
-        assert!(build_plan_with_findings(&descs).is_err());
+        let (plan, findings) = build_plan_with_findings(&descs).expect("tolerate");
+        let a = plan.index_of("a").unwrap();
+        assert!(plan.services[a].required.is_empty());
+        assert_eq!(plan.services[a].missing_required, [String::from("ghost")]);
+        assert!(findings.iter().any(|f| f.code == "W103"));
     }
 
     /// Rule 6: at the cap it works, one over it is an error naming the count -
