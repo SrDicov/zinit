@@ -325,10 +325,24 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
         zcore::Ready::Notify | zcore::Ready::Strict(StrictReady::Notify)
     );
 
-    // ── argv, fully built before the fork ──────────────────────────────
+    // ── merged env first: parent-side expansion must see it ─────────────
     //
-    // Expansion happens in the *parent* for `process`/`console`, and never for
-    // `script`.
+    // Expansion happens in the *parent* for `process`/`console`, and never
+    // for `script` (see below). The lookup runs against the merged
+    // environment — inherited, overlaid, then pinned — because that is
+    // exactly what the child will observe. Expanding against only the
+    // supervisor's own environment instead silently emptied
+    // supervisor-owned variables (`-N $ZINIT_NOTIFY_FD` became a bare
+    // `-N`, and chronyd died on the spot, forever).
+    let merged_env = merged_environment(
+        ctx.env,
+        wants_notify.then_some(notify_no(ctx)),
+        &ctx.listen
+            .iter()
+            .map(|(_, n)| n.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    // ── argv, fully built before the fork ──────────────────────────────
     //
     // For `script` the command is handed to `/bin/sh -c` verbatim. Expanding
     // first would be an active bug, not a convenience: a script is expected
@@ -341,7 +355,7 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
     let expanded_cmd = if sp.kind == ServiceKind::Script {
         String::from(ctx.command)
     } else {
-        expand_env_value(ctx.command, &env_lookup)
+        expand_env_value(ctx.command, &|name| lookup_in(&merged_env, name))
     };
     let words: Vec<String> = if sp.kind == ServiceKind::Script {
         vec![]
@@ -371,14 +385,6 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
         }
         (words[0].clone(), words)
     };
-    let merged_env = merged_environment(
-        ctx.env,
-        wants_notify.then_some(notify_no(ctx)),
-        &ctx.listen
-            .iter()
-            .map(|(_, n)| n.clone())
-            .collect::<Vec<_>>(),
-    )?;
     let path_env = path_of(&merged_env);
     let resolved = resolve_binary(&argv0, &path_env).ok_or_else(|| SpawnError::NotFound {
         name: ctx.service_name.to_string(),
@@ -1455,13 +1461,6 @@ fn merged_environment(
     for (k, v) in std::env::vars_os() {
         pairs.push((k.as_encoded_bytes().to_vec(), v.as_encoded_bytes().to_vec()));
     }
-    let lookup_in = |pairs: &[(Vec<u8>, Vec<u8>)], name: &str| -> Option<String> {
-        pairs
-            .iter()
-            .rev()
-            .find(|(k, _)| k == name.as_bytes())
-            .and_then(|(_, v)| String::from_utf8(v.clone()).ok())
-    };
     for (k, v) in overlay {
         if k.is_empty() || k.bytes().any(|b| b == b'=' || b == 0) {
             return Err(io::Error::new(
@@ -1511,9 +1510,19 @@ fn path_of(env: &[(Vec<u8>, Vec<u8>)]) -> String {
         .unwrap_or_else(|| String::from("/usr/bin:/bin"))
 }
 
-/// Process-environment lookup for expansion at spawn time.
-fn env_lookup(name: &str) -> Option<String> {
-    std::env::var(name).ok()
+/// Look up a name in an ordered environment, last binding wins (mirrors
+/// what `execve` consumers observe). Shared by overlay expansion and by
+/// parent-side command expansion: a `type = process` command must see the
+/// same bindings the child will, *including* supervisor-pinned variables
+/// like `ZINIT_NOTIFY_FD`. Looking only at the supervisor's own environment
+/// instead silently emptied them (live: every `-N $ZINIT_NOTIFY_FD` became
+/// a bare `-N`, chronyd died on the spot, forever).
+fn lookup_in(pairs: &[(Vec<u8>, Vec<u8>)], name: &str) -> Option<String> {
+    pairs
+        .iter()
+        .rev()
+        .find(|(k, _)| k == name.as_bytes())
+        .and_then(|(_, v)| String::from_utf8(v.clone()).ok())
 }
 
 /// Expand `$VAR`, `${VAR}` and `${VAR:-default}` in `input`.
@@ -1768,6 +1777,19 @@ mod tests {
         let c = ctx("test \"$ZINIT_PROBE\" = yes", &env, &log);
         let s = spawn(&plan, 0, &c).expect("spawn");
         assert_eq!(reap(&s), zrt::sys::ExitStatus::Exited(0));
+    }
+
+    #[test]
+    fn parent_expansion_sees_pinned_notify_fd() {
+        // Live: `type = process` with `-N $ZINIT_NOTIFY_FD` expanded the
+        // variable against the supervisor's own environment, where it does
+        // not exist — every spawn got a bare `-N` and died on the spot.
+        // The lookup must run against the merged environment instead.
+        let merged = merged_environment(&[], Some(3), &[]).expect("env");
+        let got = expand_env_value("chronyd -N $ZINIT_NOTIFY_FD", &|name| {
+            lookup_in(&merged, name)
+        });
+        assert_eq!(got, "chronyd -N 3");
     }
 
     #[test]
