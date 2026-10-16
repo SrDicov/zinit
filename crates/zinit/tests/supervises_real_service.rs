@@ -618,6 +618,39 @@ fn a_crash_is_restarted_within_budget() {
     );
 }
 
+/// A service that stays root must not carry NoNewPrivs.
+///
+/// NNP was once set unconditionally in the child path; every descendant —
+/// including ssh sessions — then silently lost all setuid elevation
+/// (`doas: not installed setuid`), with no way back but a power cycle.
+/// NNP is defence in depth *after a uid drop*; without one it only breaks
+/// setuid children. Fails on the old code (status reads 1), passes fixed.
+#[test]
+fn a_root_service_keeps_setuid_working() {
+    let _one = serial();
+    let scratch = Scratch::new("nnp");
+    let command = format!(
+        "grep ^NoNewPrivs /proc/self/status > {}; exec /bin/sleep 30",
+        scratch.at("nnp.status")
+    );
+    scratch.conf("plain.conf", &desc(&command, ""));
+    let mut sup = Sup::start(&scratch);
+    assert!(
+        wait_until(10_000, || scratch.read("nnp.status").is_some()),
+        "the service never reported its NoNewPrivs status in 10s"
+    );
+    let status = scratch.read("nnp.status").unwrap_or_default();
+    assert!(
+        status.contains("NoNewPrivs:\t0"),
+        "a service with no `user =` runs with NoNewPrivs set ({status:?}): \
+         its whole subtree lost setuid elevation"
+    );
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor itself died while supervising a plain service"
+    );
+}
+
 /// A cycle in the graph has no topological order, so there is no plan. The
 /// supervisor must refuse the whole directory rather than start the half of it
 /// it happens to understand.

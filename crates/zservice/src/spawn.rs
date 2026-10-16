@@ -20,9 +20,15 @@
 //!
 //! ```text
 //! sigmask → setsid → stdio/notify fds → chdir(/) → rlimits → cgroup →
-//!     setgroups → setresgid → setresuid → verify → no_new_privs →
+//!     setgroups → setresgid → setresuid → verify → no_new_privs* →
 //!     TIOCSCTTY → execve  (any failure → errno pipe + _exit(127))
 //! ```
+//!
+//! `*`: only when the service actually drops privileges (`user =`); a
+//! service that stays root keeps setuid working for its children, like
+//! any other init. Unconditional NNP once neutered `doas`/`su` for every
+//! ssh session on a live box (the session inherits it and the kernel
+//! then ignores all setuid elevation).
 //!
 //! * **An empty signal mask, before anything else.** `fork` copies the
 //!   supervisor's blocked set and `execve` *preserves* it (only dispositions
@@ -52,10 +58,13 @@
 //!   Real three-id variants, never `seteuid` alone (rule 1), with
 //!   `getuid() == geteuid()` checked afterwards (rule 2). The drop is the
 //!   last privileged act; what follows cannot regain anything.
-//! * **`PR_SET_NO_NEW_PRIVS` (Linux, best-effort).** Defence in depth after
-//!   the drop: a setuid binary the service execs cannot escalate it. Failure
-//!   here does *not* abort the spawn — on kernels without the flag the uid
-//!   drop is still complete — which is documented rather than hidden.
+//! * **`PR_SET_NO_NEW_PRIVS` (Linux, best-effort, only after a real uid
+//!   drop).** Defence in depth after the drop: a setuid binary the service
+//!   execs cannot escalate it. A service that stays root (no `user =`)
+//!   skips it, so its children keep working setuid (`doas`, `su`,
+//!   login sessions). Failure here does *not* abort the spawn — on kernels
+//!   without the flag the uid drop is still complete — which is documented
+//!   rather than hidden.
 //! * **`TIOCSCTTY` for `console` services with a tty.** Session leader (done
 //!   above) plus open tty plus `TIOCSCTTY` is the only ordering the kernel
 //!   accepts.
@@ -776,7 +785,12 @@ fn child_main(p: ChildPlan) -> ! {
     if !child_step_capdrop(p) {
         child_fail(p.exec_w, CHILD_STEP_CAPDROP);
     }
-    child_step_no_new_privs();
+    // NNP only after a real drop: without one it would neuter setuid for
+    // the whole subtree (live: every ssh session lost `doas`, with no way
+    // back but a power cycle). A root service has nothing to escalate to.
+    if p.drop_ids {
+        child_step_no_new_privs();
+    }
     if !child_step_ctty(p) {
         child_fail(p.exec_w, CHILD_STEP_CTTY);
     }
@@ -1229,10 +1243,12 @@ fn child_step_ids(p: ChildPlan) -> bool {
 
 /// Forbid gaining privilege back via `exec` (Linux, best-effort).
 ///
-/// After this, even a setuid-root binary the service runs cannot escalate
-/// it. Failure is ignored on purpose: on kernels without the flag the uid
-/// drop above is already complete, and aborting a correct drop for lack of a
-/// hardening extra would be the tail wagging the dog. Documented, not hidden.
+/// Call only after a real uid drop: without one it would neuter setuid for
+/// the service's whole subtree. After this, even a setuid-root binary the
+/// service runs cannot escalate it. Failure is ignored on purpose: on kernels
+/// without the flag the uid drop above is already complete, and aborting a
+/// correct drop for lack of a hardening extra would be the tail wagging the
+/// dog. Documented, not hidden.
 fn child_step_no_new_privs() {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
