@@ -2261,6 +2261,7 @@ rlimit-nofile = 8192
             Directive::User => "0",
             Directive::Log => "syslog",
             Directive::Critical => "no",
+            Directive::OnFatal => "warn",
             Directive::Enabled => "no",
             Directive::OnDemand => "yes",
             Directive::PrivateTmp => "yes",
