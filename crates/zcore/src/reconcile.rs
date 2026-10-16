@@ -487,10 +487,6 @@ mod tests {
         assert!(rt.get(lazy).desired == Desired::Up, "lazy pulled up");
     }
 
-    fn tick_extras(rt: &Runtime, idx: Idx) -> bool {
-        rt.get(idx).desired == Desired::Up
-    }
-
     #[test]
     fn a_target_goes_running_without_a_process() {
         let mut p = build(&[("base", &[])]);
