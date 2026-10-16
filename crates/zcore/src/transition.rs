@@ -508,7 +508,7 @@ fn handle_death(
         runtime.get_mut(idx).restart_suppressed = true;
         match sp.on_fatal {
             OnFatal::Ignore => {
-                actions.push(log(idx, LogLevel::Info, alloc::format!("{description}")));
+                actions.push(log(idx, LogLevel::Info, description));
             }
             OnFatal::Warn => {
                 let (level, hint) = if sp.restart == Restart::Never {
