@@ -625,7 +625,10 @@ fn a_crash_is_restarted_within_budget() {
 /// (`doas: not installed setuid`), with no way back but a power cycle.
 /// NNP is defence in depth *after a uid drop*; without one it only breaks
 /// setuid children. Fails on the old code (status reads 1), passes fixed.
+/// Linux-only: it reads the child's `NoNewPrivs` from `/proc`, which the
+/// rest of this suite (and BSD/macOS runners) must never assume.
 #[test]
+#[cfg(target_os = "linux")]
 fn a_root_service_keeps_setuid_working() {
     let _one = serial();
     let scratch = Scratch::new("nnp");
