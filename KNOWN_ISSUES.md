@@ -97,3 +97,19 @@ a separate process, children excluded). The 2026-10-16 soak runs a
 pre-P0 binary (PSS baseline 948 kB fresh); P0 touched only
 transition arms, but the number belongs to the old build until the
 soak restarts on the release binary.
+
+## 2026-10-16 ~20:00Z — REMOVAL ATTEMPT SELF-LOCKOUT (open)
+- The PID1-aware power shim was deployed to /sbin/poweroff (and friends),
+  but the machine is OFFLINE and unresponsive 10+ min after `doas /sbin/reboot`.
+  Root cause suspected: the shim's zinit branch calls `/sbin/zctl reboot`,
+  which needs the control socket; under dinit PID 1 (the default boot)
+  /sbin/zctl has no supervisor to talk to, so it exits 1 and the shim did
+  nothing. The fallback to the original dinit applet was added too late
+  (only after the reboot had already been issued).
+- Status: box unreachable via SSH/tailscale/LAN; needs physical power cycle.
+- Recovery on next boot (dinit default): SSH in, restore the original
+  applets from /root/dinit-orig/sbin/shutdown.real, remove the
+  compat-service pins, and only retry removal with a cold-boot-into-zinit
+  verification before any power action.
+- Lesson recorded: never replace the power path while the machine may still
+  boot into dinit; test the shim under BOTH inits before relying on it.
