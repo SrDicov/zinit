@@ -127,4 +127,8 @@ Miri is lib-only by design: `cargo +nightly miri test -p zcore --lib` (never the
   start fresh; deleted-with-live-pid retire (one TERM, reaped, dropped). Any load
   failure keeps the old plan.
 - `SIGTERM/SIGINT/SIGHUP` to `--sup` still means "stop every service, stay up idle".
-  There is no poweroff/reboot path — don't add one beside the socket.
+  Power is explicit verbs, never signals: `zctl poweroff|reboot|halt|suspend`
+  (C4, orderly stop-all + deadline + breadcrumb; `hibernate` refused, no
+  resume target). The old no-power-path rule was reversed by operator order
+  on real hardware: a sole init that cannot power the machine is the bigger
+  evil. compatd maps dinit SHUTDOWN/reboot/poweroff/halt onto the same verbs.

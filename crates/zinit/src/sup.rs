@@ -102,6 +102,18 @@ pub fn run(config: Option<&Path>) -> io::Result<()> {
     Sup::new(plan, descs, config_dirs, gen_dir)?.supervise()
 }
 
+/// A machine-power verb waiting for quiescence.
+///
+/// `deadline_ms` bounds the wait: stop-timeouts already escalate TERM to
+/// KILL per service, so past the slowest `stop-timeout` plus grace anything
+/// still alive is unkillable (D-state) and the action proceeds loudly
+/// rather than hanging the power path forever — a hanging poweroff is how
+/// a user learns to long-press.
+struct PendingPower {
+    action: ctl::PowerAction,
+    deadline_ms: u64,
+}
+
 /// The supervisor's whole mutable state.
 ///
 /// One struct rather than eight parameters on every helper: the loop's steps all
@@ -120,6 +132,11 @@ struct Sup {
     /// Set once an operator asked for a stop, so a `Ctrl-C` storm is not a stop
     /// storm.
     stopping: bool,
+    /// A machine-power verb waiting for every service to stop. `suspend`
+    /// never lands here (it keeps state); `halt`/`poweroff`/`reboot` (and
+    /// `on-fatal = reboot`) converge through the same stop-all as
+    /// [`Self::request_stop`], then act. `None` is the steady state.
+    power: Option<PendingPower>,
     /// Services already announced as out of restart budget.
     ///
     /// The core emits `BudgetExhausted` on *every* reconciliation pass for a
@@ -304,12 +321,15 @@ impl Sup {
         }
 
         let mut slots = Vec::with_capacity(plan.services.len());
-        for (idx, (sp, desc)) in plan.services.iter().zip(descs).enumerate() {
-            let log = open_log(sp);
+        for (idx, (_sp, desc)) in plan.services.iter().zip(descs).enumerate() {
+            // ponytail: the log opens on first use, not here. Ninety open
+            // log files pin the rootfs busy and break an early
+            // remount,ro (root-ro); dinit opens per-service at start for
+            // the same reason. See log_line.
             slots.push(Slot {
                 svc: ManagedService::new(idx),
                 desc,
-                log,
+                log: None,
                 registered: None,
             });
         }
@@ -386,6 +406,7 @@ impl Sup {
             sigs,
             children,
             stopping: false,
+            power: None,
             budget_announced: Vec::new(),
             last_offenders: Vec::new(),
             ctl,
@@ -453,6 +474,10 @@ impl Sup {
             if !tick.changed.is_empty() {
                 self.check_invariants();
             }
+            // Machine power waits for the stop-all above to converge (or
+            // the deadline): a power verb answered "stopping every service
+            // first" lands here, never inside a signal or socket handler.
+            self.power_step(now);
             self.dump_state();
             self.flush_ctl();
         }
@@ -604,6 +629,180 @@ impl Sup {
     /// control socket to be told what the operator meant, and assuming that a
     /// `SIGTERM` means "power the machine off" would turn every `Ctrl-C` at a
     /// console into a reboot.
+    /// An `on-fatal = halt` service failed terminally: everything
+    /// wanted down, and the reconciler converges from there. Same
+    /// landing as [`Self::request_stop`], named for the service that
+    /// asked for it.
+    fn request_halt(&mut self, name: &str) {
+        if self.stopping {
+            return;
+        }
+        self.stopping = true;
+        for idx in 0..self.runtime.len() {
+            self.runtime.set_desired(idx, Desired::Down);
+        }
+        announce_degradation(&format!(
+            "{name} failed (on-fatal = halt): stopping every service.              The machine stays up and idle afterwards"
+        ));
+    }
+
+    /// An `on-fatal = reboot` service failed terminally: stop everything,
+    /// then reboot for real through the power epilogue (same path as an
+    /// operator `zctl reboot`, with the same stop-all and deadline).
+    fn request_reboot(&mut self, name: &str, now: u64) {
+        if self.stopping {
+            return;
+        }
+        self.stopping = true;
+        for idx in 0..self.runtime.len() {
+            self.runtime.set_desired(idx, Desired::Down);
+        }
+        let cap = self.power_cap_ms();
+        self.power = Some(PendingPower {
+            action: ctl::PowerAction::Reboot,
+            deadline_ms: now.saturating_add(cap),
+        });
+        announce_degradation(&format!(
+            "{name} failed (on-fatal = reboot): stopping every service, then rebooting"
+        ));
+    }
+
+    /// Longest `stop-timeout` in the plan plus grace: the epilogue waits
+    /// this long for quiescence before acting loudly anyway.
+    fn power_cap_ms(&self) -> u64 {
+        self.plan
+            .services
+            .iter()
+            .map(|s| s.stop_timeout_ms)
+            .max()
+            .unwrap_or(10_000)
+            .saturating_add(10_000)
+    }
+
+    /// An operator power verb from the control socket. `suspend` and
+    /// `hibernate` answer at once (no stopping involved); the rest arm the
+    /// epilogue and answer that the stop-all started. Terminal failures of
+    /// the syscalls themselves surface later, loudly, on the console.
+    fn request_power(&mut self, id: &str, action: ctl::PowerAction, now: u64) -> String {
+        match action {
+            ctl::PowerAction::Hibernate => {
+                return ctl::render_err(
+                    id,
+                    6,
+                    "hibernate needs a resume target; none is configured",
+                );
+            }
+            ctl::PowerAction::Suspend => {
+                return match Self::do_suspend() {
+                    // Answered after the flush below, so a sleeping machine
+                    // never leaves the client hanging: the reply is already
+                    // on the wire when the kernel sleeps.
+                    Ok(()) => ctl::render_ok(id, "suspended"),
+                    Err(e) => ctl::render_err(id, 6, &format!("suspend failed: {e}")),
+                };
+            }
+            _ => {}
+        }
+        if self.power.is_some() {
+            return ctl::render_ok(id, "power action already in progress");
+        }
+        let cap = self.power_cap_ms();
+        self.stopping = true;
+        for idx in 0..self.runtime.len() {
+            self.runtime.set_desired(idx, Desired::Down);
+        }
+        self.power = Some(PendingPower {
+            action,
+            deadline_ms: now.saturating_add(cap),
+        });
+        ctl::render_ok(id, "stopping every service first")
+    }
+
+    /// Sync filesystems, then ask the kernel to sleep. Services keep
+    /// running — suspend preserves state, so there is nothing to stop.
+    /// If the write fails the machine stays up and the caller gets the
+    /// errno, never a hang.
+    fn do_suspend() -> io::Result<()> {
+        zrt::sys::sync();
+        // Plain file write, no raw syscalls. The kernel refuses with
+        // EPERM/ENODEV where sleep is unsupported (VMs without S3,
+        // containers), which is exactly the honest error to report.
+        std::fs::write("/sys/power/state", "mem").map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    /// The power epilogue, once per pass. Fires when every process service
+    /// is stopped, or past the deadline (something unkillable), whichever
+    /// comes first. On syscall failure the machine stays up, the pending
+    /// action is cleared so the loop cannot spin the syscall, and the
+    /// console hears why.
+    fn power_step(&mut self, now: u64) {
+        let Some(pending) = &self.power else {
+            return;
+        };
+        let action = pending.action;
+        let deadline = pending.deadline_ms;
+        // ponytail: index_of per service is O(services^2) per pass; power
+        // verbs run once per boot, so this never shows up in a profile.
+        // Promote to stored indices if it ever does.
+        let quiet = self.plan.services.iter().all(|sp| {
+            if !sp.kind.has_process() {
+                return true;
+            }
+            match self.plan.index_of(&sp.name) {
+                Some(idx) => self.runtime.state_at(idx) == State::Stopped,
+                None => true,
+            }
+        });
+        if !quiet && now < deadline {
+            return;
+        }
+        if !quiet {
+            announce_degradation(
+                "power deadline passed with services still stopping: acting loudly anyway",
+            );
+        }
+        self.power = None;
+        Self::perform_power(action);
+    }
+
+    /// Breadcrumb, sync, act. The breadcrumb survives in `/var/log` so a
+    /// power cycle that never comes back still leaves testimony. Every
+    /// syscall here returns only on failure; success does not come back.
+    fn perform_power(action: ctl::PowerAction) {
+        let what = match action {
+            ctl::PowerAction::Halt => "halt",
+            ctl::PowerAction::Poweroff => "poweroff",
+            ctl::PowerAction::Reboot => "reboot",
+            ctl::PowerAction::Suspend | ctl::PowerAction::Hibernate => {
+                announce_degradation("power epilogue reached for suspend/hibernate: no-op");
+                return;
+            }
+        };
+        let _ = std::fs::write(
+            "/var/log/zinit-power.log",
+            format!("{}: stop-all done, acting\n", what),
+        );
+        zrt::sys::sync();
+        // Suspend/hibernate never reach the epilogue (answered at verb
+        // time); the arms below exist because the match must be exhaustive,
+        // not because they can fire.
+        let r = match action {
+            ctl::PowerAction::Halt => zrt::sys::halt(),
+            ctl::PowerAction::Poweroff => zrt::sys::power_off(),
+            ctl::PowerAction::Reboot => zrt::sys::reboot(),
+            ctl::PowerAction::Suspend | ctl::PowerAction::Hibernate => {
+                announce_degradation("power epilogue reached for suspend/hibernate: no-op");
+                return;
+            }
+        };
+        // Reached only when the kernel said no: stay up, say why.
+        announce_degradation(&format!(
+            "{what} failed: {}",
+            r.err().map(|e| e.to_string()).unwrap_or_default()
+        ));
+    }
+
     fn request_stop(&mut self, sig: Signal) {
         if self.stopping {
             return;
@@ -621,13 +820,34 @@ impl Sup {
 
     /// Reap every child that has finished, and hand the fact to the core.
     fn reap(&mut self, now: u64) {
-        let dead = match self.children.reap() {
+        let mut dead = match self.children.reap() {
             Ok(dead) => dead,
             Err(e) => {
                 announce_degradation(&format!("cannot reap children: {e}"));
                 return;
             }
         };
+        // Orphans: reparented children and double-forked daemons have no
+        // pidfd/knote, so the tracker never sees them — yet we are the
+        // subreaper, and an unreaped orphan is a zombie forever.
+        // `waitpid(-1)` only ever returns our own children; unknown pids
+        // fall through to the silent `untrack` below (absent pid is Ok),
+        // so this releases them with no log spam. A tracked pid won here
+        // first still travels the normal slot path, and its later backend
+        // firing finds nothing left to report.
+        // ponytail: one extra syscall per pass when childless (it returns
+        // at once); a dedicated orphan fd would save it at the cost of a
+        // fourth backend to maintain.
+        loop {
+            match zrt::sys::waitpid_nohang(-1) {
+                Ok(Some(waited)) => dead.push((waited.pid, waited.status)),
+                Ok(None) => break,
+                Err(e) => {
+                    announce_degradation(&format!("cannot sweep orphans: {e}"));
+                    break;
+                }
+            }
+        }
         for (pid, status) in dead {
             let idx = self.slots.iter().position(|s| s.svc.pid() == Some(pid));
             if let Some(idx) = idx {
@@ -673,6 +893,19 @@ impl Sup {
                 }
             };
             if let Some(event) = exec {
+                // A child that died on the way to execve names its step
+                // through the pipe; say it once (the announce record
+                // dedups repeats) so the log holds more than an errno.
+                if let Event::SpawnFailed { errno, step, .. } = &event {
+                    if *step != 0 {
+                        let name = self.name_of(idx);
+                        let cause = std::io::Error::from_raw_os_error(*errno);
+                        announce_degradation(&format!(
+                            "{name}: child failed at {} ({cause})",
+                            zservice::spawn::child_step_name(*step)
+                        ));
+                    }
+                }
                 self.feed(&event, now);
             }
 
@@ -1059,6 +1292,10 @@ impl Sup {
                 };
                 self.reply_ctl(client, &frame);
             }
+            Command::Power { client, id, action } => {
+                let frame = self.request_power(&id, action, now);
+                self.reply_ctl(client, &frame);
+            }
             Command::Version { client, id } => {
                 let payload = format!(
                     "zinit {} reactor={} signals={} children={}",
@@ -1075,7 +1312,8 @@ impl Sup {
                     &ctl::render_ok(
                         &id,
                         "status <name> | list | start <name> | stop <name> | \
-                         restart <name> | kick <name> | reload-all | version | help",
+                         restart <name> | kick <name> | reload-all | poweroff | \
+                         reboot | halt | suspend | hibernate | version | help",
                     ),
                 );
             }
@@ -1129,18 +1367,22 @@ impl Sup {
                 slot.desc = new_descs[new_idx].take();
                 new_slots.push(slot);
             } else {
-                let log = open_log(sp);
+                // Log opens lazily (see the boot path): pre-opening every
+                // newcomer's sink would re-pin the rootfs the same way.
                 // A reload during an operator stop must not resurrect: new
-                // services join the stop, they do not outvote it.
+                // services join the stop, they do not outvote it. Otherwise a
+                // newcomer follows the same rule as boot: only `enabled`
+                // services want up (an `enabled = no` service arriving via
+                // reload-all stays down until an operator starts it).
                 if self.stopping {
                     new_runtime.set_desired(new_idx, Desired::Down);
-                } else {
+                } else if new_plan.services[new_idx].enabled {
                     new_runtime.set_desired(new_idx, Desired::Up);
                 }
                 new_slots.push(Slot {
                     svc: ManagedService::new(new_idx),
                     desc: new_descs[new_idx].take(),
-                    log,
+                    log: None,
                     registered: None,
                 });
             }
@@ -1299,6 +1541,19 @@ impl Sup {
                 | Action::DepsChanged(_)
                 | Action::CascadeStop { .. }
                 | Action::Unpin(_) => {}
+                // `on-fatal = halt`: the operator marked this failure
+                // machine-critical. Same landing as SIGTERM (everything
+                // down, idle afterwards), named for the service.
+                Action::Halt { idx } => {
+                    let name = self.name_of(*idx).to_owned();
+                    self.request_halt(&name);
+                }
+                // `on-fatal = reboot`: stop everything, then reboot through
+                // the power epilogue (same path as `zctl reboot`).
+                Action::Reboot { idx } => {
+                    let name = self.name_of(*idx).to_owned();
+                    self.request_reboot(&name, now);
+                }
                 // ponytail: no controlling terminal in this phase — no getty and
                 // no `type = console` handover, so there is nothing to grant or
                 // revoke. `SpawnCtx::tty` is the hook; wire it when the console
@@ -1332,7 +1587,14 @@ impl Sup {
             let errno = e.raw_os_error().unwrap_or(libc::EIO);
             let name = self.name_of(idx);
             announce_degradation(&format!("{name}: cannot bind listen sockets ({e})"));
-            self.feed(&Event::SpawnFailed { idx, errno }, now);
+            self.feed(
+                &Event::SpawnFailed {
+                    idx,
+                    errno,
+                    step: 0,
+                },
+                now,
+            );
             return;
         }
         let sp = &self.plan.services[idx];
@@ -1382,7 +1644,14 @@ impl Sup {
             };
             let name = self.name_of(idx);
             announce_degradation(&format!("{name}: cannot spawn ({e})"));
-            self.feed(&Event::SpawnFailed { idx, errno }, now);
+            self.feed(
+                &Event::SpawnFailed {
+                    idx,
+                    errno,
+                    step: 0,
+                },
+                now,
+            );
             return;
         }
         // The announcement record stands: "backing off" was already said for
@@ -1414,8 +1683,15 @@ impl Sup {
         let Some(slot) = self.slots.get_mut(idx) else {
             return;
         };
+        if slot.log.is_none() {
+            // First use opens the sink (see the boot path). A failing
+            // sink announces on each attempt until one succeeds; those
+            // attempts only happen on lifecycle events, which the restart
+            // budget already throttles, so this cannot flood.
+            let sp = &self.plan.services[idx];
+            slot.log = open_log(sp);
+        }
         let Some(handle) = slot.log.as_mut() else {
-            // No sink: the failure to open it was announced once, at load time.
             return;
         };
         if let Err(e) = write_line(handle, line.as_bytes()) {

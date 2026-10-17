@@ -19,7 +19,15 @@ pub enum Event {
     ExecOk(Idx),
 
     /// `fork` or `execve` failed. `errno` is positive and meaningful.
-    SpawnFailed { idx: Idx, errno: i32 },
+    ///
+    /// `step` names where a child died on the way to `execve`: 0 means the
+    /// spawn never forked (the supervisor refused it: bad log sink,
+    /// unbindable socket), 1..=12 is the pre-exec step tag the child
+    /// reported through the exec-error pipe before `_exit(127)` (sigmask,
+    /// session, fds, chdir, rlimits, cgroup, ids, capdrop, ctty, seccomp,
+    /// execve, mount). The core ignores it; it exists so the operator's
+    /// log names the failing step instead of just the errno.
+    SpawnFailed { idx: Idx, errno: i32, step: u32 },
 
     /// The service signalled readiness through the notify fd, or the
     /// `ready` adapter succeeded.
@@ -171,7 +179,11 @@ mod tests {
     fn idx_is_readable_on_every_variant() {
         let events = [
             Event::ExecOk(3),
-            Event::SpawnFailed { idx: 3, errno: 2 },
+            Event::SpawnFailed {
+                idx: 3,
+                errno: 2,
+                step: 6,
+            },
             Event::Ready(3),
             Event::ReadyTimeout(3),
             Event::StartTimeout(3),

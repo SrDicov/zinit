@@ -527,6 +527,47 @@ fn supervisor_reaps_the_service_on_stop() {
     );
 }
 
+/// A demand-pulled service that exits immediately keeps flapping.
+///
+/// Live 2026-10-16: `agetty-service@tty1` (disabled at boot, pulled by the
+/// running `agetty` oneshot) spawned once and stayed `Running` with a dead
+/// pid forever — exactly one attempt, `restarts = 0`, no respawn. This test
+/// is that shape (requirer up, disabled instance dep, instant death) and
+/// asserts the only honest outcomes: repeated attempts. One attempt ever
+/// means the death vanished between spawn and account.
+#[test]
+fn a_demand_pulled_instant_death_keeps_flapping() {
+    let _one = serial();
+    let scratch = Scratch::new("demandflap");
+    let puller = format!(
+        "{}\ndepends = flapper@tty1\n",
+        desc(&announce_then_sleep(&scratch.at("a.pid"), 30), "")
+    );
+    scratch.conf("a.conf", &puller);
+    let command = format!(
+        "echo $$ > {}; echo x >> {}; exit 1",
+        scratch.at("b.pid"),
+        scratch.at("attempts")
+    );
+    let body = format!(
+        "type = script\ncommand = {command}\nready = none\nlog = none\nenabled = no\nrestart = always\nrestart-delay = 100ms\n"
+    );
+    scratch.conf("flapper@tty1.conf", &body);
+
+    let mut sup = Sup::start(&scratch);
+    assert!(
+        wait_until(5_000, || scratch.lines("attempts") >= 4),
+        "demand-pulled flapper died instantly and `restart = always` should have \
+         started it again, but there were only {} attempts in 5s: the death went \
+         stale (live: Running with a dead pid, restarts 0)",
+        scratch.lines("attempts")
+    );
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor itself died while a demand-pulled service flapped"
+    );
+}
+
 /// A service that exits immediately is restarted — several times, and at a rate
 /// a human can still read the log for.
 ///
@@ -577,6 +618,42 @@ fn a_crash_is_restarted_within_budget() {
     );
 }
 
+/// A service that stays root must not carry NoNewPrivs.
+///
+/// NNP was once set unconditionally in the child path; every descendant —
+/// including ssh sessions — then silently lost all setuid elevation
+/// (`doas: not installed setuid`), with no way back but a power cycle.
+/// NNP is defence in depth *after a uid drop*; without one it only breaks
+/// setuid children. Fails on the old code (status reads 1), passes fixed.
+/// Linux-only: it reads the child's `NoNewPrivs` from `/proc`, which the
+/// rest of this suite (and BSD/macOS runners) must never assume.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_root_service_keeps_setuid_working() {
+    let _one = serial();
+    let scratch = Scratch::new("nnp");
+    let command = format!(
+        "grep ^NoNewPrivs /proc/self/status > {}; exec /bin/sleep 30",
+        scratch.at("nnp.status")
+    );
+    scratch.conf("plain.conf", &desc(&command, ""));
+    let mut sup = Sup::start(&scratch);
+    assert!(
+        wait_until(10_000, || scratch.read("nnp.status").is_some()),
+        "the service never reported its NoNewPrivs status in 10s"
+    );
+    let status = scratch.read("nnp.status").unwrap_or_default();
+    assert!(
+        status.contains("NoNewPrivs:\t0"),
+        "a service with no `user =` runs with NoNewPrivs set ({status:?}): \
+         its whole subtree lost setuid elevation"
+    );
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor itself died while supervising a plain service"
+    );
+}
+
 /// A cycle in the graph has no topological order, so there is no plan. The
 /// supervisor must refuse the whole directory rather than start the half of it
 /// it happens to understand.
@@ -615,4 +692,34 @@ fn an_unparseable_config_refuses_to_start() {
     let (status, stderr) = run_to_exit(&scratch);
     assert_refused(&status, &stderr, "an unparseable service description");
     assert_nothing_left_running(&scratch, &["good.pid"]);
+}
+
+/// An orphaned grandchild must be reaped, not left a zombie.
+///
+/// The supervisor is the child subreaper, so a service that forks and exits
+/// leaves its child to us. The pidfd backend only watches pids it started;
+/// the reap loop must additionally sweep `waitpid(-1)` or the orphan answers
+/// `kill(pid, 0)` forever. `pid_gone` (ESRCH) is the whole assertion: a
+/// zombie still answers liveness probes, so "alive" would pass on a corpse.
+#[test]
+fn a_reparented_orphan_is_reaped_not_left_a_zombie() {
+    let _one = serial();
+    let scratch = Scratch::new("orphan");
+    scratch.conf(
+        "forker.conf",
+        &desc(
+            &format!("sleep 30 & echo $! > {}", scratch.at("gc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    let gc = sup.await_live_pid("gc.pid", START_DEADLINE_MS);
+    // The service exited at once; the grandchild belongs to the supervisor
+    // now. Kill it and require collection, not a corpse.
+    signal(gc, libc::SIGKILL);
+    assert!(
+        wait_until(REAP_DEADLINE_MS, || pid_gone(gc)),
+        "orphan {gc} was never reaped: it still answers kill(0), \
+         so a zombie is sitting under the supervisor"
+    );
 }

@@ -96,10 +96,34 @@ pub enum Command {
     },
     /// `reload-all`: rebuild the plan without disturbing live pids.
     ReloadAll { client: RawFd, id: String },
+    /// `poweroff | reboot | halt | suspend | hibernate`: machine power.
+    /// `hibernate` always answers an error (no resume target exists);
+    /// the rest stop every service first, then act.
+    Power {
+        client: RawFd,
+        id: String,
+        action: PowerAction,
+    },
     /// `version`: binary version plus the backend capability line.
     Version { client: RawFd, id: String },
     /// `help`: the verbs this server speaks.
     Help { client: RawFd, id: String },
+}
+
+/// A machine-power verb. Parsed in [`Command`], executed by the supervisor
+/// (stop every service first, except `suspend`, which keeps state).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PowerAction {
+    /// Stop the CPU, leave the power on.
+    Halt,
+    /// Stop everything, then cut the power.
+    Poweroff,
+    /// Stop everything, then boot again.
+    Reboot,
+    /// Sync and sleep (RAM stays powered). No services are stopped.
+    Suspend,
+    /// Refused: hibernation needs a resume target that does not exist.
+    Hibernate,
 }
 
 /// A frame that parsed but means nothing: the id to blame, a code, a reason.
@@ -207,6 +231,46 @@ pub fn parse_line(client: RawFd, line: &str) -> Result<Command, CtlError> {
         "reload-all" => {
             no_args(&id, verb)?;
             Ok(Command::ReloadAll { client, id })
+        }
+        "poweroff" => {
+            no_args(&id, verb)?;
+            Ok(Command::Power {
+                client,
+                id,
+                action: PowerAction::Poweroff,
+            })
+        }
+        "reboot" => {
+            no_args(&id, verb)?;
+            Ok(Command::Power {
+                client,
+                id,
+                action: PowerAction::Reboot,
+            })
+        }
+        "halt" => {
+            no_args(&id, verb)?;
+            Ok(Command::Power {
+                client,
+                id,
+                action: PowerAction::Halt,
+            })
+        }
+        "suspend" => {
+            no_args(&id, verb)?;
+            Ok(Command::Power {
+                client,
+                id,
+                action: PowerAction::Suspend,
+            })
+        }
+        "hibernate" => {
+            no_args(&id, verb)?;
+            Ok(Command::Power {
+                client,
+                id,
+                action: PowerAction::Hibernate,
+            })
         }
         "version" => {
             no_args(&id, verb)?;
@@ -581,8 +645,44 @@ mod tests {
             parse("C 7 reload-all"),
             Ok(Command::ReloadAll { .. })
         ));
-        assert!(matches!(parse("C 8 version"), Ok(Command::Version { .. })));
-        assert!(matches!(parse("C 9 help"), Ok(Command::Help { .. })));
+        assert!(matches!(
+            parse("C 8 poweroff"),
+            Ok(Command::Power {
+                action: PowerAction::Poweroff,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse("C 9 reboot"),
+            Ok(Command::Power {
+                action: PowerAction::Reboot,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse("C 10 halt"),
+            Ok(Command::Power {
+                action: PowerAction::Halt,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse("C 11 suspend"),
+            Ok(Command::Power {
+                action: PowerAction::Suspend,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse("C 12 hibernate"),
+            Ok(Command::Power {
+                action: PowerAction::Hibernate,
+                ..
+            })
+        ));
+        assert!(matches!(parse("C 13 version"), Ok(Command::Version { .. })));
+        assert!(matches!(parse("C 14 help"), Ok(Command::Help { .. })));
+        assert!(parse("C 15 poweroff now").is_err(), "power takes no args");
     }
 
     #[test]

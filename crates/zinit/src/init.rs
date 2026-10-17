@@ -3,7 +3,9 @@
 //! Four jobs, no more (`DESIGN.md` §3):
 //!
 //! 1. Block every signal, so nothing can interrupt a `fork` or be lost.
-//! 2. Mount the minimum: `/proc`, `/sys`, `/run`.
+//! 2. Mount the minimum: `/proc`, `/sys`, `/run`, and the cgroup2
+//!    hierarchy (without it every `cgroup =` service fails obscurely,
+//!    and nothing else mounts it on a systemd-less boot).
 //! 3. Fork+exec the supervisor, `zinit --sup`.
 //! 4. Reap, unconditionally, forever.
 //!
@@ -162,6 +164,10 @@ fn mount_minimum() {
         ("proc", "/proc", None),
         ("sysfs", "/sys", None),
         ("tmpfs", "/run", Some("mode=0755")),
+        // No systemd means no cgroup2 mount, and without one every
+        // `cgroup =` spawn dies with a bare ENOENT deep in the child
+        // path. The source word is ignored for cgroup2; the type is not.
+        ("cgroup2", "/sys/fs/cgroup", None),
     ];
     for (fstype, target, data) in TABLE.iter().copied() {
         match zrt::sys::mount(

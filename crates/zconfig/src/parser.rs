@@ -69,7 +69,7 @@
 //! | `E007` | a value of the wrong shape (rlimit, `critical`, line too long) |
 //! | `E008` | a `depends` entry that is really an assignment |
 //! | `E009` | empty dependency name |
-//! | `E010` | a name declared both required and optional |
+//! | `E010` | a dependency name in two lists (required-first stays silent) |
 //! | `E011` | `depends` given to a `target` |
 //! | `E012` | `cgroup` or `rlimit-*` given to a `target` |
 //! | `E015` | the text exceeds the line or line-count limit |
@@ -102,7 +102,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use zcore::{SeccompAction, ServiceKind};
+use zcore::{OnFatal, SeccompAction, ServiceKind};
 
 use crate::desc::{ServiceDesc, validate_service_name};
 use crate::diagnostic::{Diagnostic, DiagnosticBag, Span};
@@ -144,7 +144,8 @@ pub enum Directive {
     Command,
     /// `process` | `script` | `target` | `console`.
     Type,
-    /// Comma-separated dependency names, `opt:`-prefixed for optional edges.
+    /// Comma-separated dependency names, `opt:`-prefixed for optional edges
+    /// and `after:`-prefixed for order-only edges.
     Depends,
     /// `never` | `on-failure` | `always`, or a budget.
     Restart,
@@ -168,6 +169,8 @@ pub enum Directive {
     Log,
     /// `yes` | `no`: whether a failure takes the system down.
     Critical,
+    /// `ignore` | `warn` | `halt` | `reboot`: what a terminal failure means.
+    OnFatal,
     /// `yes` | `no`: whether the service starts at boot.
     Enabled,
     /// `yes` | `no`: whether the first connection to a held socket starts
@@ -217,6 +220,7 @@ impl Directive {
             Directive::Env => "env",
             Directive::Log => "log",
             Directive::Critical => "critical",
+            Directive::OnFatal => "on-fatal",
             Directive::Enabled => "enabled",
             Directive::OnDemand => "on-demand",
             Directive::PrivateTmp => "private-tmp",
@@ -242,7 +246,7 @@ impl Directive {
     /// hidden property of the service *name* would be a policy nobody could
     /// read off the file. The alternative, refusing to model it at all, means
     /// the runtime has to hardcode the same list somewhere less visible.
-    pub const ALL: [Directive; 28] = [
+    pub const ALL: [Directive; 29] = [
         Directive::Command,
         Directive::Type,
         Directive::Depends,
@@ -257,6 +261,7 @@ impl Directive {
         Directive::Env,
         Directive::Log,
         Directive::Critical,
+        Directive::OnFatal,
         Directive::Enabled,
         Directive::OnDemand,
         Directive::PrivateTmp,
@@ -880,6 +885,21 @@ pub fn parse_service_with_diagnostics(name: &str, text: &str) -> Result<ParsedSe
                     }
                 };
             }
+            Directive::OnFatal => {
+                desc.on_fatal = match value.trim() {
+                    "ignore" => OnFatal::Ignore,
+                    "warn" => OnFatal::Warn,
+                    "halt" => OnFatal::Halt,
+                    "reboot" => OnFatal::Reboot,
+                    _ => {
+                        return Err(bad_value(
+                            directive,
+                            value_span,
+                            "write `ignore`, `warn`, `halt`, or `reboot`; the default is warn, so anything else is explicit",
+                        ));
+                    }
+                };
+            }
             Directive::Enabled => {
                 desc.enabled = match parse_bool(value) {
                     Some(b) => b,
@@ -1449,7 +1469,7 @@ fn split_list_spans(value: &str) -> Vec<ListEntry> {
     out
 }
 
-/// Split `depends = a, opt:b, c` into required and optional names.
+/// Split `depends = a, opt:b, after:c` into required, optional, and order-only names.
 ///
 /// Errors point at the offending **entry**, not at the whole line: "a, opt:,
 /// c" is a typo about one name, and a diagnostic that underlines the entire
@@ -1496,7 +1516,7 @@ fn parse_depends(
                 ),
             ));
         }
-        if text.contains(':') && !text.starts_with("opt:") {
+        if text.contains(':') && !text.starts_with("opt:") && !text.starts_with("after:") {
             return Err(ParseError::new(
                 ParseErrorKind::BadList,
                 "E008",
@@ -1506,14 +1526,17 @@ fn parse_depends(
                     quote(text)
                 ),
                 String::from(
-                    "`opt:` is the only prefix a dependency takes, and a `.target` suffix needs none",
+                    "a dependency is `name`, `opt:name`, or `after:name`; `.target` needs no suffix",
                 ),
             ));
         }
 
-        let (name, optional) = match text.strip_prefix("opt:") {
-            Some(rest) => (rest, true),
-            None => (text, false),
+        let (name, class) = match text.strip_prefix("opt:") {
+            Some(rest) => (rest, 1),
+            None => match text.strip_prefix("after:") {
+                Some(rest) => (rest, 2),
+                None => (text, 0),
+            },
         };
         let name = name.trim();
         if name.is_empty() {
@@ -1521,8 +1544,8 @@ fn parse_depends(
                 ParseErrorKind::BadList,
                 "E009",
                 entry_span,
-                String::from("`opt:` with no name after it"),
-                String::from("write `opt:name`"),
+                String::from("`opt:`/`after:` with no name after it"),
+                String::from("write `opt:name` or `after:name`"),
             ));
         }
         if name == self_name {
@@ -1531,7 +1554,7 @@ fn parse_depends(
                 "E016",
                 entry_span,
                 format!("`{self_name}` depends on itself"),
-                String::from("a service cannot be its own dependency, not even optionally"),
+                String::from("a service cannot be its own dependency, in any list"),
             ));
         }
         // A dependency name is a service name. Checking it with the same
@@ -1551,28 +1574,63 @@ fn parse_depends(
             ));
         }
 
-        // An exact duplicate is idempotent; a name that changes qualification
-        // is a contradiction, and which one the author meant is a question the
-        // file cannot answer.
-        if desc.requires(name) {
+        // An exact duplicate is idempotent. Across lists the first
+        // declaration counts, with one asymmetry: required always wins.
+        // Required-first is silent (`a, opt:a` keeps the required edge);
+        // required-second is E010 (`opt:a, a` errors: silently upgrading a
+        // soft edge to a boot-gating one is the failure mode where a typo
+        // turns into an outage under load). `opt:` vs `after:` with no
+        // required involved is E010 either way: "ignore it" and "wait for
+        // it" are contradictory instructions the file cannot resolve.
+        let in_required = desc.requires(name);
+        let in_optional = desc.depends_optional.iter().any(|n| n == name);
+        let in_after = desc.depends_after.iter().any(|n| n == name);
+        let same =
+            (class == 0 && in_required) || (class == 1 && in_optional) || (class == 2 && in_after);
+        if same {
             continue;
         }
-        if desc.depends_optional.iter().any(|n| n == name) {
-            if optional {
-                continue;
+        if in_required {
+            // Required already claimed it: silent, required wins.
+            continue;
+        }
+        if class == 0 {
+            // Required second: E010 only when a soft list claimed it
+            // first (silently upgrading a soft edge to a boot-gating one
+            // is the failure mode where a typo turns into an outage under
+            // load); a fresh name just pushes below.
+            if in_optional || in_after {
+                let first = if in_optional {
+                    "optional"
+                } else {
+                    "order-only"
+                };
+                return Err(ParseError::new(
+                    ParseErrorKind::BadList,
+                    "E010",
+                    entry_span,
+                    format!("`{name}` is already declared {first} and is now declared required"),
+                    String::from(
+                        "pick one: a dependency either gates startup, orders it, or does neither",
+                    ),
+                ));
             }
+        } else if in_optional || in_after {
+            // `opt:` vs `after:` with no required involved: "ignore it"
+            // and "wait for it" are contradictory instructions the file
+            // cannot resolve.
             return Err(ParseError::new(
                 ParseErrorKind::BadList,
                 "E010",
                 entry_span,
-                format!("`{name}` is already declared optional and is now declared required"),
-                String::from("pick one: a dependency either gates startup or it does not"),
+                format!("`{name}` is already declared softly and is now declared differently"),
+                String::from("pick one: `opt:` ignores the dependency, `after:` waits for it"),
             ));
         }
-        if optional {
-            desc.depends_optional.push(name.to_owned());
-        } else {
-            desc.depends_required.push(name.to_owned());
+        match class {
+            1 => desc.depends_optional.push(name.to_owned()),
+            2 => desc.depends_after.push(name.to_owned()),
+            _ => desc.depends_required.push(name.to_owned()),
         }
     }
     Ok(())
@@ -2203,6 +2261,7 @@ rlimit-nofile = 8192
             Directive::User => "0",
             Directive::Log => "syslog",
             Directive::Critical => "no",
+            Directive::OnFatal => "warn",
             Directive::Enabled => "no",
             Directive::OnDemand => "yes",
             Directive::PrivateTmp => "yes",
@@ -2683,6 +2742,55 @@ rlimit-nofile = 8192
             d.depends_optional.is_empty(),
             "the first declaration is the one that counts"
         );
+    }
+
+    #[test]
+    fn after_prefix_parses_into_the_order_only_list() {
+        let d = ok("command = /bin/true\ndepends = a, after:b\n");
+        assert_eq!(d.depends_required, ["a"]);
+        assert_eq!(d.depends_after, ["b"]);
+        assert!(d.depends_optional.is_empty());
+    }
+
+    #[test]
+    fn soft_lists_contradict_each_other() {
+        // opt: ignores, after: waits: no first-wins, the file cannot mean both.
+        assert_eq!(
+            err("command = /bin/true\ndepends = opt:a, after:a\n").code,
+            "E010"
+        );
+        assert_eq!(
+            err("command = /bin/true\ndepends = after:a, opt:a\n").code,
+            "E010"
+        );
+        // Required still escalates loudly when second, silently when first.
+        assert_eq!(
+            err("command = /bin/true\ndepends = after:a, a\n").code,
+            "E010"
+        );
+        let d = ok("command = /bin/true\ndepends = a, after:a\n");
+        assert_eq!(d.depends_required, ["a"]);
+        assert!(d.depends_after.is_empty());
+    }
+
+    #[test]
+    fn on_fatal_parses_all_four_policies() {
+        use zcore::OnFatal;
+        assert_eq!(ok("command = /bin/true\n").on_fatal, OnFatal::Warn);
+        assert_eq!(
+            ok("command = /bin/true\non-fatal = ignore\n").on_fatal,
+            OnFatal::Ignore
+        );
+        assert_eq!(
+            ok("command = /bin/true\non-fatal = halt\n").on_fatal,
+            OnFatal::Halt
+        );
+        assert_eq!(
+            ok("command = /bin/true\non-fatal = reboot\n").on_fatal,
+            OnFatal::Reboot
+        );
+        let e = err("command = /bin/true\non-fatal = explode\n");
+        assert_eq!(e.code, "E007");
     }
 
     #[test]

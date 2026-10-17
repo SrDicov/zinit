@@ -431,7 +431,7 @@ no está en el init, está en **cinco syscalls** que no existen igual en todas p
 | Seguimiento de hijos | `pidfd_open` (5.3+) | `kqueue` `EVFILT_PROC`/`NOTE_EXIT` | idem; fallback `waitpid(WNOHANG)` + `SIGCHLD` |
 | Señalas como fds | `signalfd` | `kqueue` `EVFILT_SIGNAL` | **Las señales entran por el mismo reactor que todo lo demás.** Fallback: self-pipe |
 | uid/gid | `setresuid`/`setresgid` | **no existen** | Detección en runtime: si hay `setresuid`, usarlo; si no, `setuid`+verificación explícita de `getuid()==geteuid()` |
-| No-new-privs | `prctl(PR_SET_NO_NEW_PRIVS)` | — | Linux; no-op + aviso en BSD |
+| No-new-privs | `prctl(PR_SET_NO_NEW_PRIVS)` | — | Linux, solo tras drop de uid; no-op + aviso en BSD |
 | ASLR off por servicio | `personality(ADDR_NO_RANDOMIZE)` | — | Linux; no-op + aviso |
 | Capabilities | `libcap` (CGO) | — | Linux; en BSD el modelo es uid/gid, sin fallo |
 | cgroups | v2 (unificada), v1 (legacy) | jails (v2) | Linux: v2 con fallback v1. BSD: no-op + aviso |
@@ -498,7 +498,7 @@ cgroup.create("zinit.slice/nombre")        → es el ÚLTIMO paso con privilegio
 place(child_pid)                           
 fijo: fds de log, fds de notify,           cerrar todo lo demás
        socket de control                   personality(ADDR_NO_RANDOMIZE)  [Linux]
-                                           prctl(NO_NEW_PRIVS)           [Linux]
+                                           prctl(NO_NEW_PRIVS) [solo tras drop de uid]
                                            fchown/fchmod sobre el fd     [no TOCTOU]
                                            cap_set_proc / cap_set        [Linux/libcap]
                                            setsid + TIOCSCTTY            [console]

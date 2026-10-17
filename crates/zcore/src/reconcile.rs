@@ -52,6 +52,41 @@ impl Tick {
 pub fn reconcile(runtime: &mut Runtime, plan: &Plan, now_ms: u64) -> Tick {
     let mut tick = Tick::default();
 
+    // ── Pass 0: demand-start (dinit's `depends-on` activation) ────────────
+    //
+    // A dependency that was disabled at boot (`enabled = no`, believed
+    // unreachable by the convert closure) becomes wanted-up exactly when
+    // a service that really pulls it is actually running — mirrors dinit's
+    // activation propagation instead of only the static plan. Only services
+    // that were disabled at *load* participate (operator-stopped services
+    // keep `enabled = true`, so `zctl stop` is never overridden by a
+    // future dependent going up). `ponytail:` racy rescan is O(services*
+    // edges) per tick; promote to a dirty flag when a reload adds an edge.
+    for i in 0..runtime.len() {
+        if runtime.get(i).desired != Desired::Up {
+            continue;
+        }
+        // No state gate on the dependent: a service that is wanted up but
+        // blocked behind a disabled dep must be allowed to pull that dep
+        // even while still Stopped. Otherwise the enable never fires (the
+        // trigger can only pull; it may not spawn), and the disabled service
+        // stays down forever — exactly the Artix agetty chain.
+        for &d in &plan.services[i].required {
+            if plan.services[d].enabled {
+                continue;
+            }
+            let dr = runtime.get(d);
+            if dr.desired != Desired::Down || dr.restart_suppressed {
+                continue;
+            }
+            if dr.state != State::Stopped {
+                continue;
+            }
+            runtime.set_desired(d, Desired::Up);
+            tick.changed.push(d);
+        }
+    }
+
     // ── Pass 1: start, in topological order ───────────────────────────────
     //
     // Walking `order_up` forward means every dependency has already been
@@ -65,9 +100,13 @@ pub fn reconcile(runtime: &mut Runtime, plan: &Plan, now_ms: u64) -> Tick {
         }
 
         // Targets have no process: they are up exactly when their required
-        // dependencies are. No spawn, no budget, no readiness.
+        // dependencies are. No spawn, no budget, no readiness. A dangling
+        // required edge holds the target like any unmet requirement, loudly
+        // at load and quietly here — never the boot.
         if !sp.kind.has_process() {
-            let deps_ok = runtime.deps_satisfied(idx, plan);
+            let deps_ok = runtime.deps_satisfied(idx, plan)
+                && runtime.after_satisfied(idx, plan)
+                && sp.missing_required.is_empty();
             let cur = runtime.get(idx).state;
             if deps_ok && cur != State::Running {
                 runtime.get_mut(idx).state = State::Running;
@@ -94,6 +133,15 @@ pub fn reconcile(runtime: &mut Runtime, plan: &Plan, now_ms: u64) -> Tick {
             State::Stopped => {
                 // Should this service be running at all right now?
                 if !runtime.deps_satisfied(idx, plan) {
+                    continue;
+                }
+                // Order-only edges: wait for the first attempt, never for
+                // success. See `after_satisfied` for the release rule.
+                if !runtime.after_satisfied(idx, plan) {
+                    continue;
+                }
+                // Dangling required edges: hold, never spawn into the void.
+                if !sp.missing_required.is_empty() {
                     continue;
                 }
                 // A death the policy refused to retry. `Desired` is still
@@ -253,7 +301,7 @@ pub fn due_events(runtime: &Runtime, plan: &Plan, now_ms: u64) -> Vec<crate::Eve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ServiceKind, ServicePlan};
+    use crate::types::{Desired, ServiceKind, ServicePlan};
     use alloc::{vec, vec::Vec};
     use std::string::String;
 
@@ -320,6 +368,135 @@ mod tests {
         assert_eq!(spawned[0], p.index_of("a").unwrap());
     }
 
+    fn spawned(t: &Tick) -> Vec<Idx> {
+        t.actions
+            .iter()
+            .filter_map(|a| match *a {
+                Action::Spawn(i) => Some(i),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn after_edge_holds_spawn_until_first_attempt() {
+        let mut p = build(&[("a", &[]), ("b", &[])]);
+        let (a, b) = (p.index_of("a").unwrap(), p.index_of("b").unwrap());
+        p.services[b].after = vec![a];
+        let mut rt = Runtime::from_plan(&p);
+        rt.set_desired(a, Desired::Up);
+        rt.set_desired(b, Desired::Up);
+        let t = reconcile(&mut rt, &p, 0);
+        assert_eq!(spawned(&t), vec![a], "b waits for a's attempt: {t:?}");
+        // A mere start (attempt in flight) releases the waiter.
+        rt.get_mut(a).state = State::Starting;
+        let t = reconcile(&mut rt, &p, 0);
+        assert_eq!(spawned(&t), vec![b], "a started, b goes: {t:?}");
+    }
+
+    #[test]
+    fn after_holds_while_a_oneshot_is_mid_flight() {
+        // A started daemon releases (effects unfold over its lifetime),
+        // but a started oneshot does not: its effects land at completion.
+        // Releasing on Starting raced the Artix ro→rw remount.
+        let mut p = build(&[("a", &[]), ("b", &[])]);
+        let (a, b) = (p.index_of("a").unwrap(), p.index_of("b").unwrap());
+        p.services[a].kind = ServiceKind::Oneshot;
+        p.services[b].after = vec![a];
+        let mut rt = Runtime::from_plan(&p);
+        rt.set_desired(a, Desired::Up);
+        rt.set_desired(b, Desired::Up);
+        rt.get_mut(a).state = State::Starting;
+        let t = reconcile(&mut rt, &p, 0);
+        assert!(spawned(&t).is_empty(), "mid-oneshot holds b: {t:?}");
+        rt.get_mut(a).completed = true;
+        let t = reconcile(&mut rt, &p, 0);
+        assert_eq!(spawned(&t), vec![b], "completed oneshot releases b: {t:?}");
+    }
+
+    #[test]
+    fn after_releases_on_terminal_outcomes() {
+        // Completed, failed, suppressed, and disabled all release: order
+        // without gating, so a dead early oneshot delays followers but
+        // never wedges them. A failed (retryable) dependency still spawns
+        // itself alongside the released waiter; completed and suppressed
+        // ones stay down.
+        let terminals: [fn(&mut Runtime, Idx); 3] = [
+            |rt: &mut Runtime, a: Idx| rt.get_mut(a).completed = true,
+            |rt: &mut Runtime, a: Idx| rt.get_mut(a).failed_starts = 1,
+            |rt: &mut Runtime, a: Idx| rt.get_mut(a).restart_suppressed = true,
+        ];
+        for setup in terminals {
+            let mut p = build(&[("a", &[]), ("b", &[])]);
+            let (a, b) = (p.index_of("a").unwrap(), p.index_of("b").unwrap());
+            p.services[a].kind = ServiceKind::Oneshot;
+            p.services[b].after = vec![a];
+            let mut rt = Runtime::from_plan(&p);
+            rt.set_desired(a, Desired::Up);
+            rt.set_desired(b, Desired::Up);
+            setup(&mut rt, a);
+            let t = reconcile(&mut rt, &p, 0);
+            let got = spawned(&t);
+            assert!(got.contains(&b), "terminal a releases b: {t:?}");
+            if got.contains(&a) {
+                // The failed (retryable) case also respawns a itself.
+                assert_eq!(got, vec![a, b], "retry rides along: {t:?}");
+            }
+        }
+        // Disabled (desired down) releases too.
+        let mut p = build(&[("a", &[]), ("b", &[])]);
+        let (a, b) = (p.index_of("a").unwrap(), p.index_of("b").unwrap());
+        p.services[b].after = vec![a];
+        let mut rt = Runtime::from_plan(&p);
+        rt.set_desired(b, Desired::Up);
+        let t = reconcile(&mut rt, &p, 0);
+        assert_eq!(spawned(&t), vec![b], "down a releases b: {t:?}");
+    }
+
+    #[test]
+    fn missing_required_holds_spawn_but_not_the_boot() {
+        // A dangling required edge holds its service (never spawns) while
+        // everything else converges: the agetty ghost that bricked a boot.
+        let mut p = build(&[("ghosted", &[]), ("free", &[])]);
+        let (g, f) = (p.index_of("ghosted").unwrap(), p.index_of("free").unwrap());
+        p.services[g].missing_required = alloc::vec![String::from("ghost")];
+        let mut rt = Runtime::from_plan(&p);
+        rt.set_desired(g, Desired::Up);
+        rt.set_desired(f, Desired::Up);
+        let t = reconcile(&mut rt, &p, 0);
+        assert_eq!(spawned(&t), alloc::vec![f], "only the healthy spawn: {t:?}");
+    }
+
+    #[test]
+    fn demand_start_single_pass() {
+        // A boot-enabled "base" reports that it running, and a disabled
+        // "extra" that it wants pulls become wanted-up via activation:
+        // one reconcile pass flips the want-state, spawning needs a
+        // second pass (consistent with the synchronous model -- never
+        // "magic eager spawning"). en<rfl:parameter name="kment reinits the pull story.
+        let mut p = build(&[("puller", &[]), ("lazy", &[])]);
+        let (puller, lazy) = (p.index_of("puller").unwrap(), p.index_of("lazy").unwrap());
+        p.services[puller].required = vec![lazy];
+        p.services[lazy].enabled = false; // disabled at boot
+        let mut rt = Runtime::from_plan(&p);
+        rt.set_desired(puller, Desired::Up);
+        // Pass A: the blocked puller flips its disabled dep up and the
+        // dep spawns in the same pass; the puller itself rightly waits
+        // for the dep to be Running (dep gate, unchanged).
+        let t1 = reconcile(&mut rt, &p, 0);
+        assert!(rt.get(lazy).desired == Desired::Up, "lazy pulled up");
+        assert!(spawned(&t1).contains(&lazy), "pulled lazy spawns: {t1:?}");
+        assert!(
+            !spawned(&t1).contains(&puller),
+            "puller waits for running dep: {t1:?}"
+        );
+        // Pass B: dep Running -> puller spawns.
+        rt.get_mut(lazy).state = State::Running;
+        rt.get_mut(lazy).pid = Some(10);
+        let t2 = reconcile(&mut rt, &p, 0);
+        assert!(spawned(&t2).contains(&puller), "puller follows: {t2:?}");
+    }
+
     #[test]
     fn a_target_goes_running_without_a_process() {
         let mut p = build(&[("base", &[])]);
@@ -334,6 +511,10 @@ mod tests {
         assert!(
             !t.actions.iter().any(|a| matches!(a, Action::Spawn(0))),
             "a target must never fork: {t:?}"
+        );
+        assert!(
+            rt.check_invariants(&p).is_empty(),
+            "a Running target with no pid is by design, not a violation"
         );
     }
 

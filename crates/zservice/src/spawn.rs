@@ -20,9 +20,15 @@
 //!
 //! ```text
 //! sigmask → setsid → stdio/notify fds → chdir(/) → rlimits → cgroup →
-//!     setgroups → setresgid → setresuid → verify → no_new_privs →
+//!     setgroups → setresgid → setresuid → verify → no_new_privs* →
 //!     TIOCSCTTY → execve  (any failure → errno pipe + _exit(127))
 //! ```
+//!
+//! `*`: only when the service actually drops privileges (`user =`); a
+//! service that stays root keeps setuid working for its children, like
+//! any other init. Unconditional NNP once neutered `doas`/`su` for every
+//! ssh session on a live box (the session inherits it and the kernel
+//! then ignores all setuid elevation).
 //!
 //! * **An empty signal mask, before anything else.** `fork` copies the
 //!   supervisor's blocked set and `execve` *preserves* it (only dispositions
@@ -52,10 +58,13 @@
 //!   Real three-id variants, never `seteuid` alone (rule 1), with
 //!   `getuid() == geteuid()` checked afterwards (rule 2). The drop is the
 //!   last privileged act; what follows cannot regain anything.
-//! * **`PR_SET_NO_NEW_PRIVS` (Linux, best-effort).** Defence in depth after
-//!   the drop: a setuid binary the service execs cannot escalate it. Failure
-//!   here does *not* abort the spawn — on kernels without the flag the uid
-//!   drop is still complete — which is documented rather than hidden.
+//! * **`PR_SET_NO_NEW_PRIVS` (Linux, best-effort, only after a real uid
+//!   drop).** Defence in depth after the drop: a setuid binary the service
+//!   execs cannot escalate it. A service that stays root (no `user =`)
+//!   skips it, so its children keep working setuid (`doas`, `su`,
+//!   login sessions). Failure here does *not* abort the spawn — on kernels
+//!   without the flag the uid drop is still complete — which is documented
+//!   rather than hidden.
 //! * **`TIOCSCTTY` for `console` services with a tty.** Session leader (done
 //!   above) plus open tty plus `TIOCSCTTY` is the only ordering the kernel
 //!   accepts.
@@ -316,10 +325,24 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
         zcore::Ready::Notify | zcore::Ready::Strict(StrictReady::Notify)
     );
 
-    // ── argv, fully built before the fork ──────────────────────────────
+    // ── merged env first: parent-side expansion must see it ─────────────
     //
-    // Expansion happens in the *parent* for `process`/`console`, and never for
-    // `script`.
+    // Expansion happens in the *parent* for `process`/`console`, and never
+    // for `script` (see below). The lookup runs against the merged
+    // environment — inherited, overlaid, then pinned — because that is
+    // exactly what the child will observe. Expanding against only the
+    // supervisor's own environment instead silently emptied
+    // supervisor-owned variables (`-N $ZINIT_NOTIFY_FD` became a bare
+    // `-N`, and chronyd died on the spot, forever).
+    let merged_env = merged_environment(
+        ctx.env,
+        wants_notify.then_some(notify_no(ctx)),
+        &ctx.listen
+            .iter()
+            .map(|(_, n)| n.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    // ── argv, fully built before the fork ──────────────────────────────
     //
     // For `script` the command is handed to `/bin/sh -c` verbatim. Expanding
     // first would be an active bug, not a convenience: a script is expected
@@ -332,7 +355,7 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
     let expanded_cmd = if sp.kind == ServiceKind::Script {
         String::from(ctx.command)
     } else {
-        expand_env_value(ctx.command, &env_lookup)
+        expand_env_value(ctx.command, &|name| lookup_in(&merged_env, name))
     };
     let words: Vec<String> = if sp.kind == ServiceKind::Script {
         vec![]
@@ -362,14 +385,6 @@ pub fn spawn(plan: &Plan, idx: Idx, ctx: &SpawnCtx<'_>) -> io::Result<Spawned> {
         }
         (words[0].clone(), words)
     };
-    let merged_env = merged_environment(
-        ctx.env,
-        wants_notify.then_some(notify_no(ctx)),
-        &ctx.listen
-            .iter()
-            .map(|(_, n)| n.clone())
-            .collect::<Vec<_>>(),
-    )?;
     let path_env = path_of(&merged_env);
     let resolved = resolve_binary(&argv0, &path_env).ok_or_else(|| SpawnError::NotFound {
         name: ctx.service_name.to_string(),
@@ -776,7 +791,12 @@ fn child_main(p: ChildPlan) -> ! {
     if !child_step_capdrop(p) {
         child_fail(p.exec_w, CHILD_STEP_CAPDROP);
     }
-    child_step_no_new_privs();
+    // NNP only after a real drop: without one it would neuter setuid for
+    // the whole subtree (live: every ssh session lost `doas`, with no way
+    // back but a power cycle). A root service has nothing to escalate to.
+    if p.drop_ids {
+        child_step_no_new_privs();
+    }
     if !child_step_ctty(p) {
         child_fail(p.exec_w, CHILD_STEP_CTTY);
     }
@@ -809,9 +829,9 @@ fn child_main(p: ChildPlan) -> ! {
 /// budget on it like any other failed start. Never silent, never special.
 ///
 /// Eight bytes go down the pipe: the errno first, then the failing step
-/// (see `CHILD_STEP_*`). Production readers (`poll_exec`) consume the first
-/// four and close — the step word is diagnostic only, discarded with the
-/// close — while tests drain all eight to name the culprit.
+/// (see `CHILD_STEP_*`). Production readers (`poll_exec`) consume all
+/// eight and report both; the supervisor announces the step name for the
+/// operator's log.
 fn child_fail(exec_w: RawFd, step: u32) -> ! {
     let errno = io::Error::last_os_error()
         .raw_os_error()
@@ -838,6 +858,30 @@ fn child_fail(exec_w: RawFd, step: u32) -> ! {
 /// Numbers, not names: the child may not allocate or format. Order follows
 /// `child_main`.
 const CHILD_STEP_SIGMASK: u32 = 1;
+/// Name a pre-exec child step for the operator's log.
+///
+/// The inverse of nothing: the child reports numbers through the exec-error
+/// pipe (see `CHILD_STEP_*`), and this turns them back into the step that
+/// died. Unknown numbers (a newer child than this supervisor) report as
+/// `"child"`, never panic: the number is data, and data does not get to
+/// crash PID 1's deputy.
+pub fn child_step_name(step: u32) -> &'static str {
+    match step {
+        CHILD_STEP_SIGMASK => "sigmask",
+        CHILD_STEP_SESSION => "session",
+        CHILD_STEP_FDS => "fds",
+        CHILD_STEP_CHDIR => "chdir",
+        CHILD_STEP_RLIMITS => "rlimits",
+        CHILD_STEP_CGROUP => "cgroup",
+        CHILD_STEP_IDS => "ids",
+        CHILD_STEP_CAPDROP => "capdrop",
+        CHILD_STEP_CTTY => "ctty",
+        CHILD_STEP_SECCOMP => "seccomp",
+        CHILD_STEP_EXECVE => "execve",
+        CHILD_STEP_MOUNT => "mount",
+        _ => "child",
+    }
+}
 const CHILD_STEP_SESSION: u32 = 2;
 const CHILD_STEP_FDS: u32 = 3;
 const CHILD_STEP_CHDIR: u32 = 4;
@@ -1030,12 +1074,17 @@ fn child_step_cgroup(p: ChildPlan) -> bool {
         }
         let pid = libc::getpid();
         let (buf, len) = pid_ascii(pid);
+        // Digits are right-aligned (see `pid_range`): writing from zero
+        // would send NUL padding the kernel rejects with EINVAL — every
+        // cgroup= service died pre-exec this way while manual joins
+        // (real digits) worked.
+        let (start, count) = pid_range(&buf, len);
         let mut done = 0;
-        while done < len {
+        while done < count {
             let n = libc::write(
                 fd,
-                buf.as_ptr().add(done).cast::<libc::c_void>(),
-                len - done,
+                buf.as_ptr().add(start + done).cast::<libc::c_void>(),
+                count - done,
             );
             if n <= 0 {
                 libc::close(fd);
@@ -1049,6 +1098,13 @@ fn child_step_cgroup(p: ChildPlan) -> bool {
 }
 
 /// Format a pid as ASCII, on the stack. No allocation, no std.
+/// Byte range of the pid digits in a [`pid_ascii`] buffer: right-aligned,
+///
+/// so the caller writes `buf[start..start + count]` and nothing else.
+fn pid_range(buf: &[u8; 12], len: usize) -> (usize, usize) {
+    (buf.len() - len, len)
+}
+
 fn pid_ascii(pid: i32) -> ([u8; 12], usize) {
     let mut buf = [0u8; 12];
     let mut n = pid as i64;
@@ -1193,10 +1249,12 @@ fn child_step_ids(p: ChildPlan) -> bool {
 
 /// Forbid gaining privilege back via `exec` (Linux, best-effort).
 ///
-/// After this, even a setuid-root binary the service runs cannot escalate
-/// it. Failure is ignored on purpose: on kernels without the flag the uid
-/// drop above is already complete, and aborting a correct drop for lack of a
-/// hardening extra would be the tail wagging the dog. Documented, not hidden.
+/// Call only after a real uid drop: without one it would neuter setuid for
+/// the service's whole subtree. After this, even a setuid-root binary the
+/// service runs cannot escalate it. Failure is ignored on purpose: on kernels
+/// without the flag the uid drop above is already complete, and aborting a
+/// correct drop for lack of a hardening extra would be the tail wagging the
+/// dog. Documented, not hidden.
 fn child_step_no_new_privs() {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -1403,13 +1461,6 @@ fn merged_environment(
     for (k, v) in std::env::vars_os() {
         pairs.push((k.as_encoded_bytes().to_vec(), v.as_encoded_bytes().to_vec()));
     }
-    let lookup_in = |pairs: &[(Vec<u8>, Vec<u8>)], name: &str| -> Option<String> {
-        pairs
-            .iter()
-            .rev()
-            .find(|(k, _)| k == name.as_bytes())
-            .and_then(|(_, v)| String::from_utf8(v.clone()).ok())
-    };
     for (k, v) in overlay {
         if k.is_empty() || k.bytes().any(|b| b == b'=' || b == 0) {
             return Err(io::Error::new(
@@ -1459,9 +1510,19 @@ fn path_of(env: &[(Vec<u8>, Vec<u8>)]) -> String {
         .unwrap_or_else(|| String::from("/usr/bin:/bin"))
 }
 
-/// Process-environment lookup for expansion at spawn time.
-fn env_lookup(name: &str) -> Option<String> {
-    std::env::var(name).ok()
+/// Look up a name in an ordered environment, last binding wins (mirrors
+/// what `execve` consumers observe). Shared by overlay expansion and by
+/// parent-side command expansion: a `type = process` command must see the
+/// same bindings the child will, *including* supervisor-pinned variables
+/// like `ZINIT_NOTIFY_FD`. Looking only at the supervisor's own environment
+/// instead silently emptied them (live: every `-N $ZINIT_NOTIFY_FD` became
+/// a bare `-N`, chronyd died on the spot, forever).
+fn lookup_in(pairs: &[(Vec<u8>, Vec<u8>)], name: &str) -> Option<String> {
+    pairs
+        .iter()
+        .rev()
+        .find(|(k, _)| k == name.as_bytes())
+        .and_then(|(_, v)| String::from_utf8(v.clone()).ok())
 }
 
 /// Expand `$VAR`, `${VAR}` and `${VAR:-default}` in `input`.
@@ -1719,6 +1780,19 @@ mod tests {
     }
 
     #[test]
+    fn parent_expansion_sees_pinned_notify_fd() {
+        // Live: `type = process` with `-N $ZINIT_NOTIFY_FD` expanded the
+        // variable against the supervisor's own environment, where it does
+        // not exist — every spawn got a bare `-N` and died on the spot.
+        // The lookup must run against the merged environment instead.
+        let merged = merged_environment(&[], Some(3), &[]).expect("env");
+        let got = expand_env_value("chronyd -N $ZINIT_NOTIFY_FD", &|name| {
+            lookup_in(&merged, name)
+        });
+        assert_eq!(got, "chronyd -N 3");
+    }
+
+    #[test]
     fn expansion_forms() {
         let lookup = |n: &str| match n {
             "A" => Some(String::from("1")),
@@ -1846,29 +1920,15 @@ mod tests {
             let (buf, len) = pid_ascii(n);
             // The digits are right-aligned at the end of the buffer.
             assert_eq!(&buf[buf.len() - len..], want.as_bytes(), "pid {n}");
+            // …and the range the child actually writes holds exactly them.
+            let (start, count) = pid_range(&buf, len);
+            assert_eq!(&buf[start..start + count], want.as_bytes(), "range {n}");
         }
     }
 
     /// Drain the exec-error pipe for a failure message: eight bytes are
     /// `errno` + failing step (see `CHILD_STEP_*`); EOF is a clean exec.
     fn exec_verdict(exec: RawFd) -> String {
-        fn step_name(step: u32) -> &'static str {
-            match step {
-                1 => "sigmask",
-                2 => "session",
-                3 => "fds",
-                4 => "chdir",
-                5 => "rlimits",
-                6 => "cgroup",
-                7 => "ids",
-                8 => "capdrop",
-                9 => "ctty",
-                10 => "seccomp",
-                11 => "execve",
-                12 => "mount",
-                _ => "unknown-step",
-            }
-        }
         let mut ebuf = [0u8; 8];
         let mut egot = 0;
         loop {
@@ -1882,7 +1942,7 @@ mod tests {
                     if egot >= 8 {
                         let errno = u32::from_le_bytes(ebuf[..4].try_into().expect("slice"));
                         let step = u32::from_le_bytes(ebuf[4..].try_into().expect("slice"));
-                        break format!("exec failed at {}: errno {errno}", step_name(step));
+                        break format!("exec failed at {}: errno {errno}", child_step_name(step));
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {

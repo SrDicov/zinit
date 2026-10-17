@@ -16,3 +16,10 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 zconfig = { path = "../crates/zconfig" }
+
+# cargo-fuzz builds each target as `cargo build --bin <target>`; without an
+# explicit [[bin]] the manifest has no targets and the nightly libFuzzer job
+# fails with "no targets specified in the manifest".
+[[bin]]
+name = "parse_service"
+path = "fuzz_targets/parse_service.rs"
