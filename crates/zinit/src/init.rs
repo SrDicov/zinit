@@ -17,6 +17,7 @@
 use std::ffi::{CStr, CString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 use zrt::report::announce_degradation;
 
@@ -35,7 +36,7 @@ const IDLE_MS: u64 = 50;
 ///
 /// `main` calls this and nothing else. The `!` is load-bearing: a PID 1 that
 /// returned would take the machine's only init down with it.
-pub fn run() -> ! {
+pub fn run(config: Option<&Path>) -> ! {
     // ── 1. Signals ──────────────────────────────────────────────────────
     //
     // A child that exits between the kernel's decision to notify and the
@@ -93,7 +94,7 @@ pub fn run() -> ! {
             // still falls through to the reaper below — an init that stops
             // reaping is worse than one that supervises nothing.
             if !other_supervisor {
-                match spawn_supervisor(exe) {
+                match spawn_supervisor(exe, config) {
                     Ok(pid) => sup = Some(pid),
                     Err(e) => announce_once(
                         &mut last_errno,
@@ -353,8 +354,15 @@ fn request_poweroff_at(path: &std::path::Path) {
 /// Everything the child touches is built here, in the parent: the binary path
 /// and the whole `argv` array. Past `fork` the child runs one syscall and one
 /// exit, which is the entire mitigation `DESIGN.md` §9.1 asks for.
-fn spawn_supervisor(exe: &CStr) -> io::Result<i32> {
-    let argv = zrt::sys::exec_argv(&[exe, c"--sup"]);
+fn spawn_supervisor(exe: &CStr, config: Option<&Path>) -> io::Result<i32> {
+    // The supervisor's own argument: an explicit directory is the whole
+    // configuration, exactly like `zinit --sup <dir>`. Without it the
+    // default layers decide.
+    let dir = config.and_then(|p| CString::new(p.as_os_str().as_bytes()).ok());
+    let argv = match dir.as_ref() {
+        Some(d) => zrt::sys::exec_argv(&[exe, c"--sup", d.as_c_str()]),
+        None => zrt::sys::exec_argv(&[exe, c"--sup"]),
+    };
     match zrt::sys::fork() {
         // `execvp_or_exit` is the sanctioned single-exit child path: it execs
         // and, on any failure, `_exit(127)`. An absolute `file` means `execvp`

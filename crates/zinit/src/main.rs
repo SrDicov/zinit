@@ -44,9 +44,20 @@ fn main() -> ExitCode {
 
     match flag.as_str() {
         "--init" => {
+            // An optional configuration directory, exactly like `--sup
+            // <dir>`: the whole configuration, not one layer. The kernel
+            // invokes `/sbin/init` with no arguments, so the default
+            // layers are what a real boot uses; a test (or an operator
+            // with a machine in its own directory) can point it elsewhere.
+            let dir: Option<PathBuf> = args.next().map(PathBuf::from);
+            if args.next().is_some() {
+                announce_degradation("--init takes at most one argument: a directory");
+                usage();
+                return ExitCode::from(2);
+            }
             // Diverges: a PID 1 that returned would take the machine's only init
             // down with it. No exit code is reachable from this arm.
-            init::run();
+            init::run(dir.as_deref());
         }
         "--sup" => {
             let dir: Option<PathBuf> = args.next().map(PathBuf::from);

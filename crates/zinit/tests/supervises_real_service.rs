@@ -1077,3 +1077,165 @@ fn the_visible_state_follows_the_plan() {
          machine that is not this one"
     );
 }
+
+/// zinit as a real PID 1.
+///
+/// Every other test in this file drives a *supervisor*. This one drives the
+/// *init*: PID 1 mounts `/proc`, `/sys` and `/run`, forks the supervisor,
+/// reaps orphans and answers signals. A PID namespace is the cheapest way
+/// to be PID 1 without a virtual machine:
+///
+/// ```text
+/// unshare --user --map-root-user --pid --fork --mount-proc
+/// ```
+///
+/// The shell that `unshare` forks *is* PID 1 of the new namespace, and it
+/// execs zinit, so the process that ends up as PID 1 is zinit. The
+/// namespace's own init is killed at the end of the test — the kernel
+/// tears the namespace down with it, and nothing survives.
+///
+/// The test skips itself where a user namespace is not available (a
+/// container without `CLONE_NEWUSER`, a kernel without it): the check is
+/// about the code, not about the machine's kernel configuration.
+#[test]
+#[cfg(target_os = "linux")]
+fn zinit_boots_as_pid_one_in_a_namespace() {
+    let _one = serial();
+    if which("unshare").is_none() {
+        eprintln!("skipped: no `unshare` on this machine");
+        return;
+    }
+    let scratch = Scratch::new("pid1");
+    // The service the namespace is supposed to bring up, in its own
+    // configuration directory: `--init <dir>` makes that directory the
+    // whole configuration, exactly like `--sup <dir>`.
+    let services = scratch.path().join("services");
+    std::fs::create_dir_all(&services).expect("create the service directory");
+    scratch.conf(
+        "services/probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 60", scratch.at("svc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/pid1-namespace.sh"
+    );
+    let zinit = env!("CARGO_BIN_EXE_zinit");
+
+    let mut child = Command::new("unshare")
+        .args([
+            "--user",
+            "--map-root-user",
+            "--pid",
+            "--fork",
+            "--mount-proc",
+            "sh",
+            script,
+            &scratch.path().to_string_lossy(),
+            zinit,
+        ])
+        .stdin(Stdio::null())
+        // The namespace's processes inherit these descriptors, and a pipe
+        // they keep open is a pipe the test runner waits on forever. A file
+        // is read after the fact and blocks nobody.
+        .stdout(Stdio::from(
+            std::fs::File::create(scratch.at("ns.out")).expect("create the log"),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create(scratch.at("ns.err")).expect("create the log"),
+        ))
+        .spawn()
+        .expect("cannot spawn unshare");
+
+    // The namespace's PID 1 is a child of the `unshare` process, and it
+    // starts as the shell that execs zinit: poll until it says it is
+    // zinit, or until it is clear that there is no namespace here at all.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut comm = String::new();
+    loop {
+        let children =
+            std::fs::read_to_string(format!("/proc/{}/task/{}/children", child.id(), child.id()))
+                .unwrap_or_default();
+        if let Some(pid) = children.split_whitespace().next() {
+            comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            if comm.trim() == "zinit" {
+                break;
+            }
+        }
+        if Instant::now() > deadline {
+            break;
+        }
+        sleep_ms(100);
+    }
+    let ns_pid1 = children_pid(child.id());
+    if comm.trim() != "zinit" {
+        // No user namespace on this machine: the test has nothing to say.
+        // SAFETY: the pid is this test's own child.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+            libc::kill(child.id() as i32, libc::SIGKILL);
+        }
+        let _ = child.wait();
+        eprintln!("skipped: no PID namespace available on this machine");
+        return;
+    }
+
+    // The supervisor must come up and bind the control socket, and the
+    // service must be running: PID 1 mounted what it needed and the
+    // supervisor did its job inside the namespace.
+    let start = Instant::now();
+    let up = loop {
+        if scratch.pid("svc.pid").is_some_and(pid_alive) {
+            break true;
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            break false;
+        }
+        sleep_ms(100);
+    };
+    let mut stderr = String::new();
+    if !up {
+        stderr = scratch.tail("ns.err");
+    }
+    assert!(
+        up,
+        "the service never came up inside the namespace\\n{stderr}"
+    );
+
+    // Tear the namespace down: killing the `unshare` process takes PID 1
+    // with it, and the kernel cleans up everything inside. Only that one
+    // pid: a process-group kill here would take the test runner with it.
+    // SAFETY: the pid is this test's own child.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGKILL);
+    }
+    let _ = child.wait();
+    // The namespace's PID 1 is still alive (its parent died, so it was
+    // reparented); killing it is what actually empties the namespace.
+    // SAFETY: the pid came from this test's own /proc entry.
+    unsafe {
+        libc::kill(ns_pid1 as i32, libc::SIGKILL);
+    }
+}
+
+/// The first child of `pid`, from `/proc`.
+fn children_pid(pid: u32) -> u32 {
+    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .ok()
+        .and_then(|c| c.split_whitespace().next().and_then(|p| p.parse().ok()))
+        .unwrap_or(0)
+}
+
+/// The full path of `name` in `PATH`, if it is there.
+fn which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
