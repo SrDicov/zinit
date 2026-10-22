@@ -77,8 +77,10 @@ trabajo del día. Lo que ya está arreglado y verificado **no** se repite.
   `on-boot-sec` + `on-unit-active-sec`; `on-calendar` no.
 - **Gramática systemd, journal, D-Bus, `sd_notify` completo, tamperlog**:
   prohibidos por el encargo y sin beneficio en esta máquina.
-- **Tocar el sandbox**: no hay evidencia de que necesite cambios; el test
-  nuevo (`the_sandbox_really_confines`) lo demuestra tal cual está.
+- **Tocar el sandbox "sin evidencia"**: la evidencia llegó, y era mala. El
+  filtro no filtraba: `SECCOMP_MODE_FILTER` valía 1 (`STRICT`), NNP no se
+  ponía sin cambio de identidad y la base implícita no cubría un shell. Ver
+  C9.
 
 ## Reglas de esta noche
 
@@ -96,3 +98,13 @@ trabajo del día. Lo que ya está arreglado y verificado **no** se repite.
   (`375641d`, `94a533f`, `46e0d5f`), test en CI para x86_64 y test de sandbox
   como root verificado en contenedor. Limitación declarada: tabla sólo
   x86_64.
+- [x] **C10** `SIGINT` a PID 1 (lo que produce Ctrl-Alt-Del) pedía
+  `poweroff`; el contrato del kernel es **reiniciar**. Ahora el handler
+  recuerda qué señal llegó (la primera gana) y el init pide `reboot` para
+  `SIGINT` y `poweroff` para `SIGTERM`, con test de ambos verbos (`f1e5968`).
+- [x] **C11** `syscall-allow` probado de extremo a extremo: mismo comando sin
+  filtro (0), filtrado (rechazado) y filtrado con `syscall-allow = kill` (0)
+  (`476b10a`).
+- [x] **C12** Un log que no se puede abrir es rechazo ruidoso, no servicio
+  sin logs: test con `ENOTDIR` y aserción de que el servicio no corre y el
+  supervisor sobrevive.
