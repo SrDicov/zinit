@@ -62,7 +62,15 @@ fn main() -> ExitCode {
                     // it once: PID 1 will relaunch it, and a twenty-times-a-second
                     // stderr flood would bury the boot log that matters.
                     announce_degradation(&format!("supervisor stopped: {e}"));
-                    ExitCode::from(1)
+                    // "Another supervisor owns the socket" is not a failure
+                    // to retry: the machine is governed by that one, and
+                    // PID 1 reads this code and steps aside.
+                    let code: u8 = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        sup::OTHER_SUPERVISOR_EXIT as u8
+                    } else {
+                        1
+                    };
+                    ExitCode::from(code)
                 }
             }
         }

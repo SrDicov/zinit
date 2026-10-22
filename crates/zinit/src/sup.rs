@@ -176,9 +176,12 @@ struct Sup {
     /// have no plan entry anymore, so the core cannot reason about them;
     /// they are sent TERM once, reaped like any other child, then dropped.
     retired: Vec<Retired>,
+    /// The single-instance lock: an open descriptor holding an exclusive
+    /// `flock` on `<socket>.lock`. It lives as long as the supervisor does,
+    /// because closing it is what releases the lock.
+    _instance_lock: InstanceLock,
     /// Whether this process is the child subreaper: orphaned grandchildren
-    /// of `Forking` services reparent here and are reaped normally. When
-    /// false (non-Linux, or a refusing kernel), adopted daemons are watched
+    /// of `Forking` services reparent here and are reaped normally. When    /// false (non-Linux, or a refusing kernel), adopted daemons are watched
     /// with `kill(pid, 0)` polling instead — announced at startup, because a
     /// supervisor that polls where it claimed to reap is a difference bug
     /// reports cannot reproduce.
@@ -363,6 +366,33 @@ impl Sup {
                 ));
             }
         }
+        // One supervisor per socket. Two of them over one socket is not a
+        // configuration, it is a race: the second one unlinks the path and
+        // binds its own, and the first one's clients end up talking to
+        // somebody else — the machine then looks like it has two of every
+        // daemon, fighting over the ports.
+        //
+        // The lock is a separate file, not the socket: the socket is
+        // unlinked and rebound on every start, so a lock on it would be
+        // taken on a different inode each time and would arbitrate
+        // nothing.
+        let lock_path = socket_path.with_extension("lock");
+        let lock = match claim_instance(&lock_path) {
+            Ok(lock) => lock,
+            Err(e) => {
+                // Another supervisor owns the socket. Saying so is better
+                // than fighting for it: the machine is already governed.
+                // The caller turns this into the exit code PID 1 reads.
+                announce_degradation(&format!(
+                    "another supervisor already owns {} ({e}); this one steps aside",
+                    socket_path.display()
+                ));
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("another supervisor already owns {}", socket_path.display()),
+                ));
+            }
+        };
         let ctl = match ctl::CtlServer::bind(&socket_path) {
             Ok(server) => match reactor.add(server.listener_fd(), Interest::Read) {
                 Ok(()) => Some(server),
@@ -418,6 +448,7 @@ impl Sup {
             pending_restart: Vec::new(),
             retired: Vec::new(),
             subreaper,
+            _instance_lock: lock,
         })
     }
 
@@ -2451,6 +2482,39 @@ fn ctl_state_dir() -> PathBuf {
     std::env::var_os(ctl::STATE_DIR_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(ctl::DEFAULT_STATE_DIR))
+}
+
+/// The exit code that says "another supervisor already owns the socket".
+///
+/// PID 1 reads it and stops relaunching: the machine is governed by the
+/// other supervisor, and a second one fighting for the socket would be
+/// worse than none.
+pub const OTHER_SUPERVISOR_EXIT: i32 = 11;
+
+/// The single-instance lock: an open descriptor holding an exclusive `flock`.
+///
+/// The lock is a separate file next to the socket: the socket itself is
+/// unlinked and rebound on every start, so a lock on it would sit on a
+/// different inode each time and arbitrate nothing. Dropping this value
+/// closes the descriptor, and closing it releases the lock — so a
+/// supervisor that dies leaves the next one free to take over.
+#[derive(Debug)]
+struct InstanceLock(std::os::fd::RawFd);
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        let _ = zrt::sys::close(self.0);
+    }
+}
+
+/// Take the single-instance lock for this control socket.
+fn claim_instance(lock_path: &Path) -> io::Result<InstanceLock> {
+    let fd = zrt::sys::open_cloexec(lock_path, libc::O_RDWR | libc::O_CREAT, 0o600)?;
+    if let Err(e) = zrt::sys::flock_exclusive(fd) {
+        let _ = zrt::sys::close(fd);
+        return Err(e);
+    }
+    Ok(InstanceLock(fd))
 }
 
 /// Announce `message` and turn it into the `Err` that stops the supervisor.

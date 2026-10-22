@@ -67,6 +67,10 @@ pub fn run() -> ! {
     // allocates nothing.
     let exe = self_path();
     let mut sup: Option<i32> = None;
+    // Set when another supervisor owns the control socket: this process is
+    // then a bare reaper, which is exactly what a machine whose supervisor
+    // lives elsewhere needs.
+    let mut other_supervisor = false;
     // Two "say each distinct failure once" gates. An init that repeats the
     // same line twenty times a second turns stderr into the bottleneck and
     // buries the boot that actually needed reading.
@@ -78,13 +82,19 @@ pub fn run() -> ! {
         // here (fork failed, supervisor died) are both transient or fixed by
         // the next tick, and neither is a reason to stop reaping.
         if let (None, Some(exe)) = (sup, exe.as_deref()) {
-            match spawn_supervisor(exe) {
-                Ok(pid) => sup = Some(pid),
-                Err(e) => announce_once(
-                    &mut last_errno,
-                    e.raw_os_error().unwrap_or(libc::EINVAL),
-                    format!("fork failed ({e}); no supervisor running"),
-                ),
+            // The socket belongs to somebody else: spawning another
+            // supervisor would only make them fight for it. The loop
+            // still falls through to the reaper below — an init that stops
+            // reaping is worse than one that supervises nothing.
+            if !other_supervisor {
+                match spawn_supervisor(exe) {
+                    Ok(pid) => sup = Some(pid),
+                    Err(e) => announce_once(
+                        &mut last_errno,
+                        e.raw_os_error().unwrap_or(libc::EINVAL),
+                        format!("fork failed ({e}); no supervisor running"),
+                    ),
+                }
             }
         }
 
@@ -96,12 +106,31 @@ pub fn run() -> ! {
             // exited is halted.
             (Some(pid), Ok(w)) if w.pid == pid => {
                 let code = w.status.code();
-                announce_once(
-                    &mut last_exit,
-                    code,
-                    format!("supervisor (pid {pid}) exited with {code}; relaunching"),
-                );
-                sup = None;
+                if code == crate::sup::OTHER_SUPERVISOR_EXIT {
+                    // Another supervisor owns the control socket: the
+                    // machine is governed, and a second one fighting for
+                    // the socket would be worse than none. Announce it once
+                    // and stop relaunching.
+                    announce_once(
+                        &mut last_exit,
+                        code,
+                        format!(
+                            "another supervisor already owns the control socket \
+                             (pid {pid} stepped aside); not relaunching"
+                        ),
+                    );
+                    sup = None;
+                    // Keep reaping, but do not spawn another supervisor.
+                    // The flag below says "there is a supervisor, not mine".
+                    other_supervisor = true;
+                } else {
+                    announce_once(
+                        &mut last_exit,
+                        code,
+                        format!("supervisor (pid {pid}) exited with {code}; relaunching"),
+                    );
+                    sup = None;
+                }
             }
             // Any other child of ours — an orphan the kernel re-parented to
             // PID 1 when its parent died. It means nothing here beyond the

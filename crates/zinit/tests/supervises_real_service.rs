@@ -890,3 +890,58 @@ fn the_control_socket_refuses_a_mutation_from_an_unknown_peer() {
     );
     assert!(sup.exited().is_none(), "the supervisor exited");
 }
+
+/// One supervisor per control socket.
+///
+/// Two supervisors over one socket is not a configuration, it is a race: the
+/// second one unlinks the path and binds its own, and the first one's
+/// clients end up talking to somebody else. The machine then looks like it
+/// has two of every daemon, fighting over the ports — which is exactly what
+/// a hand-started second supervisor used to cause.
+///
+/// The second supervisor must step aside (exit code 11) and the first must
+/// keep the socket.
+#[test]
+fn a_second_supervisor_steps_aside() {
+    let _one = serial();
+    let scratch = Scratch::new("instance");
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 30", scratch.at("svc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let mut first = Sup::start(&scratch);
+    let _pid = first.await_live_pid("svc.pid", START_DEADLINE_MS);
+
+    // The second one gets the same socket path, so it finds the lock.
+    let mut second = sup_command(&scratch)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("cannot spawn the second supervisor");
+    let status = second.wait().expect("the second supervisor must exit");
+    assert_eq!(
+        status.code(),
+        Some(11),
+        "the second supervisor did not step aside: {status:?}"
+    );
+
+    // The first one still owns the socket: its service is still running and
+    // the socket still answers.
+    assert!(
+        scratch.pid("svc.pid").is_some(),
+        "the first supervisor lost its service"
+    );
+    let out = zctl(&scratch, &["list"]);
+    assert!(
+        out.status.success(),
+        "the first supervisor lost the control socket: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        first.exited().is_none(),
+        "the first supervisor exited when the second one appeared"
+    );
+}
