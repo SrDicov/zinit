@@ -25,8 +25,12 @@ trabajo del día. Lo que ya está arreglado y verificado **no** se repite.
   `soak-verdict.md`.
 - [ ] **B3** Verificar en vivo el apagado por señal (`kill -TERM 1` → poweroff)
   con el binario nuevo.
-- [ ] **B4** Comprobar si la distribución trae `cron`/`crond`: si lo trae,
-  los timers de zinit son duplicados de función y no se implementan (YAGNI).
+- [x] **B4** Comprobar si la distribución trae `cron`/`crond`: **sí**.
+  Evidencia en `z-dinit-generator/evidence/`: `crond` y `cronie` arrancan y
+  se reinician en la propia caja (`iter-closure-obs.md`: "zctl start crond →
+  Running en 5 s"), y `HANDOFF.md` los lista entre los servicios vivos. Los
+  timers de zinit duplicarían una función que ya está: **descartados** (ver
+  FASE 3 abajo).
 
 ## Ítems de código (orden por impacto ÷ tamaño)
 
@@ -52,8 +56,13 @@ trabajo del día. Lo que ya está arreglado y verificado **no** se repite.
 
 ## Descartado con motivo
 
-- **Timers de calendario**: dependen de B4. Si la distribución trae cron,
-  un segundo planificador es la misma función dos veces.
+- **Timers de calendario (FASE 3): descartados con evidencia.** La caja trae
+  `cronie`/`crond` (B4), así que un segundo planificador sería la misma
+  función dos veces, y el cálculo de calendario (zonas, DST) es justo donde
+  una implementación pequeña se vuelve incorrecta en silencio. Si algún día
+  se necesita un timer *dentro* del grafo de dependencias (arrancar algo N
+  segundos después de otro servicio, sin cron), el alcance mínimo es
+  `on-boot-sec` + `on-unit-active-sec`; `on-calendar` no.
 - **Gramática systemd, journal, D-Bus, `sd_notify` completo, tamperlog**:
   prohibidos por el encargo y sin beneficio en esta máquina.
 - **Tocar el sandbox**: no hay evidencia de que necesite cambios; el test

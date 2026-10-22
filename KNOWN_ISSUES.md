@@ -166,5 +166,6 @@ soak restarts on the release binary.
 - **Verificación en vivo del apagado por señal** (`kill -TERM 1`): el
   camino está implementado y con test de regresión, pero el syscall
   final sólo se prueba en la máquina.
-- **Timers**: depende de si la distribución trae `cron`. Si lo trae, un
-  segundo planificador es la misma función dos veces.
+- **Timers**: resuelto por la vía de no hacerlos. La máquina trae
+  `cronie`/`crond` (evidencia en `z-dinit-generator/evidence/`), así que un
+  planificador dentro de zinit sería la misma función dos veces. 

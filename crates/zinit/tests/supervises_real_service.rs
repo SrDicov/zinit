@@ -1627,3 +1627,56 @@ fn hibernate_is_refused_with_a_reason() {
         "the supervisor died on a refused hibernate"
     );
 }
+
+/// Two stops asked at the same time stop the service once.
+///
+/// The commands arrive on two connections and are served in one loop, so the
+/// second one sees a service that is already `Stopping`: it must answer, not
+/// signal twice, and not leave the service half-stopped. The observable is
+/// the state: down, and the process gone.
+#[test]
+fn two_stops_at_once_stop_the_service_once() {
+    let _one = serial();
+    let scratch = Scratch::new("two-stops");
+    if zctl_path().is_none() {
+        let _ = std::fs::write(scratch.at("skipped"), "no zctl binary\n");
+        return;
+    }
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 30", scratch.at("svc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    let pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
+
+    let (first, second) = std::thread::scope(|s| {
+        let a = s.spawn(|| zctl(&scratch, &["stop", "probe"]));
+        let b = s.spawn(|| zctl(&scratch, &["stop", "probe"]));
+        (
+            a.join().expect("first stop"),
+            b.join().expect("second stop"),
+        )
+    });
+    assert!(
+        first.status.success() && second.status.success(),
+        "a stop was refused: {:?} / {:?}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&second.stdout)
+    );
+    assert!(
+        wait_until(REAP_DEADLINE_MS, || pid_gone(pid)),
+        "the service survived two stops"
+    );
+    let state = scratch.read("state/probe").expect("the state file");
+    assert!(
+        state.contains("state=Stopped") && state.contains("desired=Down"),
+        "the state does not say it is stopped: {state}"
+    );
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor died on two simultaneous stops"
+    );
+}
