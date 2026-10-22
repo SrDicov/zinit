@@ -95,3 +95,27 @@ duro de 1024; el supervisor sube el blando al duro al arrancar). Por
 encima de eso hace falta un ayudante que abra descriptores por el
 supervisor, que es exactamente el peso que este proyecto no quiere: se
 documenta el techo en vez de construirlo.
+
+## Soak-proxy local (2026-10-22, mientras la caja está apagada)
+
+El soak de 24 h necesita la máquina real, así que se midió lo que un soak
+detecta (fugas) en corto: 90 servicios `process` + un `reload-all` y un
+`stop`/`start` cada 20 s durante 5 minutos, muestreando el supervisor.
+
+| t | RSS | fds | zombis | hijos |
+|---|---:|---:|---:|---:|
+| 20 s | 3144 kB | 188 | 0 | 90 |
+| 100 s | 3148 kB | 188 | 0 | 90 |
+| 180 s | 3312 kB | 188 | 0 | 90 |
+| 280 s | 3444 kB | 188 | 0 | 90 |
+
+RSS oscila entre 3,1 y 3,4 MB sin pendiente, descriptores constantes,
+cero zombis y los 90 hijos intactos: 16 recargas del plan no filtran ni
+un descriptor ni dejan un proceso sin recoger. **No es un soak de 24 h**,
+es la evidencia de que las dos fugas que un soak busca (memoria y
+descriptores) no aparecen en el ciclo de recarga.
+
+Efecto secundario encontrado y arreglado: 16 recargas escribían **2896
+líneas** de log, porque cada carga repetía todos los avisos del plan
+(`W003` y su ayuda, una vez por servicio y por recarga). Ahora se anuncian
+una vez por proceso (`ebb4af9`).
