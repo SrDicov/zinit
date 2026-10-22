@@ -1302,6 +1302,7 @@ fn zinit_boots_as_pid_one_in_a_namespace() {
 }
 
 /// The first child of `pid`, from `/proc`.
+#[cfg(target_os = "linux")]
 fn children_pid(pid: u32) -> u32 {
     std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
         .ok()
@@ -1310,6 +1311,7 @@ fn children_pid(pid: u32) -> u32 {
 }
 
 /// The full path of `name` in `PATH`, if it is there.
+#[cfg(target_os = "linux")]
 fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -1674,14 +1676,16 @@ fn two_stops_at_once_stop_the_service_once() {
         String::from_utf8_lossy(&first.stdout),
         String::from_utf8_lossy(&second.stdout)
     );
+    // The process being gone is not the supervisor knowing it: the state file
+    // is rewritten when the death has been reaped, which is a later moment.
+    // Both facts are asserted, so both are waited for.
     assert!(
-        wait_until(REAP_DEADLINE_MS, || pid_gone(pid)),
-        "the service survived two stops"
-    );
-    let state = scratch.read("state/probe").expect("the state file");
-    assert!(
-        state.contains("state=Stopped") && state.contains("desired=Down"),
-        "the state does not say it is stopped: {state}"
+        wait_until(REAP_DEADLINE_MS, || {
+            let state = scratch.read("state/probe").unwrap_or_default();
+            pid_gone(pid) && state.contains("state=Stopped") && state.contains("desired=Down")
+        }),
+        "the state never said the service was stopped: {:?}",
+        scratch.read("state/probe")
     );
     assert!(
         sup.exited().is_none(),
