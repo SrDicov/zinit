@@ -40,7 +40,7 @@ trabajo del día. Lo que ya está arreglado y verificado **no** se repite.
 - [x] **C3** El socket de control no tiene tope de clientes: un proceso
   local puede abrir miles de conexiones y el supervisor crece sin límite.
   Tope (64) y se cierra la conexión de más.
-- [ ] **C4** **El supervisor re-adopta los servicios vivos al arrancar.**
+- [x] **C4** **El supervisor re-adopta los servicios vivos al arrancar.**
   Hoy, si el supervisor muere, al volver a arrancar arranca **copias** de
   todo lo que sigue vivo: la máquina queda con dos daemons de cada cosa
   peleándose por los puertos (pasó en vivo el 2026-10-16). El estado

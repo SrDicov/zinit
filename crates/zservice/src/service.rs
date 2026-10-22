@@ -136,6 +136,26 @@ impl ManagedService {
         self.pid
     }
 
+    /// Take over a process that is already running.
+    ///
+    /// The supervisor that started it died; this one finds the process
+    /// still alive and adopts it instead of starting a second copy. The
+    /// process is not our child (the kernel reparented it to PID 1), so:
+    ///
+    /// * the process group is unknown — the stop path signals it by pid,
+    ///   which is what `adopted` already means for a `Forking` daemon;
+    /// * the exec handshake is long over — the process is running, not
+    ///   starting;
+    /// * its death is watched through a pidfd, and nobody can say how it
+    ///   died (see the tracker's `ECHILD` arm).
+    pub fn adopt(&mut self, pid: i32) {
+        self.pid = Some(pid);
+        self.pgid = None;
+        self.adopted = true;
+        self.exec_confirmed = false;
+        self.ready = ReadyWait::None;
+    }
+
     /// The process group to signal, if any.
     pub const fn pgid(&self) -> Option<i32> {
         self.pgid

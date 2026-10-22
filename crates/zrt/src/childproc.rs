@@ -349,8 +349,20 @@ impl ChildTracker for PidfdTracker {
             // *how*. It cannot block: the process is already dead, and if the
             // wait says otherwise the pidfd was for a different process and
             // the right answer is "nothing to report".
-            if let Some(waited) = sys::waitpid_nohang(pid)? {
-                out.push((waited.pid, waited.status));
+            match sys::waitpid_nohang(pid) {
+                Ok(Some(waited)) => out.push((waited.pid, waited.status)),
+                Ok(None) => {}
+                // `ECHILD`: the process is gone but it was never our
+                // child — an adopted one (a service that outlived the
+                // supervisor that started it). The pidfd said it died;
+                // nobody can say how, and inventing an exit code would be
+                // a lie. The status says "gone, cause unknown", which the
+                // restart policy treats as a failure, because the service
+                // did not choose to stop.
+                Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {
+                    out.push((pid, sys::ExitStatus::Reported(-1)));
+                }
+                Err(e) => return Err(e),
             }
         }
         Ok(out)

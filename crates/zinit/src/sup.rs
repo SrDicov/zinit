@@ -120,8 +120,16 @@ pub fn run(config: Option<&Path>) -> io::Result<()> {
             (plan, descs, Some(dir))
         }
     };
-    let mut sup = Sup::new(plan, descs, config_dirs, gen_dir)?;
+    let mut sup = Sup::new(
+        plan,
+        descs,
+        config_dirs,
+        gen_dir,
+        ctl_socket_path(),
+        ctl_state_dir(),
+    )?;
     sup.emergency_dir = emergency_dir;
+    sup.adopt_live_services();
     sup.supervise()
 }
 
@@ -313,6 +321,8 @@ impl Sup {
         descs: Vec<Option<ServiceDesc>>,
         config_dirs: Vec<PathBuf>,
         gen_dir: PathBuf,
+        socket_path: PathBuf,
+        state_dir: PathBuf,
     ) -> io::Result<Sup> {
         if let Err(e) = block_all() {
             return Err(fatal(format!("cannot block signals: {e}")));
@@ -403,7 +413,6 @@ impl Sup {
         // that connects during the first pass is accepted, not refused. A
         // failure degrades to "no control socket": the loop below checks the
         // `Option` every pass, and everything else works without it.
-        let socket_path = ctl_socket_path();
         // The parent is created, not assumed: PID 1 mounts a fresh tmpfs on
         // `/run` at boot, so `/run/zinit` never survives a reboot — without
         // this the first boot of every real machine would have no control
@@ -467,7 +476,6 @@ impl Sup {
         // The visible-state directory (contract C6). Created once; a failure
         // disables the dumps rather than failing the boot — supervision does
         // not depend on observability, however embarrassing that is to admit.
-        let state_dir = ctl_state_dir();
         let state_usable = match std::fs::create_dir_all(&state_dir) {
             Ok(()) => true,
             Err(e) => {
@@ -1621,6 +1629,63 @@ impl Sup {
 
     /// Rewrite the visible-state files whose content changed (contract C6).
     ///
+    /// Take over the services that are still running.
+    ///
+    /// The supervisor that started them died. Its children were reparented
+    /// to PID 1, which knows nothing about them: without this, the new
+    /// supervisor starts a *second* copy of every service that is still
+    /// alive, and the machine ends up with two of every daemon fighting
+    /// over the ports. That happened on real hardware (2026-10-16).
+    ///
+    /// The visible state already says which pid each service had. A pid
+    /// that is still alive and belongs to a service the plan still names is
+    /// adopted: it is watched through a pidfd, it is signalled by pid, and
+    /// the supervisor does not start a copy.
+    ///
+    /// A service that was `Starting` (its readiness handshake belonged to
+    /// the dead supervisor) is not adopted: the handshake is gone, so the
+    /// only honest thing is to start it again.
+    fn adopt_live_services(&mut self) {
+        if !self.state_usable {
+            return;
+        }
+        let now = zrt::clock::now_ms();
+        let mut adopted = 0usize;
+        for idx in 0..self.slots.len() {
+            let name = self.plan.services[idx].name.clone();
+            let Some((pid, started_ms)) = read_live_service(&self.state_dir, &name) else {
+                continue;
+            };
+            if !pid_alive(pid) {
+                continue;
+            }
+            // Watch it: a pidfd fires when the process dies, whoever
+            // reaps it. The kernel reparented it to PID 1, so nobody here
+            // can `waitpid` it — the tracker says so and reports the death
+            // without inventing a cause.
+            if let Err(e) = self.children.track(pid) {
+                announce_degradation(&format!("cannot watch the adopted {name} (pid {pid}): {e}"));
+                continue;
+            }
+            self.slots[idx].svc.adopt(pid);
+            {
+                let s = self.runtime.get_mut(idx);
+                s.state = State::Running;
+                s.pid = Some(pid);
+                s.pgid = None;
+                s.started_at = Some(started_ms.unwrap_or(now));
+                s.ready_due_at = None;
+                s.start_due_at = None;
+            }
+            adopted += 1;
+        }
+        if adopted > 0 {
+            announce_degradation(&format!(
+                "adopted {adopted} service(s) that were still running"
+            ));
+        }
+    }
+
     /// `name=value` lines for identity and core facts (name, state, desired,
     /// pid, restarts, completed, suppressed) plus the static plan facts that
     /// explain them (watchdog budget, seccomp action, listen names):
@@ -1642,11 +1707,16 @@ impl Sup {
             // watchdog even on?" without a second source: confinement that
             // is invisible is confinement nobody can debug.
             let content = format!(
-                "name={}\nstate={:?}\ndesired={:?}\npid={}\nrestarts={}\ncompleted={}\nsuppressed={}\nwatchdog={}\nseccomp={}\nlistens={}\n",
+                "name={}\nstate={:?}\ndesired={:?}\npid={}\nstarted_ms={}\nrestarts={}\ncompleted={}\nsuppressed={}\nwatchdog={}\nseccomp={}\nlistens={}\n",
                 sp.name,
                 s.state,
                 s.desired,
                 s.pid.map_or_else(|| String::from("-"), |p| p.to_string()),
+                // The monotonic start time: a supervisor that comes back
+                // after a crash restores the age of the services it
+                // adopts, instead of claiming they started a second ago.
+                s.started_at
+                    .map_or_else(|| String::from("-"), |v| v.to_string()),
                 s.restarts,
                 s.completed,
                 s.restart_suppressed,
@@ -2686,6 +2756,33 @@ fn claim_instance(lock_path: &Path) -> io::Result<InstanceLock> {
     Ok(InstanceLock(fd))
 }
 
+/// The pid and start time of a service that was running, from the state file.
+///
+/// `None` when the file is missing, unreadable, or says the service was not
+/// running: only a service the previous supervisor saw as `Running` can be
+/// adopted.
+fn read_live_service(state_dir: &Path, name: &str) -> Option<(i32, Option<u64>)> {
+    let text = std::fs::read_to_string(state_dir.join(name)).ok()?;
+    let mut pid = None;
+    let mut started = None;
+    let mut running = false;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "state" => running = value == "Running",
+            "pid" => pid = value.parse::<i32>().ok().filter(|p| *p > 1),
+            "started_ms" => started = value.parse::<u64>().ok(),
+            _ => {}
+        }
+    }
+    if !running {
+        return None;
+    }
+    Some((pid?, started))
+}
+
 /// Announce `message` and turn it into the `Err` that stops the supervisor.
 fn fatal(message: String) -> io::Error {
     announce_degradation(&message);
@@ -3016,6 +3113,29 @@ mod tests {
     /// second, and a start owed still wakes the loop on its restart delay:
     /// `arm` returns no deadline when nothing pends. The registrations stay
     /// in place either way, so this buys idle without costing latency.
+    /// The single-instance lock is released when the supervisor goes away.
+    ///
+    /// This is the property the whole thing rests on: a supervisor that
+    /// dies must leave the socket free for the next one, or the machine
+    /// ends up with no supervisor at all (PID 1 reads the "stepped aside"
+    /// exit code and stops relaunching).
+    #[test]
+    fn the_instance_lock_is_released_when_it_is_dropped() {
+        let dir = scratch("lock-release");
+        let path = dir.join("ctl.lock");
+        let first = claim_instance(&path).expect("take the lock");
+        // A second one cannot: the first still holds it.
+        assert!(
+            claim_instance(&path).is_err(),
+            "two supervisors took the same lock: the second one would steal the socket"
+        );
+        drop(first);
+        // And now it can: the lock died with its holder.
+        let again = claim_instance(&path).expect("take the lock again");
+        drop(again);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The suspend answer must be sent before the machine sleeps.
     ///
     /// The write to `/sys/power/state` does not return until the machine
@@ -3033,10 +3153,6 @@ mod tests {
         // `ZINIT_STATE_DIR` — only child-process integration tests use
         // them, and those are separate processes — so no thread can observe
         // the swap mid-flight. Removed before return either way.
-        unsafe {
-            std::env::set_var(ctl::SOCKET_ENV, &sock);
-            std::env::set_var(ctl::STATE_DIR_ENV, &state);
-        }
         let quiet = base.join("quiet");
         let _ = std::fs::create_dir_all(&quiet);
         std::fs::write(
@@ -3045,8 +3161,15 @@ mod tests {
         )
         .expect("write");
         let (plan, descs) = load(&quiet).expect("quiet loads");
-        let mut sup =
-            Sup::new(plan, descs, vec![quiet.clone()], gen_dir.clone()).expect("supervisor builds");
+        let mut sup = Sup::new(
+            plan,
+            descs,
+            vec![quiet.clone()],
+            gen_dir.clone(),
+            sock.clone(),
+            state.clone(),
+        )
+        .expect("supervisor builds");
         let frame = sup.request_power("1", ctl::PowerAction::Suspend, 0);
         assert!(
             frame.starts_with("R 1 0 suspending"),
@@ -3067,10 +3190,6 @@ mod tests {
         // `ZINIT_STATE_DIR` — only child-process integration tests use them,
         // and those are separate processes — so no thread can observe the
         // swap mid-flight. Removed before return either way.
-        unsafe {
-            std::env::set_var(ctl::SOCKET_ENV, &sock);
-            std::env::set_var(ctl::STATE_DIR_ENV, &state);
-        }
         // Settled: the one service wants nothing (disabled at boot).
         let quiet = base.join("quiet");
         let _ = std::fs::create_dir_all(&quiet);
@@ -3080,8 +3199,15 @@ mod tests {
         )
         .expect("write");
         let (plan, descs) = load(&quiet).expect("quiet loads");
-        let mut sup =
-            Sup::new(plan, descs, vec![quiet.clone()], gen_dir.clone()).expect("supervisor builds");
+        let mut sup = Sup::new(
+            plan,
+            descs,
+            vec![quiet.clone()],
+            gen_dir.clone(),
+            sock.clone(),
+            state.clone(),
+        )
+        .expect("supervisor builds");
         assert_eq!(
             sup.arm(1_000_000),
             None,
@@ -3093,8 +3219,18 @@ mod tests {
         let _ = std::fs::create_dir_all(&eager);
         write_conf(&eager, "e");
         let (plan, descs) = load(&eager).expect("eager loads");
-        let mut sup =
-            Sup::new(plan, descs, vec![eager.clone()], gen_dir.clone()).expect("supervisor builds");
+        // A different socket path: two supervisors over one path is what
+        // the single-instance lock forbids, and this test is about `arm`,
+        // not about the lock (the lock has its own test).
+        let mut sup = Sup::new(
+            plan,
+            descs,
+            vec![eager.clone()],
+            gen_dir.clone(),
+            base.join("ctl2"),
+            state.clone(),
+        )
+        .expect("supervisor builds");
         let wait = sup
             .arm(1_000_000)
             .expect("a start owed must wake the loop on its delay");

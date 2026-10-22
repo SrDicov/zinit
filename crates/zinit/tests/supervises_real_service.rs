@@ -1379,3 +1379,122 @@ fn the_sandbox_really_confines() {
         "the supervisor died while supervising confined services"
     );
 }
+
+/// A supervisor that comes back must not start a second copy of what is
+/// already running.
+///
+/// The supervisor that started the services died; its children were
+/// reparented to PID 1, which knows nothing about them. Without adoption,
+/// the new supervisor starts a copy of everything: the machine ends up
+/// with two of every daemon fighting over the ports, which is exactly what
+/// happened on real hardware.
+///
+/// The test: start a supervisor, kill it (the service survives), start a
+/// new one over the same state directory, and require that the service is
+/// the *same* process and that the new supervisor knows about it.
+#[test]
+fn a_restarted_supervisor_adopts_the_services_that_are_still_alive() {
+    let _one = serial();
+    let scratch = Scratch::new("adopt");
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 300", scratch.at("svc.pid")),
+            "restart = always\nrestart-delay = 100ms\n",
+        ),
+    );
+    let mut first = Sup::start(&scratch);
+    let pid = first.await_live_pid("svc.pid", START_DEADLINE_MS);
+
+    // Kill the supervisor the way a crash would: no cleanup, no goodbye.
+    // The service is not its child any more (the kernel reparents it), and
+    // it must survive.
+    // SAFETY: the pid is this test's own child.
+    unsafe {
+        libc::kill(first.pid(), libc::SIGKILL);
+    }
+    let _ = first.child.wait();
+    sleep_ms(300);
+    assert!(
+        pid_alive(pid),
+        "the service died with its supervisor: the test is not testing adoption"
+    );
+
+    // The new supervisor reads the same state directory.
+    let mut second = Sup::start(&scratch);
+    sleep_ms(1_500);
+
+    // The same process: no second copy.
+    assert_eq!(
+        scratch.pid("svc.pid"),
+        Some(pid),
+        "the new supervisor started a second copy of a service that was already running"
+    );
+    // And it knows about it: the state says the service is running under
+    // the supervisor's own account, not stopped.
+    let state = scratch.read("state/probe").expect("the state file");
+    assert!(
+        state.contains("state=Running"),
+        "the adopted service is not Running in the visible state: {state}"
+    );
+    assert!(
+        state.contains(&format!("pid={pid}")),
+        "the adopted service has the wrong pid in the visible state: {state}"
+    );
+    assert!(
+        second.exited().is_none(),
+        "the new supervisor died while adopting"
+    );
+}
+
+/// A supervisor that dies leaves the socket free for the next one.
+///
+/// The single-instance lock must not outlive the process that took it: a
+/// supervisor that died and a new one that cannot start is a machine with
+/// no supervisor at all. The lock is released by the kernel when the
+/// process goes away, so the next one takes the socket.
+#[test]
+fn a_dead_supervisor_leaves_the_socket_free() {
+    let _one = serial();
+    let scratch = Scratch::new("lockfree");
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 30", scratch.at("svc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let mut first = Sup::start(&scratch);
+    let _pid = first.await_live_pid("svc.pid", START_DEADLINE_MS);
+    // Kill it the way a crash would.
+    // SAFETY: the pid is this test's own child.
+    unsafe {
+        libc::kill(first.pid(), libc::SIGKILL);
+    }
+    let _ = first.child.wait();
+    sleep_ms(300);
+
+    // The next supervisor takes the same socket: the lock died with the
+    // process that held it. (It takes a moment to bind it, so the question
+    // is asked until it is answered.)
+    let mut second = Sup::start(&scratch);
+    let mut answered = false;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        let out = zctl(&scratch, &["list"]);
+        if out.status.success() {
+            answered = true;
+            break;
+        }
+        sleep_ms(100);
+    }
+    assert!(
+        answered,
+        "the second supervisor did not take the socket: {}",
+        scratch.tail("sup.log")
+    );
+    assert!(
+        second.exited().is_none(),
+        "the second supervisor stepped aside although the first one was dead"
+    );
+}
