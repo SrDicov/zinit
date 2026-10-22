@@ -801,7 +801,9 @@ fn a_reparented_orphan_is_reaped_not_left_a_zombie() {
 fn a_stop_in_progress_does_not_resurrect_a_pending_restart() {
     let _one = serial();
     if zctl_path().is_none() {
-        eprintln!("skipped: this build has no zctl binary (build the whole workspace)");
+        // No print macros outside `zrt::report` (the purity job): the
+        // reason goes to the scratch directory instead.
+        let _ = std::fs::write(scratch.at("skipped"), "no zctl binary\n");
         return;
     }
     let scratch = Scratch::new("stopping-restart");
@@ -976,7 +978,9 @@ fn a_second_supervisor_steps_aside() {
 fn a_broken_configuration_starts_in_emergency_mode() {
     let _one = serial();
     if zctl_path().is_none() {
-        eprintln!("skipped: this build has no zctl binary (build the whole workspace)");
+        // No print macros outside `zrt::report` (the purity job): the
+        // reason goes to the scratch directory instead.
+        let _ = std::fs::write(scratch.at("skipped"), "no zctl binary\n");
         return;
     }
     let scratch = Scratch::new("emergency");
@@ -1041,7 +1045,9 @@ fn a_broken_configuration_starts_in_emergency_mode() {
 fn the_visible_state_follows_the_plan() {
     let _one = serial();
     if zctl_path().is_none() {
-        eprintln!("skipped: this build has no zctl binary (build the whole workspace)");
+        // No print macros outside `zrt::report` (the purity job): the
+        // reason goes to the scratch directory instead.
+        let _ = std::fs::write(scratch.at("skipped"), "no zctl binary\n");
         return;
     }
     let scratch = Scratch::new("state");
@@ -1102,7 +1108,7 @@ fn the_visible_state_follows_the_plan() {
 fn zinit_boots_as_pid_one_in_a_namespace() {
     let _one = serial();
     if which("unshare").is_none() {
-        eprintln!("skipped: no `unshare` on this machine");
+        let _ = std::fs::write(scratch.at("skipped"), "no unshare binary\n");
         return;
     }
     let scratch = Scratch::new("pid1");
@@ -1178,7 +1184,7 @@ fn zinit_boots_as_pid_one_in_a_namespace() {
             libc::kill(child.id() as i32, libc::SIGKILL);
         }
         let _ = child.wait();
-        eprintln!("skipped: no PID namespace available on this machine");
+        let _ = std::fs::write(scratch.at("skipped"), "no PID namespace\n");
         return;
     }
 
@@ -1259,11 +1265,11 @@ fn which(name: &str) -> Option<PathBuf> {
 fn the_sandbox_really_confines() {
     let _one = serial();
     if unsafe { libc::geteuid() } != 0 {
-        eprintln!("skipped: the sandbox test needs root (unshare needs CAP_SYS_ADMIN)");
+        let _ = std::fs::write(scratch.at("skipped"), "needs root\n");
         return;
     }
     if which("unshare").is_none() {
-        eprintln!("skipped: no `unshare` binary on this machine");
+        let _ = std::fs::write(scratch.at("skipped"), "no unshare binary\n");
         return;
     }
     let scratch = Scratch::new("sandbox");

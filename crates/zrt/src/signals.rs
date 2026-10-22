@@ -356,16 +356,20 @@ extern "C" fn note_power_signal(_signo: libc::c_int) {
 /// kernel's answer to a dead init is a panic.
 pub fn install_power_handler() -> io::Result<()> {
     for sig in [libc::SIGTERM, libc::SIGINT] {
-        // SAFETY: `action` is a live `sigaction` with a valid handler and an
-        // empty mask; `sigaction` copies it and retains nothing. The flags
-        // ask for no restart (`SA_RESTART` off), so a blocking `waitpid` in
-        // the init returns `EINTR` and the loop notices the signal.
-        let action = libc::sigaction {
-            sa_sigaction: note_power_signal as *const () as usize,
-            sa_mask: unsafe { core::mem::zeroed() },
-            sa_flags: 0,
-            sa_restorer: None,
-        };
+        // The struct is zeroed and then filled: `sigaction` has different
+        // fields per platform (`sa_restorer` exists on Linux and nowhere
+        // else), and naming a field that does not exist does not compile
+        // on the other half of the matrix.
+        // SAFETY: `sigaction` is a plain C struct of integers and a
+        // pointer; zeroing it is the documented way to build one, and the
+        // handler and the empty mask are set right after.
+        let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+        action.sa_sigaction = note_power_signal as *const () as usize;
+        // No `SA_RESTART`: a blocking `waitpid` in the init must return
+        // `EINTR` so the loop notices the signal.
+        action.sa_flags = 0;
+        // SAFETY: `action` is a live, fully built `sigaction`; `sigaction`
+        // copies it and retains nothing.
         if unsafe { libc::sigaction(sig, &action, std::ptr::null_mut()) } != 0 {
             return Err(io::Error::last_os_error());
         }
