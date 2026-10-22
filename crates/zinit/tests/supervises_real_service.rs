@@ -1349,19 +1349,26 @@ fn the_sandbox_really_confines() {
         return;
     }
     // The command under test: it needs a namespace, and it says whether it
-    // got one.
-    let probe = format!(
-        "/bin/sh -c 'unshare -m true 2>/dev/null; echo $? > {}'",
-        scratch.at("rc")
-    );
+    // got one. Each service writes **its own** answer — a shared file would be
+    // overwritten by whichever finished last, which is exactly the kind of
+    // test that passes for the wrong reason.
+    let probe = |name: &str| {
+        format!(
+            "/bin/sh -c 'unshare -m true 2>/dev/null; echo $? > {}'",
+            scratch.at(&format!("{name}.rc"))
+        )
+    };
     // The same command, three times over: unconfined, capability-dropped
     // and syscall-filtered.
-    scratch.conf("plain.conf", &desc(&probe, ""));
+    scratch.conf("plain.conf", &desc(&probe("plain"), ""));
     scratch.conf(
         "nocaps.conf",
-        &desc(&probe, "drop-capabilities = sys_admin\n"),
+        &desc(&probe("nocaps"), "drop-capabilities = sys_admin\n"),
     );
-    scratch.conf("seccomp.conf", &desc(&probe, "syscall-filter = errno\n"));
+    scratch.conf(
+        "seccomp.conf",
+        &desc(&probe("seccomp"), "syscall-filter = errno\n"),
+    );
 
     let mut sup = Sup::start(&scratch);
 
@@ -1376,10 +1383,11 @@ fn the_sandbox_really_confines() {
                 && scratch.read("nocaps.rc").is_some()
                 && scratch.read("seccomp.rc").is_some()
         }),
-        "not every probe answered: plain={:?} nocaps={:?} seccomp={:?}",
+        "not every probe answered: plain={:?} nocaps={:?} seccomp={:?}\n{}",
         scratch.read("plain.rc"),
         scratch.read("nocaps.rc"),
-        scratch.read("seccomp.rc")
+        scratch.read("seccomp.rc"),
+        scratch.tail("sup.log")
     );
 
     assert_eq!(
