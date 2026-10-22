@@ -1691,12 +1691,18 @@ fn two_stops_at_once_stop_the_service_once() {
 
 /// A service under a syscall filter runs, or the filter is not a filter.
 ///
+/// Linux x86_64 only: the syscall-number table is verified for that
+/// architecture and nothing else, and everywhere else a configured filter is
+/// a spawn refusal by design ("loud refusal beats an unverified number"). The
+/// refusal is a different test; this one is about the filter working.
+///
 /// `SECCOMP_MODE_STRICT` and `SECCOMP_MODE_FILTER` are one digit apart, and
 /// the wrong one does not weaken the sandbox: it `SIGKILL`s the service on
 /// the first `execve`, so every filtered service never starts. The test is
 /// the plainest possible use of a filtered service — write a file, exit —
 /// and it needs no root, so it runs everywhere the suite runs.
 #[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn a_filtered_service_starts_and_does_its_work() {
     let _one = serial();
     let scratch = Scratch::new("seccomp-runs");
