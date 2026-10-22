@@ -113,3 +113,58 @@ soak restarts on the release binary.
   verification before any power action.
 - Lesson recorded: never replace the power path while the machine may still
   boot into dinit; test the shim under BOTH inits before relying on it.
+
+## 2026-10-16/17 — Cerrado en esta noche
+
+- **Un supervisor por socket (cerrado)**: dos supervisores sobre el mismo
+  socket era una carrera, no una configuración; el segundo robaba el path y
+  los clientes del primero acababan hablando con otro. Ahora hay un
+  `flock` exclusivo sobre `<socket>.lock` y el segundo se aparta con el
+  código de salida 11, que PID 1 lee para no relanzar (la máquina ya está
+  gobernada por el otro). Un supervisor muerto libera el cerrojo: lo
+  libera el kernel, no el código.
+- **Un supervisor que vuelve arranca copias de todo (cerrado)**: al
+  morir, sus hijos quedaban reparentados a PID 1, que no sabe nada de
+  ellos, y el supervisor nuevo arrancaba un segundo copy de cada servicio
+  (pasó en vivo el 2026-10-16: dos daemons de cada cosa peleándose por
+  los puertos). Ahora el supervisor adopta los que siguen vivos: el estado
+  visible dice qué pid tenía cada servicio, y un pid vivo de un servicio
+  que el plan todavía nombra se adopta (vigilado con pidfd, señalado por
+  pid, sin arrancar una copia).
+- **`kill -TERM 1` no apagaba la máquina (cerrado)**: la señal se
+  encolaba y se ignoraba. Ahora el handler sólo pone una bandera (en
+  contexto de señal no se puede hacer nada más) y el bucle de PID 1 la
+  convierte en un verbo `poweroff` por el socket de control: el poder
+  sigue teniendo un solo dueño, el supervisor.
+- **Configuración rota = máquina girando (cerrado)**: el supervisor
+  moría, PID 1 lo relanzaba, moría otra vez, y la máquina se quedaba sin
+  socket, sin servicios y sin manera de entrar. Ahora hay modo
+  emergencia: una shell en `/dev/console` (escrita como una descripción
+  normal y cargada por el mismo parser) y el socket de control en pie,
+  para que `zctl reload-all` recoja el plan real cuando el fichero esté
+  arreglado. `zctl emergency` la pone a demanda.
+- **El estado visible mentía (cerrado)**: los ficheros de servicios
+  borrados seguían ahí diciendo que estaban corriendo, y se escribían
+  en sitio (un lector podía ver medio fichero nuevo y medio viejo). Ahora
+  se escriben con rename (atómico) y los de servicios que ya no están en
+  el plan se borran.
+- **`suspend` respondía después de despertarse (cerrado)**: la escritura
+  a `/sys/power/state` no vuelve hasta que la máquina despierta, así que
+  el cliente esperaba dormido. Ahora la respuesta ("suspending") sale
+  antes, y el error (si el kernel lo rechazó) llega después.
+- **Doble superficie de autenticación (cerrado)**: el socket de control
+  es 0600, pero cualquier proceso de ese usuario podía mandar `poweroff`.
+  Ahora se capturan las credenciales del peer al aceptar (`SO_PEERCRED`):
+  leer es para cualquiera, gestionar servicios es del dueño, y apagar la
+  máquina es del dueño usando `zctl` (o de root). Código de error nuevo:
+  `6`.
+
+## Abierto (espera la máquina)
+
+- **Soak de 24 h**: la caja está apagada; no se puede relanzar el
+  muestreo ni medir la pendiente hasta que vuelva.
+- **Verificación en vivo del apagado por señal** (`kill -TERM 1`): el
+  camino está implementado y con test de regresión, pero el syscall
+  final sólo se prueba en la máquina.
+- **Timers**: depende de si la distribución trae `cron`. Si lo trae, un
+  segundo planificador es la misma función dos veces.
