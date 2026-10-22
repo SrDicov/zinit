@@ -1646,6 +1646,12 @@ impl Sup {
     /// A service that was `Starting` (its readiness handshake belonged to
     /// the dead supervisor) is not adopted: the handshake is gone, so the
     /// only honest thing is to start it again.
+    ///
+    /// The known limit: a pid that was reused by an unrelated process
+    /// would be adopted as ours. The state directory is a tmpfs by default
+    /// (`/run/zinit/state`), so the file only describes this boot; the
+    /// limit only exists if the operator points it at persistent storage
+    /// *and* a pid is recycled. Starting a duplicate is the worse failure.
     fn adopt_live_services(&mut self) {
         if !self.state_usable {
             return;
