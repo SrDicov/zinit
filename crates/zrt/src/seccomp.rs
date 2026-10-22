@@ -204,6 +204,10 @@ pub fn syscall_nr(name: &str) -> Option<u32> {
         "getsockopt" => 55,
         "clone" => 56,
         "fork" => 57,
+        // `vfork` is what dash uses for fork-and-exec; without it every
+        // `sh -c` that runs an external command reports "Cannot fork".
+        "vfork" => 58,
+        "waitid" => 247,
         "execve" => 59,
         "exit" => 60,
         "wait4" => 61,
@@ -458,6 +462,13 @@ pub const IMPLICIT: &[&str] = &[
     "sigaltstack",
     "tgkill",
     "clone",
+    // Any service that runs a child — a shell script, a wrapper, a launcher —
+    // has to wait for it. `wait4` only ever reaches your own children, so it
+    // grants nothing over another process; `kill` deliberately stays out of
+    // the baseline, because signalling *any* pid is a different power.
+    "wait4",
+    "waitid",
+    "vfork",
     "clone3",
     "execve",
     "exit",
