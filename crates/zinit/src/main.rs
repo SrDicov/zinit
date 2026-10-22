@@ -114,6 +114,7 @@ fn main() -> ExitCode {
 /// The entry points, on stderr, for the same reason as `--version`.
 fn usage() {
     announce_degradation(
-        "usage: zinit --init | zinit --sup [<services.d>] | zinit check [<services.d>] | zinit --version",
+        "usage: zinit --init [<services.d>] | zinit --sup [<services.d>] | \
+         zinit check [<services.d>] | zinit --version",
     );
 }
