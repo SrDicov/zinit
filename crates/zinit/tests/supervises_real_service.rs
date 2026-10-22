@@ -1455,6 +1455,24 @@ fn a_restarted_supervisor_adopts_the_services_that_are_still_alive() {
         second.exited().is_none(),
         "the new supervisor died while adopting"
     );
+
+    // And the adopted service is really supervised: when it dies, the new
+    // supervisor notices and starts it again. (An adopted process is not
+    // our child, so nobody may read its exit status — the death still has
+    // to reach the restart policy.)
+    // SAFETY: the pid is the service's own, reported by the service.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    let restarted = wait_until(START_DEADLINE_MS, || {
+        scratch
+            .pid("svc.pid")
+            .is_some_and(|p| p != pid && pid_alive(p))
+    });
+    assert!(
+        restarted,
+        "the adopted service died and was never restarted: the supervisor did not notice"
+    );
 }
 
 /// A supervisor that dies leaves the socket free for the next one.

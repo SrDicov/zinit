@@ -349,7 +349,7 @@ impl ChildTracker for PidfdTracker {
             // *how*. It cannot block: the process is already dead, and if the
             // wait says otherwise the pidfd was for a different process and
             // the right answer is "nothing to report".
-            match sys::waitpid_nohang(pid) {
+            match sys::waitpid_nohang_strict(pid) {
                 Ok(Some(waited)) => out.push((waited.pid, waited.status)),
                 Ok(None) => {}
                 // `ECHILD`: the process is gone but it was never our

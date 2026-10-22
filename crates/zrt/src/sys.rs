@@ -1281,6 +1281,23 @@ pub fn decode_status(raw: i32) -> ExitStatus {
 /// distinction matters because an init calls this in a loop and must be able to
 /// tell "no child died" from "the kernel is broken".
 pub fn waitpid_nohang(pid: i32) -> io::Result<Option<Waited>> {
+    match waitpid_nohang_strict(pid) {
+        // "No such child" is the normal answer for a sweep: there is
+        // nothing to reap. The strict version tells the difference; this
+        // one does not need to.
+        Err(e) if e.raw_os_error() == Some(libc::ECHILD) => Ok(None),
+        other => other,
+    }
+}
+
+/// `waitpid(pid, WNOHANG)` that tells "no such child" apart from "not
+/// exited yet".
+///
+/// The difference matters for an adopted process: the pidfd says it died,
+/// and `waitpid` answers `ECHILD` because it was never our child (the
+/// kernel reparented it to PID 1). The lenient wrapper folds that into
+/// `Ok(None)` — "nothing to report" — and the death is lost.
+pub fn waitpid_nohang_strict(pid: i32) -> io::Result<Option<Waited>> {
     loop {
         let mut status: libc::c_int = 0;
         // SAFETY: `&raw mut status` is a live, aligned `c_int`; `waitpid`
@@ -1297,10 +1314,8 @@ pub fn waitpid_nohang(pid: i32) -> io::Result<Option<Waited>> {
             return Ok(None);
         }
         let err = io::Error::last_os_error();
-        // `ECHILD` means there is no such child: it exited and was already
-        // reaped, or it was never ours. Not an error for a reaper.
         if err.raw_os_error() == Some(libc::ECHILD) {
-            return Ok(None);
+            return Err(err);
         }
         if err.kind() != io::ErrorKind::Interrupted {
             return Err(err);

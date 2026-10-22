@@ -47,6 +47,10 @@ pub enum Event {
     Exited { idx: Idx, code: i32 },
 
     /// The child was killed by `signal`.
+    ///
+    /// `signal` 0 means the cause is unknown: an adopted process died and
+    /// nobody may read its exit status (it was never our child). It is
+    /// still a death, and not a clean one.
     Signalled { idx: Idx, signal: i32 },
 
     /// The child was reaped but was not one we spawned - it was inherited

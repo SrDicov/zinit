@@ -600,6 +600,17 @@ impl ManagedService {
                 idx: self.idx,
                 signal,
             }),
+            // `Reported(-1)` is the marker for "the process is gone and
+            // nobody can say how": an adopted process, whose death the
+            // kernel reported and whose exit status nobody may read (it
+            // was never our child). It is a death — the service is not
+            // running any more — and it is not a clean exit, so the
+            // restart policy treats it as a failure. Signal 0 is the
+            // marker for "unknown signal".
+            zrt::sys::ExitStatus::Reported(raw) if raw < 0 => Some(Event::Signalled {
+                idx: self.idx,
+                signal: 0,
+            }),
             zrt::sys::ExitStatus::Reported(_) => None,
         };
         if is_forking && !self.adopted {
