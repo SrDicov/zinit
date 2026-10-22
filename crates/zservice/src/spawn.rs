@@ -794,7 +794,13 @@ fn child_main(p: ChildPlan) -> ! {
     // NNP only after a real drop: without one it would neuter setuid for
     // the whole subtree (live: every ssh session lost `doas`, with no way
     // back but a power cycle). A root service has nothing to escalate to.
-    if p.drop_ids {
+    // `no_new_privs` is mandatory to install a seccomp filter without
+    // CAP_SYS_ADMIN, and it is the only honest setting once a filter is
+    // asked for: a service that can still gain privileges through a setuid
+    // binary has an escape hatch the filter cannot see. Without a filter it
+    // stays gated on the id drop, so a root service that runs `doas` keeps
+    // working — that unconditional gate was a live regression once.
+    if p.drop_ids || p.seccomp_len > 0 {
         child_step_no_new_privs();
     }
     if !child_step_ctty(p) {

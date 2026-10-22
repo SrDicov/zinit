@@ -1680,3 +1680,44 @@ fn two_stops_at_once_stop_the_service_once() {
         "the supervisor died on two simultaneous stops"
     );
 }
+
+/// A service under a syscall filter runs, or the filter is not a filter.
+///
+/// `SECCOMP_MODE_STRICT` and `SECCOMP_MODE_FILTER` are one digit apart, and
+/// the wrong one does not weaken the sandbox: it `SIGKILL`s the service on
+/// the first `execve`, so every filtered service never starts. The test is
+/// the plainest possible use of a filtered service — write a file, exit —
+/// and it needs no root, so it runs everywhere the suite runs.
+#[test]
+fn a_filtered_service_starts_and_does_its_work() {
+    let _one = serial();
+    let scratch = Scratch::new("seccomp-runs");
+    let probe = |tag: &str| format!("echo {tag} > {}", scratch.at(&format!("{tag}.done")),);
+    scratch.conf("plain.conf", &desc(&probe("plain"), ""));
+    scratch.conf(
+        "errno.conf",
+        &desc(&probe("errno"), "syscall-filter = errno\n"),
+    );
+    scratch.conf(
+        "enforce.conf",
+        &desc(&probe("enforce"), "syscall-filter = enforce\n"),
+    );
+
+    let mut sup = Sup::start(&scratch);
+    assert!(
+        wait_until(START_DEADLINE_MS, || {
+            scratch.read("plain.done").is_some()
+                && scratch.read("errno.done").is_some()
+                && scratch.read("enforce.done").is_some()
+        }),
+        "a filtered service never ran: plain={:?} errno={:?} enforce={:?}\n{}",
+        scratch.read("plain.done"),
+        scratch.read("errno.done"),
+        scratch.read("enforce.done"),
+        scratch.tail("sup.log")
+    );
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor died while supervising filtered services"
+    );
+}

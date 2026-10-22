@@ -74,8 +74,16 @@ const RET_ERRNO: u32 = 0x0005_0000;
 
 /// `prctl` option and filter mode (linux/prctl.h). Defined here rather than
 /// taken from `libc` so a missing binding is impossible by construction.
+///
+/// `SECCOMP_MODE_FILTER` is **2**. `1` is `SECCOMP_MODE_STRICT`, which is a
+/// different thing entirely: the kernel installs its own hard-coded filter
+/// that allows `read`, `write`, `_exit` and `sigreturn` and nothing else, and
+/// kills the process with `SIGKILL` on anything else — `execve` included. The
+/// wrong value looked like a working sandbox right up to the first service
+/// that tried to run: `strace` showed `prctl(PR_SET_SECCOMP,
+/// SECCOMP_MODE_STRICT)` and a `killed by SIGKILL` one line later.
 const PR_SET_SECCOMP: i32 = 22;
-const SECCOMP_MODE_FILTER: u64 = 1;
+const SECCOMP_MODE_FILTER: u64 = 2;
 
 /// Audit architecture tokens (linux/audit.h): machine + 64-bit + little-endian.
 const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
@@ -241,6 +249,13 @@ pub fn syscall_nr(name: &str) -> Option<u32> {
         "setresuid" => 117,
         "setresgid" => 119,
         "getpgid" => 121,
+        // `getpgrp` is a syscall of its own on x86_64 (111), not an alias of
+        // `getpgid` (121), and glibc's `getpgrp()` uses it. A shell calls it
+        // during job-control initialisation, so a missing entry here is a
+        // shell that dies before running a single line.
+        "getpgrp" => 111,
+        "getresuid" => 118,
+        "getresgid" => 120,
         "capget" => 125,
         "capset" => 126,
         "rt_sigpending" => 127,
@@ -424,6 +439,9 @@ pub const IMPLICIT: &[&str] = &[
     "getegid",
     "getgroups",
     "getpgid",
+    "getpgrp",
+    "getresuid",
+    "getresgid",
     "uname",
     "clock_gettime",
     "clock_getres",
@@ -602,6 +620,38 @@ pub fn install(_filter: &[Insn]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Every number in the baseline really is in the assembled program.
+    ///
+    /// The baseline is a list of names; the program is a list of numbers. A
+    /// name that resolves but is dropped on the way (or a jump that skips the
+    /// wrong entry) is a filter that blocks what it says it allows, and the
+    /// symptom is a shell failing at `getpgrp` with `EPERM`.
+    #[test]
+    fn the_program_allows_every_implicit_syscall() {
+        let prog = super::build(&[], super::OnViolation::Errno).expect("filter builds");
+        for name in super::IMPLICIT {
+            let nr = super::syscall_nr(name).expect("implicit name resolves");
+            assert!(
+                prog.iter().any(
+                    |i| i.code == (super::BPF_JMP | super::BPF_JEQ | super::BPF_K) && i.k == nr
+                ),
+                "`{name}` ({nr}) is in the baseline and not in the program"
+            );
+        }
+    }
+
+    /// The mode number is the difference between a filter and a kill switch.
+    ///
+    /// `SECCOMP_MODE_STRICT` (1) installs the kernel's own four-syscall
+    /// filter and `SIGKILL`s the process on `execve`; `SECCOMP_MODE_FILTER`
+    /// (2) installs the program built here. A `1` here is not a weaker
+    /// sandbox, it is a service that never starts, and `strace` is the only
+    /// place it shows.
+    #[test]
+    fn the_filter_mode_is_the_filter_mode() {
+        assert_eq!(super::SECCOMP_MODE_FILTER, 2, "1 is SECCOMP_MODE_STRICT");
+    }
+
     use super::*;
 
     /// The program for two allowed calls, written out by hand: any drift in
