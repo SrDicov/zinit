@@ -1735,3 +1735,64 @@ fn a_filtered_service_starts_and_does_its_work() {
         "the supervisor died while supervising filtered services"
     );
 }
+
+/// `syscall-allow` opens exactly the door it names.
+///
+/// `kill` is deliberately not in the implicit baseline — signalling any pid
+/// is a power a service should have to ask for. The test: the same command
+/// three times, unconfined, filtered, and filtered with `kill` allowed. The
+/// filter must refuse it and the allow list must let it through, which is
+/// the only end-to-end proof that the list is wired to anything.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn syscall_allow_opens_exactly_one_door() {
+    let _one = serial();
+    let scratch = Scratch::new("seccomp-allow");
+    // `kill -0 $$` asks the kernel whether the pid exists and sends nothing:
+    // no privileges needed, and the shell builtin means no fork.
+    let probe = |name: &str| {
+        format!(
+            "kill -0 $$; echo $? > {}",
+            scratch.at(&format!("{name}.rc"))
+        )
+    };
+    scratch.conf("plain.conf", &desc(&probe("plain"), ""));
+    scratch.conf(
+        "blocked.conf",
+        &desc(&probe("blocked"), "syscall-filter = errno\n"),
+    );
+    scratch.conf(
+        "allowed.conf",
+        &desc(
+            &probe("allowed"),
+            "syscall-filter = errno\nsyscall-allow = kill\n",
+        ),
+    );
+
+    let mut sup = Sup::start(&scratch);
+    assert!(
+        wait_until(START_DEADLINE_MS, || {
+            scratch.read("plain.rc").is_some()
+                && scratch.read("blocked.rc").is_some()
+                && scratch.read("allowed.rc").is_some()
+        }),
+        "a probe never answered: plain={:?} blocked={:?} allowed={:?}\n{}",
+        scratch.read("plain.rc"),
+        scratch.read("blocked.rc"),
+        scratch.read("allowed.rc"),
+        scratch.tail("sup.log")
+    );
+    let rc = |name: &str| -> String { scratch.read(name).unwrap_or_default().trim().to_string() };
+    assert_eq!(rc("plain.rc"), "0", "the unconfined probe failed");
+    assert_ne!(
+        rc("blocked.rc"),
+        "0",
+        "the filter let a service signal a pid without asking for it"
+    );
+    assert_eq!(
+        rc("allowed.rc"),
+        "0",
+        "`syscall-allow = kill` did not open the door it named"
+    );
+    assert!(sup.exited().is_none(), "the supervisor died");
+}
