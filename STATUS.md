@@ -18,10 +18,19 @@ commit). Base: `2f449e3`.
 | — | devtmpfs, PATH heredado, `RLIMIT_NOFILE`, estado atómico | varios | Gate local: build + clippy + suite verdes |
 | — | Test de PID 1 real en namespace | `2d1517d` | `unshare --user --map-root-user --pid --fork`: PID 1 es zinit, el servicio arranca, el namespace se limpia |
 | — | Test del sandbox (seccomp + capdrop) | `f7b6a93` | la misma operación con y sin confinamiento: sin él pasa, con él falla |
+| C6 | Escala: 500 servicios | `6030459` | 622 ms hasta converger, 4,0 MB RSS, 1008 fds, 1 hilo, 0 zombis (`docs/audit/baseline.md`) |
+| C7 | Dos `stop` simultáneos | `a578607` | ambos responden, el servicio muere una vez, estado `Stopped`/`Down` |
+| C8 | Un servicio que se para se lleva su grupo | `7b990e3` | reproducido en contenedor Ubuntu (dash): el hijo directo moría al primer `SIGTERM` y los nietos quedaban vivos con el servicio dado por parado. Era el fallo que llevaba la suite de CI en rojo desde el guard de parada |
+| C9 | `syscall-filter` no filtraba | `375641d` + `94a533f` + `46e0d5f` | `SECCOMP_MODE_FILTER` valía 1 (`STRICT`): todo servicio filtrado moría con `SIGKILL` en el `execve`. Además NNP no se ponía sin cambio de identidad y la base implícita no cubría un shell (faltaban `getpgrp` 111, `getresuid` 118, `getresgid` 120, `wait4`, `waitid`, `vfork` 58). Test en CI para x86_64 + sandbox como root verificado en contenedor |
+| C10 | Ctrl-Alt-Del reinicia | `f1e5968` | `SIGINT` a PID 1 pedía `poweroff`; el contrato del kernel es reiniciar. Test de los dos verbos por el socket falso |
+| C11 | `syscall-allow` de extremo a extremo | `476b10a` | mismo comando: sin filtro 0, filtrado rechazado, filtrado con `syscall-allow = kill` 0 |
+| C12 | Log que no se puede abrir = rechazo | `ce967ab` | `ENOTDIR` en el camino del log: el servicio no corre y el supervisor sobrevive |
+| — | Un reload no reinicia lo que ya dijo READY | `5c474cc` | `ready = notify` de extremo a extremo (nunca se había probado): tras `reload-all` el pid es el mismo y sigue `Running` pasado el `start-timeout`. Cierra el sospechoso del bucle de chronyd |
 
-Suite local: **567 tests, 0 fallos**; clippy `-D warnings` limpio; `fmt`
-limpio. CI: los workflows corren en GitHub Actions (el veredicto de la
-matriz está en el run del tip `fd4d76f`).
+Suite local: **577 tests, 0 fallos**; clippy `-D warnings` limpio; `fmt`
+limpio; `zinit` release = **676 KiB** (presupuesto 1 MiB). CI: matriz en
+GitHub Actions sobre el tip de `testing`; el único job que falla por código
+ajeno es `check riscv32gc-unknown-linux-gnu` (std de nightly, documentado).
 
 ## Bloqueado (necesita la caja)
 
@@ -30,8 +39,9 @@ matriz está en el run del tip `fd4d76f`).
 - **B2** Soak de 24 h con el binario final y `soak-verdict.md`.
 - **B3** Verificar en vivo `kill -TERM 1` → apagado real (el camino está
   implementado y con test; el syscall final sólo se prueba en la máquina).
-- **B4** ¿Trae la distribución `cron`? Si lo trae, los timers de zinit
-  duplican una función que ya existe y no se implementan (YAGNI).
+- **B4** ~~¿Trae la distribución `cron`?~~ **Resuelto sin la caja**: sí,
+  `cronie`/`crond` (evidencia en `z-dinit-generator/evidence/`), así que los
+  timers de zinit serían la misma función dos veces. Descartados.
 
 La caja Chimera está **apagada** (sin red, sin SSH). Todo lo anterior
 espera a que vuelva.
@@ -39,9 +49,8 @@ espera a que vuelva.
 ## Decisión necesaria (del usuario)
 
 1. **Encender la caja** para B1-B4 y el soak.
-2. **Timers**: si la máquina trae cron, se descartan (mi recomendación:
-   descartar). Si no lo trae, se implementan en la versión reducida
-   (`on-boot-sec` + `on-calendar HH:MM:SS`).
+2. **Timers**: ya no hay decisión que tomar — la máquina trae cron y se
+   descartan con evidencia (B4).
 3. **Grub**: el default sigue siendo dinit. El cambio a zinit es decisión
    del operador y espera al soak verde.
 
