@@ -51,8 +51,20 @@ trabajo del día. Lo que ya está arreglado y verificado **no** se repite.
   visible (`$ZINIT_STATE_DIR`) ya dice qué pid tenía cada servicio: basta
   con leerlo al arrancar, comprobar que el pid sigue vivo y **adoptarlo**
   en vez de arrancar otro.
-- [ ] **C5** `AUDIT.md`/`KNOWN_ISSUES.md` al día con el estado real
+- [x] **C5** `AUDIT.md`/`KNOWN_ISSUES.md` al día con el estado real
   (incluido el fallo de `riscv32` y la desviación del código de error 6).
+- [x] **C6** Escala medida: 500 servicios convergen en 622 ms con 4,0 MB de
+  RSS, 1008 descriptores, 1 hilo y 0 zombis (`docs/audit/baseline.md`). El
+  techo es `RLIMIT_NOFILE / 2`; se documenta, no se construye un ayudante.
+- [x] **C7** Dos `stop` simultáneos sobre el mismo servicio: ambos
+  responden, el servicio muere una vez y el estado queda `Stopped`/`Down`
+  (test `two_stops_at_once_stop_the_service_once`).
+- [x] **C8** El grupo de procesos muere con el servicio **cuando se está
+  parando** (`7b990e3`). Bug real, reproducido en contenedor Ubuntu (dash
+  bifurca; el bash local ejecuta y por eso no salía aquí): el hijo directo
+  moría al primer `SIGTERM`, el supervisor daba el servicio por parado y
+  los nietos seguían vivos. La prueba de CI lo llevaba fallando desde el
+  commit del guard.
 
 ## Descartado con motivo
 

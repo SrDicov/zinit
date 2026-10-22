@@ -72,3 +72,26 @@ job `purity` de CI falla el build si aparece una tercera parte.
 
 El veredicto de build/test/lint es de GitHub Actions; estos números son
 solo para saber cuánto tarda un ciclo local.
+
+## Escala: 500 servicios (medido el 2026-10-22)
+
+Plan de 500 `process` idénticos (`/bin/sleep 120`, `restart = never`),
+supervisor local, `target/release/zinit`:
+
+| medida | valor |
+|---|---:|
+| convergencia (todos `running`) | **622 ms** |
+| `VmRSS` del supervisor | **4,0 MB** |
+| `VmPeak` | 5,3 MB |
+| descriptores abiertos | **1008** (≈2 por servicio) |
+| hilos | **1** |
+| hijos directos | 500 |
+| zombis | **0** |
+| ficheros de estado | 500 |
+
+Lectura: el coste por servicio es de ~8 KB de RSS y dos descriptores, así
+que el techo real es `RLIMIT_NOFILE / 2` (~500 servicios con un límite
+duro de 1024; el supervisor sube el blando al duro al arrancar). Por
+encima de eso hace falta un ayudante que abra descriptores por el
+supervisor, que es exactamente el peso que este proyecto no quiere: se
+documenta el techo en vez de construirlo.
