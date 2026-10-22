@@ -56,6 +56,14 @@ pub const MAX_LINE_BYTES: usize = 4096;
 /// Hard cap on buffered input or unflushed output per client. Past it the
 /// client is dropped (input) or its replies discarded at flush (output).
 pub const MAX_BUFFERED_BYTES: usize = 65536;
+/// How many clients may be connected at once.
+///
+/// The supervisor is the one process that must not run out of memory, and
+/// every client costs a descriptor and a buffer. A local process that
+/// opens connections in a loop would otherwise grow the supervisor without
+/// bound; past the cap the connection is closed before it is registered,
+/// so the cost of refusing it is one descriptor.
+pub const MAX_CLIENTS: usize = 64;
 
 /// One parsed client frame, with the connection it arrived on.
 ///
@@ -584,6 +592,13 @@ impl CtlServer {
         loop {
             match zrt::sys::unix_accept(self.listener) {
                 Ok(fd) => {
+                    if self.clients.len() >= MAX_CLIENTS {
+                        // No more room: the connection is closed before it
+                        // is registered, so refusing it costs one
+                        // descriptor and nothing else.
+                        let _ = zrt::sys::close(fd);
+                        continue;
+                    }
                     if reactor.add(fd, Interest::Read).is_err() {
                         let _ = zrt::sys::close(fd);
                         continue;

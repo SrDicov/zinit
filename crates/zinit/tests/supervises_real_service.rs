@@ -1035,6 +1035,57 @@ fn a_broken_configuration_starts_in_emergency_mode() {
     );
 }
 
+/// The control socket must not grow without bound.
+///
+/// A local process that opens connections in a loop would otherwise make
+/// the supervisor grow: every client costs a descriptor and a buffer, and
+/// the supervisor is the one process that must not run out of memory. Past
+/// the cap the connection is closed before it is registered.
+#[test]
+fn the_control_socket_refuses_more_clients_than_it_can_hold() {
+    use std::os::unix::net::UnixStream;
+
+    let _one = serial();
+    let scratch = Scratch::new("clientcap");
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 30", scratch.at("svc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    let _pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
+
+    // More connections than the cap, all of them held open.
+    let mut held = Vec::new();
+    for _ in 0..(crate_cap() + 8) {
+        match UnixStream::connect(scratch.at("ctl")) {
+            Ok(s) => held.push(s),
+            Err(_) => break,
+        }
+    }
+    // The supervisor is still there: the cap refused the extra
+    // connections, it did not wedge anything.
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor died when the clients piled up"
+    );
+    // With the pile gone, the socket works again.
+    drop(held);
+    let out = zctl(&scratch, &["list"]);
+    assert!(
+        out.status.success(),
+        "the control socket did not recover after the clients left: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The cap the control socket enforces, as the test sees it.
+fn crate_cap() -> usize {
+    64
+}
+
 /// The visible state must describe the machine that is running.
 ///
 /// Two things used to go wrong: a service deleted from the configuration

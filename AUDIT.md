@@ -37,7 +37,7 @@ trabajo del día. Lo que ya está arreglado y verificado **no** se repite.
   kernel duerme"): el orden está invertido y el cliente espera en el socket
   mientras la máquina duerme. Arreglo: renderizar y vaciar la respuesta
   antes de dormir.
-- [ ] **C3** El socket de control no tiene tope de clientes: un proceso
+- [x] **C3** El socket de control no tiene tope de clientes: un proceso
   local puede abrir miles de conexiones y el supervisor crece sin límite.
   Tope (64) y se cierra la conexión de más.
 - [ ] **C4** **El supervisor re-adopta los servicios vivos al arrancar.**
