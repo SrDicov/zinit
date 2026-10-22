@@ -971,8 +971,46 @@ impl Sup {
             let idx = self.slots.iter().position(|s| s.svc.pid() == Some(pid));
             if let Some(idx) = idx {
                 let forking = self.plan.services[idx].kind == ServiceKind::Forking;
+                // A service being *stopped* is its process group, and the
+                // group dies with the main child. Without this, a service
+                // whose direct child died on the first `SIGTERM` while its
+                // children inherited an ignored one leaves the real work
+                // running, and the supervisor reports the service stopped
+                // while it is still there: the stop timeout never escalates,
+                // because from the core's point of view the death already
+                // happened.
+                //
+                // Only while `Stopping`: on a crash the children may be the
+                // service's own workers, and the subreaper adopts them — the
+                // orphan contract (`a_reparented_orphan_is_reaped`) is that
+                // they are reaped, not killed behind the operator's back.
+                // `Forking` and `Oneshot` are excluded on purpose: their
+                // children are meant to outlive them (an adopted daemon, a
+                // double-forked launcher), and the group is not ours to kill.
+                let leftover = if matches!(
+                    self.plan.services[idx].kind,
+                    ServiceKind::Forking | ServiceKind::Oneshot
+                ) || self.runtime.state_at(idx) != State::Stopping
+                {
+                    None
+                } else if self.slots[idx].svc.group_is_signallable() {
+                    self.slots[idx].svc.pgid()
+                } else {
+                    None
+                };
                 if let Some(event) = self.slots[idx].svc.on_waitpid(forking, status) {
                     self.feed(&event, now);
+                }
+                if let Some(pgid) = leftover {
+                    // `ESRCH` is the ordinary case (the group went with its
+                    // leader) and nothing to say; a real failure is announced.
+                    if let Err(e) = zrt::sys::kill_group(pgid, Signal::Kill)
+                        && e.raw_os_error() != Some(libc::ESRCH)
+                    {
+                        announce_degradation(&format!(
+                            "cannot clean up the group of pid {pid}: {e}"
+                        ));
+                    }
                 }
                 self.slots[idx].svc.cleanup();
                 // `cleanup` closed the custodial fds, so the numbers the reactor

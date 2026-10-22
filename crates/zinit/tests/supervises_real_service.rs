@@ -807,11 +807,15 @@ fn a_stop_in_progress_does_not_resurrect_a_pending_restart() {
         let _ = std::fs::write(scratch.at("skipped"), "no zctl binary\n");
         return;
     }
-    // The service ignores SIGTERM: the supervisor has to escalate to
-    // SIGKILL after `stop-timeout`, which is the window in which the stop
-    // and the pending restart overlap.
+    // The service ignores SIGTERM *in its own process*, which for a
+    // `script` service is the shell the supervisor forks: the trap has to be
+    // in that shell's body, not in a nested `/bin/sh -c`, or the direct child
+    // dies on the first signal and the restart is legitimate instead of
+    // racing the stop. The supervisor then has to escalate to SIGKILL after
+    // `stop-timeout`, which is the window in which the stop and the pending
+    // restart overlap.
     let command = format!(
-        "/bin/sh -c 'trap \"\" TERM; echo $$ > {}; sleep 300'",
+        "trap \"\" TERM; echo $$ > {}; sleep 300",
         scratch.at("svc.pid")
     );
     scratch.conf(
@@ -1071,13 +1075,23 @@ fn the_control_socket_refuses_more_clients_than_it_can_hold() {
         sup.exited().is_none(),
         "the supervisor died when the clients piled up"
     );
-    // With the pile gone, the socket works again.
+    // With the pile gone, the socket works again. The closed connections are
+    // noticed when the loop next looks at them, so the question is asked
+    // until it is answered instead of exactly once.
     drop(held);
-    let out = zctl(&scratch, &["list"]);
+    let start = Instant::now();
+    let mut answered = false;
+    while start.elapsed() < Duration::from_secs(10) {
+        if zctl(&scratch, &["list"]).status.success() {
+            answered = true;
+            break;
+        }
+        sleep_ms(50);
+    }
     assert!(
-        out.status.success(),
+        answered,
         "the control socket did not recover after the clients left: {}",
-        String::from_utf8_lossy(&out.stderr)
+        scratch.tail("sup.log")
     );
 }
 
