@@ -32,7 +32,7 @@ trabajo del día. Lo que ya está arreglado y verificado **no** se repite.
 
 - [x] **C1** `zctl emergency`: verbo que pone una shell en la consola con
   el plan sano. *(hecho: commit `zctl emergency`)*
-- [ ] **C2** `suspend` responde **después** de despertarse. El comentario del
+- [x] **C2** `suspend` responde **después** de despertarse. El comentario del
   código promete lo contrario ("la respuesta ya está en el cable cuando el
   kernel duerme"): el orden está invertido y el cliente espera en el socket
   mientras la máquina duerme. Arreglo: renderizar y vaciar la respuesta

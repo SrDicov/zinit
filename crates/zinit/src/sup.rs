@@ -791,13 +791,13 @@ impl Sup {
                 );
             }
             ctl::PowerAction::Suspend => {
-                return match Self::do_suspend() {
-                    // Answered after the flush below, so a sleeping machine
-                    // never leaves the client hanging: the reply is already
-                    // on the wire when the kernel sleeps.
-                    Ok(()) => ctl::render_ok(id, "suspended"),
-                    Err(e) => ctl::render_err(id, 6, &format!("suspend failed: {e}")),
-                };
+                // The machine is about to sleep, and the write to
+                // `/sys/power/state` does not return until it wakes. The
+                // client must not be left waiting for a reply that can
+                // only come after the wake: the "suspending" answer goes
+                // out first, and the error (if the kernel refused) follows
+                // after the machine is back.
+                return ctl::render_ok(id, "suspending");
             }
             _ => {}
         }
@@ -1432,6 +1432,19 @@ impl Sup {
             Command::Power { client, id, action } => {
                 let frame = self.request_power(&id, action, now);
                 self.reply_ctl(client, &frame);
+                if action == ctl::PowerAction::Suspend {
+                    // The reply is queued; it has to be *on the wire*
+                    // before the machine sleeps, or the client waits for
+                    // an answer that can only come after the wake.
+                    self.flush_ctl();
+                    if let Err(e) = Self::do_suspend() {
+                        announce_degradation(&format!("suspend failed: {e}"));
+                        self.reply_ctl(
+                            client,
+                            &ctl::render_err(&id, 6, &format!("suspend failed: {e}")),
+                        );
+                    }
+                }
             }
             Command::Version { client, id } => {
                 let payload = format!(
@@ -3003,6 +3016,46 @@ mod tests {
     /// second, and a start owed still wakes the loop on its restart delay:
     /// `arm` returns no deadline when nothing pends. The registrations stay
     /// in place either way, so this buys idle without costing latency.
+    /// The suspend answer must be sent before the machine sleeps.
+    ///
+    /// The write to `/sys/power/state` does not return until the machine
+    /// wakes, so an answer rendered after it keeps the client waiting for
+    /// the whole sleep. The answer is "suspending", and the error (if the
+    /// kernel refused) follows after the wake.
+    #[test]
+    fn a_suspend_answers_before_it_sleeps() {
+        let base = scratch("suspend-answer");
+        let sock = base.join("ctl");
+        let state = base.join("state");
+        let gen_dir = base.join("gen");
+        let _ = std::fs::create_dir_all(&gen_dir);
+        // SAFETY: no other test in this binary reads `ZINIT_SOCKET` or
+        // `ZINIT_STATE_DIR` — only child-process integration tests use
+        // them, and those are separate processes — so no thread can observe
+        // the swap mid-flight. Removed before return either way.
+        unsafe {
+            std::env::set_var(ctl::SOCKET_ENV, &sock);
+            std::env::set_var(ctl::STATE_DIR_ENV, &state);
+        }
+        let quiet = base.join("quiet");
+        let _ = std::fs::create_dir_all(&quiet);
+        std::fs::write(
+            quiet.join("q.conf"),
+            "command = /bin/true\nready = none\nenabled = no\n",
+        )
+        .expect("write");
+        let (plan, descs) = load(&quiet).expect("quiet loads");
+        let mut sup =
+            Sup::new(plan, descs, vec![quiet.clone()], gen_dir.clone()).expect("supervisor builds");
+        let frame = sup.request_power("1", ctl::PowerAction::Suspend, 0);
+        assert!(
+            frame.starts_with("R 1 0 suspending"),
+            "the suspend answer must go out before the sleep, not after it: {frame:?}"
+        );
+        drop(sup);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn arm_sleeps_forever_when_settled_and_wakes_for_a_start_owed() {
         let base = scratch("arm-idle");
