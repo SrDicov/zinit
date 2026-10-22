@@ -1796,3 +1796,47 @@ fn syscall_allow_opens_exactly_one_door() {
     );
     assert!(sup.exited().is_none(), "the supervisor died");
 }
+
+/// A log that cannot be opened is a refusal, not a silent service.
+///
+/// Losing the log is losing the only evidence an operator has, so a service
+/// whose sink cannot be created must not run with its output going nowhere.
+/// The refusal names the real cause (the directory, the errno), and the
+/// supervisor stays up: a bad description is not a reason to stop the
+/// machine's init.
+#[test]
+fn a_log_that_cannot_be_opened_is_a_refusal() {
+    let _one = serial();
+    let scratch = Scratch::new("log-refused");
+    // The supervisor creates a missing log directory, so the refusal has to
+    // come from something a directory cannot be created under: a regular file
+    // in the way (`ENOTDIR`), which needs no privileges and no read-only mount.
+    std::fs::write(scratch.at("blocked"), b"not a directory").expect("write the blocker");
+    scratch.conf(
+        "probe.conf",
+        &format!(
+            "type = script\ncommand = echo ran > {}\nready = none\n\
+             log = file:{}/x.log\nrestart = never\n",
+            scratch.at("marker"),
+            scratch.at("blocked")
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    assert!(
+        wait_until(START_DEADLINE_MS, || {
+            scratch
+                .read("sup.log")
+                .is_some_and(|log| log.contains("cannot open log"))
+        }),
+        "the refusal never reached the log:\n{}",
+        scratch.tail("sup.log")
+    );
+    assert!(
+        scratch.read("marker").is_none(),
+        "the service ran with its log going nowhere"
+    );
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor died over a bad log path"
+    );
+}

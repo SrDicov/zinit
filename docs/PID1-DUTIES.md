@@ -7,7 +7,7 @@ el kernel le delega porque no hay nadie más que los haga.
 | deber | estado | decisión | por qué |
 |---|---|---|---|
 | Bloquear todas las señales antes del fork | sí (`zrt::signals::block_all`) | obligatorio | sin `SIGCHLD` bloqueado hay una ventana entre el fork y el registro del hijo donde una muerte se pierde |
-| `SIGTERM`/`SIGINT` manejables | sí (`install_power_handler`) | obligatorio | una señal al init que no hace nada deja la máquina encendida para siempre; el kernel además manda `SIGINT` al init con Ctrl-Alt-Del |
+| `SIGTERM`/`SIGINT` manejables | sí (`install_power_handler`) | obligatorio | una señal al init que no hace nada deja la máquina encendida para siempre. `SIGINT` es lo que el kernel manda con **Ctrl-Alt-Del** y pide **reinicio**; `SIGTERM` (`kill -TERM 1`) pide apagar. El primer signo gana: una segunda señal no convierte un apagado en un reinicio a mitad |
 | Montar `/proc` | sí | obligatorio | sin `/proc` no hay `cmdline`, ni `meminfo`, ni liveness por `/proc` |
 | Montar `/sys` | sí | obligatorio | sin él no hay `/sys/fs/cgroup` |
 | Montar `/run` (tmpfs) | sí | obligatorio | el estado y los sockets son de este boot, no del anterior |
@@ -21,6 +21,7 @@ el kernel le delega porque no hay nadie más que los haga.
 | Un solo supervisor por socket | sí (`flock` en `<socket>.lock`) | deseable | dos supervisores sobre un socket es una carrera, no una configuración |
 | Responder a una señal de potencia | sí (vía el socket de control) | obligatorio | el poder tiene un solo dueño: el supervisor (stop-all, breadcrumb, `sync`, syscall) |
 | Plan que no carga | modo emergencia | obligatorio | un plan roto que mata al supervisor deja la máquina girando sin socket y sin servicios |
+| Salir a demanda a una consola de emergencia | sí (`zctl emergency`) | deseable | el operador necesita una shell *antes* de tocar el plan; obliga a recargar luego con `zctl reload-all` |
 | `machine-id` | no | **deseable, pendiente** | lo necesita el resto del userspace, no zinit; escribirlo es del init, pero no es lo que rompe una máquina |
 | `hostname` | no (`sethostname` existe en `zrt`, nadie lo llama) | **deseable, pendiente** | mismo caso: depende de la distribución, no del init |
 | `/etc/mtab` | no | cosmético | glibc y musl leen `/proc/mounts` |
