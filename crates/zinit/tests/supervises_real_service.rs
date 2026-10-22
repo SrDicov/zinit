@@ -800,13 +800,13 @@ fn a_reparented_orphan_is_reaped_not_left_a_zombie() {
 #[test]
 fn a_stop_in_progress_does_not_resurrect_a_pending_restart() {
     let _one = serial();
+    let scratch = Scratch::new("stopping-restart");
     if zctl_path().is_none() {
         // No print macros outside `zrt::report` (the purity job): the
         // reason goes to the scratch directory instead.
         let _ = std::fs::write(scratch.at("skipped"), "no zctl binary\n");
         return;
     }
-    let scratch = Scratch::new("stopping-restart");
     // The service ignores SIGTERM: the supervisor has to escalate to
     // SIGKILL after `stop-timeout`, which is the window in which the stop
     // and the pending restart overlap.
@@ -977,13 +977,13 @@ fn a_second_supervisor_steps_aside() {
 #[test]
 fn a_broken_configuration_starts_in_emergency_mode() {
     let _one = serial();
+    let scratch = Scratch::new("emergency");
     if zctl_path().is_none() {
         // No print macros outside `zrt::report` (the purity job): the
         // reason goes to the scratch directory instead.
         let _ = std::fs::write(scratch.at("skipped"), "no zctl binary\n");
         return;
     }
-    let scratch = Scratch::new("emergency");
     // A file the parser cannot read: the plan will not load.
     scratch.conf("broken.conf", "not-a-directive\n");
 
@@ -1044,13 +1044,13 @@ fn a_broken_configuration_starts_in_emergency_mode() {
 #[test]
 fn the_visible_state_follows_the_plan() {
     let _one = serial();
+    let scratch = Scratch::new("state");
     if zctl_path().is_none() {
         // No print macros outside `zrt::report` (the purity job): the
         // reason goes to the scratch directory instead.
         let _ = std::fs::write(scratch.at("skipped"), "no zctl binary\n");
         return;
     }
-    let scratch = Scratch::new("state");
     scratch.conf(
         "probe.conf",
         &desc(
@@ -1107,11 +1107,11 @@ fn the_visible_state_follows_the_plan() {
 #[cfg(target_os = "linux")]
 fn zinit_boots_as_pid_one_in_a_namespace() {
     let _one = serial();
+    let scratch = Scratch::new("pid1");
     if which("unshare").is_none() {
         let _ = std::fs::write(scratch.at("skipped"), "no unshare binary\n");
         return;
     }
-    let scratch = Scratch::new("pid1");
     // The service the namespace is supposed to bring up, in its own
     // configuration directory: `--init <dir>` makes that directory the
     // whole configuration, exactly like `--sup <dir>`.
@@ -1264,6 +1264,7 @@ fn which(name: &str) -> Option<PathBuf> {
 #[cfg(target_os = "linux")]
 fn the_sandbox_really_confines() {
     let _one = serial();
+    let scratch = Scratch::new("sandbox");
     if unsafe { libc::geteuid() } != 0 {
         let _ = std::fs::write(scratch.at("skipped"), "needs root\n");
         return;
@@ -1272,7 +1273,6 @@ fn the_sandbox_really_confines() {
         let _ = std::fs::write(scratch.at("skipped"), "no unshare binary\n");
         return;
     }
-    let scratch = Scratch::new("sandbox");
     // The command under test: it needs a namespace, and it says whether it
     // got one.
     let probe = format!(
