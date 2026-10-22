@@ -1488,20 +1488,6 @@ impl Sup {
         }
     }
 
-    /// Rebuild the plan from the configured layers without disturbing live pids.
-    ///
-    /// Surviving services keep their mechanism (`ManagedService`: pid, fds,
-    /// waiter) and their core slot (state, deadlines, budget) — only the
-    /// plan index moves, via [`ManagedService::reindex`], and the description
-    /// is replaced so the *next* start uses the new config. New services
-    /// start fresh; deleted services with a live process are retired (one
-    /// SIGTERM, reaped normally, then dropped). A deleted service with no
-    /// process simply ceases to exist.
-    ///
-    /// Any load failure — bad file, cycle, unresolvable user — aborts the
-    /// reload and keeps the old plan: a supervisor that governs a
-    /// configuration it does not believe in is worse than one that governs
-    /// yesterday's.
     /// Add the emergency description as the highest configuration layer.
     ///
     /// The same file the broken-configuration path writes: a console shell
@@ -1523,6 +1509,20 @@ impl Sup {
         Ok(())
     }
 
+    /// Rebuild the plan from the configured layers without disturbing live pids.
+    ///
+    /// Surviving services keep their mechanism (`ManagedService`: pid, fds,
+    /// waiter) and their core slot (state, deadlines, budget) — only the
+    /// plan index moves, via [`ManagedService::reindex`], and the description
+    /// is replaced so the *next* start uses the new config. New services
+    /// start fresh; deleted services with a live process are retired (one
+    /// SIGTERM, reaped normally, then dropped). A deleted service with no
+    /// process simply ceases to exist.
+    ///
+    /// Any load failure — bad file, cycle, unresolvable user — aborts the
+    /// reload and keeps the old plan: a supervisor that governs a
+    /// configuration it does not believe in is worse than one that governs
+    /// yesterday's.
     fn reload(&mut self) -> Result<usize, String> {
         let (new_plan, mut new_descs) = match load_all(&self.config_dirs, &self.gen_dir) {
             Ok(ok) => ok,
