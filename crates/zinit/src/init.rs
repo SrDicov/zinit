@@ -301,17 +301,25 @@ fn self_path() -> Option<CString> {
 /// on. Giving up is loud: a machine that was told to power off and did not
 /// is a machine whose operator is waiting for a screen that never goes dark.
 fn request_poweroff() {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
-
     let path = std::env::var_os(crate::ctl::SOCKET_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(crate::ctl::DEFAULT_SOCKET_PATH));
+    request_poweroff_at(&path);
+}
+
+/// Ask the supervisor at `path` to power the machine off.
+///
+/// The path is a parameter so the test can point it at a fake server
+/// instead of the real one: the socket path comes from the environment, and
+/// a test that changes the environment changes it for the whole process.
+fn request_poweroff_at(path: &std::path::Path) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
     // Ten tries, 200 ms apart: two seconds is plenty for a supervisor that
     // is starting, and short enough that the operator is not left waiting.
     for attempt in 0..10 {
-        match UnixStream::connect(&path) {
+        match UnixStream::connect(path) {
             Ok(mut stream) => {
                 if stream.write_all(b"C 1 poweroff\n").is_err() {
                     announce_degradation("power signal: cannot write to the control socket");
@@ -371,19 +379,14 @@ mod tests {
     /// that reads the frame the init sends.
     #[test]
     fn a_power_signal_becomes_a_power_verb() {
-        use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
 
         let dir = std::env::temp_dir().join(format!("zinit-powertest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch");
         let path = dir.join("ctl");
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).expect("bind the fake socket");
-
-        // SAFETY: no other test in this binary reads `ZINIT_SOCKET`.
-        unsafe {
-            std::env::set_var(crate::ctl::SOCKET_ENV, &path);
-        }
 
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept");
@@ -393,7 +396,7 @@ mod tests {
             frame
         });
 
-        super::request_poweroff();
+        super::request_poweroff_at(&path);
         let frame = server.join().expect("the server thread finished");
         assert_eq!(
             frame, "C 1 poweroff\n",
