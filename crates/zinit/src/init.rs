@@ -107,8 +107,8 @@ pub fn run(config: Option<&Path>) -> ! {
 
         // A power signal, if one arrived, is acted on before the wait: the
         // machine must not sit in `waitpid` waiting for a child to die.
-        if zrt::signals::power_signalled() {
-            request_poweroff();
+        if let Some(sig) = zrt::signals::power_signalled() {
+            request_verb(verb_for(sig));
         }
 
         match (sup, zrt::sys::waitpid_interruptible(-1)) {
@@ -301,20 +301,34 @@ fn self_path() -> Option<CString> {
 /// it starts — so the request is retried for a while before it is given up
 /// on. Giving up is loud: a machine that was told to power off and did not
 /// is a machine whose operator is waiting for a screen that never goes dark.
-fn request_poweroff() {
+fn request_verb(verb: &'static str) {
     use std::path::PathBuf;
     let path = std::env::var_os(crate::ctl::SOCKET_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(crate::ctl::DEFAULT_SOCKET_PATH));
-    request_poweroff_at(&path);
+    request_verb_at(&path, verb);
 }
 
-/// Ask the supervisor at `path` to power the machine off.
+/// The verb a power signal asks for.
+///
+/// `Ctrl-Alt-Del` reaches PID 1 as `SIGINT`, and the kernel's contract for it
+/// is a **reboot** — that is the whole point of the key combination. An
+/// operator running `kill -TERM 1` is asking for the machine to go down.
+/// Getting this backwards powers a desktop off when the user asked it to
+/// restart.
+fn verb_for(sig: zrt::signals::Signal) -> &'static str {
+    match sig {
+        zrt::signals::Signal::Int => "reboot",
+        _ => "poweroff",
+    }
+}
+
+/// Ask the supervisor at `path` to act on `verb`.
 ///
 /// The path is a parameter so the test can point it at a fake server
 /// instead of the real one: the socket path comes from the environment, and
 /// a test that changes the environment changes it for the whole process.
-fn request_poweroff_at(path: &std::path::Path) {
+fn request_verb_at(path: &std::path::Path, verb: &'static str) {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
     // Ten tries, 200 ms apart: two seconds is plenty for a supervisor that
@@ -322,7 +336,8 @@ fn request_poweroff_at(path: &std::path::Path) {
     for attempt in 0..10 {
         match UnixStream::connect(path) {
             Ok(mut stream) => {
-                if stream.write_all(b"C 1 poweroff\n").is_err() {
+                let frame = format!("C 1 {verb}\n");
+                if stream.write_all(frame.as_bytes()).is_err() {
                     announce_degradation("power signal: cannot write to the control socket");
                     return;
                 }
@@ -384,35 +399,53 @@ mod tests {
     /// PID 1 does not power the machine off itself: the supervisor owns
     /// that path (stop every service, breadcrumb, sync, syscall), and one
     /// path is easier to reason about than two. The test is a fake server
-    /// that reads the frame the init sends.
+    /// that reads the frame the init sends, for both verbs.
     #[test]
     fn a_power_signal_becomes_a_power_verb() {
-        use std::io::{BufRead, BufReader};
-        use std::os::unix::net::UnixListener;
-
-        let dir = std::env::temp_dir().join(format!("zinit-powertest-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch");
-        let path = dir.join("ctl");
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).expect("bind the fake socket");
-
-        let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept");
-            let mut reader = BufReader::new(stream);
-            let mut frame = String::new();
-            reader.read_line(&mut frame).expect("read the frame");
+        /// Send one verb to a fake socket and return the frame it received.
+        fn round(verb: &'static str) -> String {
+            use std::io::{BufRead, BufReader};
+            use std::os::unix::net::UnixListener;
+            let dir =
+                std::env::temp_dir().join(format!("zinit-powertest-{}-{verb}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("scratch");
+            let path = dir.join("ctl");
+            let _ = std::fs::remove_file(&path);
+            let listener = UnixListener::bind(&path).expect("bind the fake socket");
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(stream);
+                let mut frame = String::new();
+                reader.read_line(&mut frame).expect("read the frame");
+                frame
+            });
+            super::request_verb_at(&path, verb);
+            let frame = server.join().expect("the server thread finished");
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir_all(&dir);
             frame
-        });
+        }
 
-        super::request_poweroff_at(&path);
-        let frame = server.join().expect("the server thread finished");
         assert_eq!(
-            frame, "C 1 poweroff\n",
-            "the power signal did not become a power verb"
+            round("poweroff"),
+            "C 1 poweroff\n",
+            "the power signal did not become a poweroff"
         );
+        assert_eq!(
+            round("reboot"),
+            "C 1 reboot\n",
+            "the power signal did not become a reboot"
+        );
+    }
 
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(&dir);
+    /// Ctrl-Alt-Del asks for a reboot; `SIGTERM` asks for the machine to go
+    /// down. Backwards, a desktop powers off when the user asked it to
+    /// restart.
+    #[test]
+    fn the_signal_names_the_verb() {
+        use zrt::signals::Signal;
+        assert_eq!(super::verb_for(Signal::Int), "reboot");
+        assert_eq!(super::verb_for(Signal::Term), "poweroff");
     }
 
     #[test]

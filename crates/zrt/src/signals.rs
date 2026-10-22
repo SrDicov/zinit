@@ -334,22 +334,33 @@ pub fn block_all() -> io::Result<()> {
 /// The handler does nothing but set this flag: it runs in signal context,
 /// where nothing but an atomic store is allowed. The init's loop reads the
 /// flag and does the actual work.
-static POWER_SIGNALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static POWER_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// The handler for the power signals.
 ///
-/// Async-signal-safe by construction: one relaxed atomic store and nothing
-/// else. No allocation, no locks, no syscalls.
-extern "C" fn note_power_signal(_signo: libc::c_int) {
-    POWER_SIGNALLED.store(true, std::sync::atomic::Ordering::Relaxed);
+/// Async-signal-safe by construction: one relaxed atomic compare-and-store
+/// and nothing else. No allocation, no locks, no syscalls.
+///
+/// The **first** signal wins: the machine is already going down, and a second
+/// one arriving mid-stop must not turn a poweroff into a reboot halfway
+/// through the sequence.
+extern "C" fn note_power_signal(signo: libc::c_int) {
+    let _ = POWER_SIGNAL.compare_exchange(
+        0,
+        signo,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Install the handler for the power signals and unblock them.
 ///
-/// `SIGTERM` and `SIGINT` to PID 1 mean "shut the machine down" — the
-/// kernel's own Ctrl-Alt-Del ends up as a `SIGINT` to the init, and an
-/// operator at the console expects `kill -TERM 1` to power the box off
-/// instead of leaving it running with every service stopped.
+/// Both are power signals, with different meanings: `SIGINT` is what the
+/// kernel raises for `Ctrl-Alt-Del` and asks for a **reboot**, while
+/// `SIGTERM` — `kill -TERM 1` from an operator at the console — means the
+/// machine should go down instead of staying up with every service stopped.
+/// [`power_signalled`] reports which one, so the init can ask for the right
+/// verb.
 ///
 /// The handler is installed *before* the signals are unblocked: a signal
 /// delivered between the unblock and the handler would kill PID 1, and the
@@ -382,13 +393,19 @@ pub fn install_power_handler() -> io::Result<()> {
     unblock(set)
 }
 
-/// Did a power signal arrive? Consumes the flag.
+/// Which power signal arrived, if any. Consumes the flag.
 ///
 /// One-shot on purpose: the init acts on the signal once, and a second
 /// signal while the machine is already going down must not start a second
-/// power action.
-pub fn power_signalled() -> bool {
-    POWER_SIGNALLED.swap(false, std::sync::atomic::Ordering::Relaxed)
+/// power action. The signal itself matters: `SIGINT` is what the kernel
+/// raises for `Ctrl-Alt-Del`, whose contract is a reboot, while `SIGTERM`
+/// is an operator asking for the machine to go down.
+pub fn power_signalled() -> Option<Signal> {
+    match POWER_SIGNAL.swap(0, std::sync::atomic::Ordering::Relaxed) {
+        libc::SIGTERM => Some(Signal::Term),
+        libc::SIGINT => Some(Signal::Int),
+        _ => None,
+    }
 }
 
 /// The signals currently blocked in the calling thread.
@@ -1176,26 +1193,40 @@ mod tests {
         assert_eq!(Signal::from_raw(9999), None);
     }
 
-    /// The power handler sets the flag and nothing else.
+    /// The power handler records *which* signal arrived, and nothing else.
     ///
     /// A handler that did anything more (a syscall, an allocation) would be
-    /// unsafe in signal context, so the whole design rests on this being an
-    /// atomic store and the flag being read by the loop.
+    /// unsafe in signal context, so the whole design rests on this being one
+    /// atomic exchange and the flag being read by the loop. The signal
+    /// matters because `SIGINT` (`Ctrl-Alt-Del`) asks for a reboot and
+    /// `SIGTERM` asks for the machine to go down.
     #[test]
-    fn the_power_handler_sets_the_flag() {
+    fn the_power_handler_says_which_signal_arrived() {
         install_power_handler().expect("install the handler");
-        assert!(
-            !power_signalled(),
-            "the flag was set before any signal arrived"
+        assert_eq!(
+            power_signalled(),
+            None,
+            "something was set before any signal arrived"
         );
         raise_to_self(Signal::Term).expect("raise SIGTERM");
         // The signal is delivered on the next return to userspace; the
         // raise itself is a syscall, so by the time it returns the handler
         // has run.
-        assert!(power_signalled(), "SIGTERM did not reach the power handler");
-        assert!(
-            !power_signalled(),
+        assert_eq!(
+            power_signalled(),
+            Some(Signal::Term),
+            "SIGTERM did not reach the power handler"
+        );
+        assert_eq!(
+            power_signalled(),
+            None,
             "the flag must be consumed once, so a second power action cannot start"
+        );
+        raise_to_self(Signal::Int).expect("raise SIGINT");
+        assert_eq!(
+            power_signalled(),
+            Some(Signal::Int),
+            "SIGINT did not reach the power handler"
         );
     }
 }
