@@ -1414,6 +1414,21 @@ impl Sup {
                 };
                 self.reply_ctl(client, &frame);
             }
+            Command::Emergency { client, id } => {
+                // The emergency shell, on demand: the same description the
+                // broken-configuration path uses, added as the highest
+                // layer and reloaded. The operator gets a console on a
+                // machine whose plan is fine, and `zctl stop emergency`
+                // takes it away again.
+                let frame = match self.add_emergency_layer() {
+                    Ok(()) => {
+                        let n = self.reload().unwrap_or(0);
+                        ctl::render_ok(&id, &format!("emergency shell added; {n} services"))
+                    }
+                    Err(e) => ctl::render_err(&id, 5, &e),
+                };
+                self.reply_ctl(client, &frame);
+            }
             Command::Power { client, id, action } => {
                 let frame = self.request_power(&id, action, now);
                 self.reply_ctl(client, &frame);
@@ -1465,6 +1480,27 @@ impl Sup {
     /// reload and keeps the old plan: a supervisor that governs a
     /// configuration it does not believe in is worse than one that governs
     /// yesterday's.
+    /// Add the emergency description as the highest configuration layer.
+    ///
+    /// The same file the broken-configuration path writes: a console shell
+    /// on `/dev/console`. It is a layer, not a special case, so the shell
+    /// is supervised like any other service (it can be stopped with
+    /// `zctl stop emergency`).
+    fn add_emergency_layer(&mut self) -> Result<(), String> {
+        let dir = std::env::temp_dir().join(format!("zinit-emergency-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {dir:?}: {e}"))?;
+        std::fs::write(
+            dir.join("emergency.conf"),
+            "type = console\ncommand = /bin/sh\ntty = /dev/console\nready = none\n\
+             log = none\nrestart = always\n",
+        )
+        .map_err(|e| format!("cannot write the emergency description: {e}"))?;
+        // The layer is the last one, so it wins over anything the operator
+        // wrote for the same name.
+        self.config_dirs.push(dir);
+        Ok(())
+    }
+
     fn reload(&mut self) -> Result<usize, String> {
         let (new_plan, mut new_descs) = match load_all(&self.config_dirs, &self.gen_dir) {
             Ok(ok) => ok,

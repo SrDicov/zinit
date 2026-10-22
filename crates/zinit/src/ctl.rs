@@ -108,6 +108,8 @@ pub enum Command {
     Version { client: RawFd, id: String },
     /// `help`: the verbs this server speaks.
     Help { client: RawFd, id: String },
+    /// `emergency`: put a shell on the console, whatever the plan says.
+    Emergency { client: RawFd, id: String },
 }
 
 /// What a verb is allowed to do, from the caller's point of view.
@@ -144,7 +146,10 @@ impl Command {
             | Command::Restart { .. }
             | Command::Kick { .. }
             | Command::ReloadAll { .. } => VerbClass::Mutate,
-            Command::Power { .. } => VerbClass::Power,
+            // Taking the console is a machine-wide act, like the power
+            // verbs: it is the one thing an operator does not want a
+            // stray program of their own user doing by accident.
+            Command::Power { .. } | Command::Emergency { .. } => VerbClass::Power,
         }
     }
 }
@@ -161,7 +166,8 @@ fn cmd_id(cmd: &Command) -> String {
         | Command::ReloadAll { id, .. }
         | Command::Power { id, .. }
         | Command::Version { id, .. }
-        | Command::Help { id, .. } => id.clone(),
+        | Command::Help { id, .. }
+        | Command::Emergency { id, .. } => id.clone(),
     }
 }
 
@@ -400,6 +406,10 @@ pub fn parse_line(client: RawFd, line: &str) -> Result<Command, CtlError> {
         "version" => {
             no_args(&id, verb)?;
             Ok(Command::Version { client, id })
+        }
+        "emergency" => {
+            no_args(&id, verb)?;
+            Ok(Command::Emergency { client, id })
         }
         "help" => {
             no_args(&id, verb)?;
