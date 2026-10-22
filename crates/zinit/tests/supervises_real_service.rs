@@ -1239,3 +1239,86 @@ fn which(name: &str) -> Option<PathBuf> {
     }
     None
 }
+
+/// The sandbox must actually confine.
+///
+/// The filter's implicit baseline covers what libc needs to start (read,
+/// write, open, socket, clone, execve...), so the proof cannot be "the
+/// service cannot open a file". It is an operation outside the baseline:
+/// `unshare(2)` is not in it, so a service that tries it is either refused
+/// (errno mode) or killed (enforce mode).
+///
+/// The comparison is the point: the *same* command must succeed without
+/// confinement and fail with it. A test that only shows the confined
+/// service failing proves nothing — it might have failed for any reason.
+///
+/// Root only: `unshare(CLONE_NEWNS)` needs `CAP_SYS_ADMIN`, and without
+/// root the unconfined service fails too.
+#[test]
+#[cfg(target_os = "linux")]
+fn the_sandbox_really_confines() {
+    let _one = serial();
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipped: the sandbox test needs root (unshare needs CAP_SYS_ADMIN)");
+        return;
+    }
+    if which("unshare").is_none() {
+        eprintln!("skipped: no `unshare` binary on this machine");
+        return;
+    }
+    let scratch = Scratch::new("sandbox");
+    // The command under test: it needs a namespace, and it says whether it
+    // got one.
+    let probe = format!(
+        "/bin/sh -c 'unshare -m true 2>/dev/null; echo $? > {}'",
+        scratch.at("rc")
+    );
+    // The same command, three times over: unconfined, capability-dropped
+    // and syscall-filtered.
+    scratch.conf("plain.conf", &desc(&probe, ""));
+    scratch.conf(
+        "nocaps.conf",
+        &desc(&probe, "drop-capabilities = sys_admin\n"),
+    );
+    scratch.conf("seccomp.conf", &desc(&probe, "syscall-filter = errno\n"));
+
+    let mut sup = Sup::start(&scratch);
+
+    let rc = |name: &str| -> i32 {
+        let text = scratch.read(name).unwrap_or_default();
+        text.trim().parse().unwrap_or(-1)
+    };
+    // Wait for all three to have answered.
+    assert!(
+        wait_until(15_000, || {
+            scratch.read("plain.rc").is_some()
+                && scratch.read("nocaps.rc").is_some()
+                && scratch.read("seccomp.rc").is_some()
+        }),
+        "not every probe answered: plain={:?} nocaps={:?} seccomp={:?}",
+        scratch.read("plain.rc"),
+        scratch.read("nocaps.rc"),
+        scratch.read("seccomp.rc")
+    );
+
+    assert_eq!(
+        rc("plain.rc"),
+        0,
+        "the unconfined service could not create a namespace: the test proves \
+         nothing if the baseline operation fails"
+    );
+    assert_ne!(
+        rc("nocaps.rc"),
+        0,
+        "dropping CAP_SYS_ADMIN did not stop the service from creating a namespace"
+    );
+    assert_ne!(
+        rc("seccomp.rc"),
+        0,
+        "the syscall filter did not stop the service from creating a namespace"
+    );
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor died while supervising confined services"
+    );
+}
