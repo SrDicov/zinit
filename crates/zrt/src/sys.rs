@@ -1304,6 +1304,27 @@ pub fn waitpid_blocking(pid: i32) -> io::Result<Waited> {
     }
 }
 
+/// `waitpid(2)` that lets `EINTR` through.
+///
+/// The one documented exception to this module's rule that interruptions
+/// are handled here: PID 1 needs the interruption, because the signal that
+/// interrupted it is the message. A `SIGTERM` to the init must be able to
+/// wake a `waitpid` that is waiting for a child that has not died yet —
+/// otherwise "shut the machine down" waits for a process to exit first.
+pub fn waitpid_interruptible(pid: i32) -> io::Result<Waited> {
+    let mut status: libc::c_int = 0;
+    // SAFETY: as `waitpid_blocking`, but without WNOHANG and without the
+    // EINTR retry. `status` is a live `c_int` the kernel writes into.
+    let rc = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+    if rc > 0 {
+        return Ok(Waited {
+            pid: rc,
+            status: decode_status(status),
+        });
+    }
+    Err(io::Error::last_os_error())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Byte-level I/O
 // ─────────────────────────────────────────────────────────────────────────────

@@ -49,11 +49,17 @@ pub fn run() -> ! {
             "could not block signals ({e}); continuing unblocked"
         ));
     }
-    // ponytail: power signals (firmware `SIGTERM`) are queued and ignored, not
-    // forwarded. Forwarding them means delivering to the supervisor's control
-    // socket, which does not exist until a later phase; until then, being
-    // unreachable to shutdown is a smaller failure than an init that
-    // half-handles them.
+    // The power signals are the exception: `SIGTERM` and `SIGINT` to PID 1
+    // mean "shut the machine down", which is what the kernel's Ctrl-Alt-Del
+    // turns into and what an operator at the console expects from
+    // `kill -TERM 1`. The handler only sets a flag (signal context allows
+    // nothing else); the loop below does the work.
+    if let Err(e) = zrt::signals::install_power_handler() {
+        announce_degradation(&format!(
+            "cannot install the power-signal handler ({e}); the machine will not shut \
+             down from a signal"
+        ));
+    }
 
     // ── 2. The minimum ──────────────────────────────────────────────────
     //
@@ -98,7 +104,13 @@ pub fn run() -> ! {
             }
         }
 
-        match (sup, zrt::sys::waitpid_blocking(-1)) {
+        // A power signal, if one arrived, is acted on before the wait: the
+        // machine must not sit in `waitpid` waiting for a child to die.
+        if zrt::signals::power_signalled() {
+            request_poweroff();
+        }
+
+        match (sup, zrt::sys::waitpid_interruptible(-1)) {
             // The supervisor died. Say how, then let the top of the loop
             // relaunch it at once: the wait above already slept until the
             // death, so there is no tick to wait out. Never fatal: a machine
@@ -136,6 +148,9 @@ pub fn run() -> ! {
             // PID 1 when its parent died. It means nothing here beyond the
             // obligation to reap it, which is why this arm does nothing.
             (_, Ok(_)) => {}
+            // Interrupted by a signal: the loop's turn again, and the
+            // power check at the top of it sees the flag. Not a failure.
+            (_, Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
             // No children at all (`ECHILD`): bare reaper, or every fork
             // failing. Sleep instead of spinning; the top of the loop
             // retries the spawn past transient fork failures.
@@ -274,6 +289,57 @@ fn self_path() -> Option<CString> {
     }
 }
 
+/// Ask the supervisor to power the machine off.
+///
+/// The power lives in the supervisor: it is the one that stops every service,
+/// writes the breadcrumb and makes the syscall. PID 1 only *asks*, through
+/// the same control socket an operator uses, so there is exactly one power
+/// path in the machine.
+///
+/// The socket may not be there yet — the supervisor binds it a moment after
+/// it starts — so the request is retried for a while before it is given up
+/// on. Giving up is loud: a machine that was told to power off and did not
+/// is a machine whose operator is waiting for a screen that never goes dark.
+fn request_poweroff() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
+
+    let path = std::env::var_os(crate::ctl::SOCKET_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(crate::ctl::DEFAULT_SOCKET_PATH));
+    // Ten tries, 200 ms apart: two seconds is plenty for a supervisor that
+    // is starting, and short enough that the operator is not left waiting.
+    for attempt in 0..10 {
+        match UnixStream::connect(&path) {
+            Ok(mut stream) => {
+                if stream.write_all(b"C 1 poweroff\n").is_err() {
+                    announce_degradation("power signal: cannot write to the control socket");
+                    return;
+                }
+                let mut reply = String::new();
+                let _ = BufReader::new(&stream).read_line(&mut reply);
+                announce_degradation(&format!(
+                    "power signal: the supervisor answered {:?}",
+                    reply.trim()
+                ));
+                return;
+            }
+            Err(e) => {
+                if attempt == 9 {
+                    announce_degradation(&format!(
+                        "power signal: no control socket at {} ({e}); the machine stays up. \
+                         Use `zctl poweroff` once the supervisor is up.",
+                        path.display()
+                    ));
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+}
+
 /// Fork and exec `zinit --sup`. The child's pid, or the fork's error.
 ///
 /// Everything the child touches is built here, in the parent: the binary path
@@ -297,6 +363,47 @@ mod tests {
     /// The only part of an init that can be tested without becoming one:
     /// `current_exe` must resolve and survive the `CString` conversion,
     /// because every supervisor relaunch goes through it.
+    /// The power signal becomes a power verb on the control socket.
+    ///
+    /// PID 1 does not power the machine off itself: the supervisor owns
+    /// that path (stop every service, breadcrumb, sync, syscall), and one
+    /// path is easier to reason about than two. The test is a fake server
+    /// that reads the frame the init sends.
+    #[test]
+    fn a_power_signal_becomes_a_power_verb() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let dir = std::env::temp_dir().join(format!("zinit-powertest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("ctl");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind the fake socket");
+
+        // SAFETY: no other test in this binary reads `ZINIT_SOCKET`.
+        unsafe {
+            std::env::set_var(crate::ctl::SOCKET_ENV, &path);
+        }
+
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream);
+            let mut frame = String::new();
+            reader.read_line(&mut frame).expect("read the frame");
+            frame
+        });
+
+        super::request_poweroff();
+        let frame = server.join().expect("the server thread finished");
+        assert_eq!(
+            frame, "C 1 poweroff\n",
+            "the power signal did not become a power verb"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn own_binary_path_is_resolvable() {
         assert!(
