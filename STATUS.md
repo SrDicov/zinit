@@ -15,7 +15,7 @@ commit). Base: `2f449e3`.
 | — | `kill -TERM 1` apaga la máquina | `62b8397`…`20c91d4` | test de la conversión señal→verbo `poweroff` |
 | — | Modo emergencia (config rota → shell + socket) | `a2b3a64` | test: config rota → el supervisor no muere, el socket responde, `reload-all` recoge el plan real |
 | — | Cerrojo de instancia única (flock) | `b816d19` | test: el segundo supervisor se aparta con el código 11; otro: un supervisor muerto deja el socket libre |
-| — | devtmpfs, PATH heredado, `RLIMIT_NOFILE`, estado atómico | varios |Gate local: build + clippy + suite verdes |
+| — | devtmpfs, PATH heredado, `RLIMIT_NOFILE`, estado atómico | varios | Gate local: build + clippy + suite verdes |
 | — | Test de PID 1 real en namespace | `2d1517d` | `unshare --user --map-root-user --pid --fork`: PID 1 es zinit, el servicio arranca, el namespace se limpia |
 | — | Test del sandbox (seccomp + capdrop) | `f7b6a93` | la misma operación con y sin confinamiento: sin él pasa, con él falla |
 
