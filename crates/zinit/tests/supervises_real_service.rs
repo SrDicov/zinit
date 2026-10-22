@@ -1498,3 +1498,90 @@ fn a_dead_supervisor_leaves_the_socket_free() {
         "the second supervisor stepped aside although the first one was dead"
     );
 }
+
+/// A service with a cgroup lands in it, with its own pid.
+///
+/// The cgroup is not a label: the child is moved into
+/// `/sys/fs/cgroup/zinit.slice/<name>/` before it execs, so the kernel
+/// accounts the service there. The test reads the cgroup's own file: the
+/// pid has to be there, and it has to be the service's.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_service_with_a_cgroup_lands_in_it() {
+    let _one = serial();
+    let scratch = Scratch::new("cgroup");
+    if unsafe { libc::geteuid() } != 0
+        || !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+    {
+        // No print macros outside `zrt::report` (the purity job): the
+        // reason goes to the scratch directory instead.
+        let _ = std::fs::write(scratch.at("skipped"), "needs root and cgroup2\n");
+        return;
+    }
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 30", scratch.at("svc.pid")),
+            "restart = never\ncgroup = probe\n",
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    let pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
+
+    let procs = std::fs::read_to_string("/sys/fs/cgroup/zinit.slice/probe/cgroup.procs")
+        .expect("the cgroup has a procs file");
+    let pids: Vec<i32> = procs
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    assert!(
+        pids.contains(&pid),
+        "the service is not in its cgroup: {pids:?} does not contain {pid}"
+    );
+}
+
+/// `hibernate` is refused, and the refusal says why.
+///
+/// There is no resume target on this machine, so hibernating would either
+/// do nothing or leave a file the kernel cannot read back. The honest
+/// answer is a refusal with a code of its own, not a silent success.
+#[test]
+fn hibernate_is_refused_with_a_reason() {
+    let _one = serial();
+    let scratch = Scratch::new("hibernate");
+    if zctl_path().is_none() {
+        let _ = std::fs::write(scratch.at("skipped"), "no zctl binary\n");
+        return;
+    }
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 30", scratch.at("svc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    let _pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
+
+    let out = zctl(&scratch, &["hibernate"]);
+    let reply = String::from_utf8_lossy(&out.stdout);
+    // The id is the client's own token (`zctl` by default), so the check
+    // is on the code and the reason, not on the token.
+    assert!(
+        reply.starts_with("E ") && reply.contains(" 6 "),
+        "hibernate must be refused with code 6: {reply:?}"
+    );
+    assert!(
+        reply.contains("resume target"),
+        "the refusal must say what is missing: {reply:?}"
+    );
+    assert!(
+        !out.status.success(),
+        "a refused verb must not report success"
+    );
+    // And the machine is still up: the refusal changed nothing.
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor died on a refused hibernate"
+    );
+}
