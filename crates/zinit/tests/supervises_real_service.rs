@@ -197,6 +197,15 @@ impl Scratch {
             .unwrap_or_else(|e| panic!("cannot write {}: {e}", path.display()));
     }
 
+    /// The last lines of a file, for a failure message.
+    fn tail(&self, name: &str) -> String {
+        let text = std::fs::read_to_string(self.path().join(name)).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().rev().take(12).collect();
+        let mut out: Vec<&str> = lines.into_iter().rev().collect();
+        out.push("");
+        out.join("\n")
+    }
+
     fn read(&self, name: &str) -> Option<String> {
         std::fs::read_to_string(self.dir.join(name)).ok()
     }
@@ -241,6 +250,58 @@ fn zctl_path() -> Option<PathBuf> {
     }
     let bin = dir.join("zctl");
     if bin.is_file() { Some(bin) } else { None }
+}
+
+/// Send one frame to the control socket as somebody who is not root.
+///
+/// The reply comes back through a pipe: the peer is a forked child that
+/// dropped its privileges, and a pipe is how its answer gets out.
+fn ask_as_nobody(socket: &str, frame: &str) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    // `nobody` is the conventional unprivileged account; when the test is
+    // not root there is nothing to drop and the peer is already
+    // unprivileged.
+    const NOBODY: u32 = 65534;
+
+    let (mut reader, mut writer) = std::io::pipe().expect("pipe");
+    // SAFETY: a fork whose child does nothing but async-signal-safe work:
+    // it drops its privileges, connects, writes, reads and exits. The
+    // parent only reads the pipe.
+    let pid = unsafe { libc::fork() };
+    match pid {
+        0 => {
+            // Child: become somebody else, then ask.
+            // SAFETY: the ids are valid, and these are the only calls
+            // between the fork and the exit.
+            unsafe {
+                libc::setgid(NOBODY);
+                libc::setuid(NOBODY);
+            }
+            let mut stream = match UnixStream::connect(socket) {
+                Ok(s) => s,
+                Err(_) => std::process::exit(1),
+            };
+            let _ = stream.write_all(frame.as_bytes());
+            let mut line = String::new();
+            let _ = BufReader::new(&stream).read_line(&mut line);
+            let _ = writer.write_all(line.as_bytes());
+            std::process::exit(0);
+        }
+        -1 => panic!("cannot fork the peer"),
+        _ => {}
+    }
+    let mut answer = String::new();
+    let _ = BufReader::new(&mut reader).read_line(&mut answer);
+    // Reap the child: a test that leaves a corpse is a test that makes the
+    // next one flakier.
+    // SAFETY: the pid is this test's own child.
+    unsafe {
+        let mut status = 0;
+        libc::waitpid(pid, &raw mut status, 0);
+    }
+    answer
 }
 
 /// Run the real `zctl` against this test's supervisor.
@@ -317,9 +378,15 @@ impl<'a> Sup<'a> {
         // seconds could fill a 64 KiB pipe and then block on its own stderr,
         // which would look exactly like a hang. The refusal tests pipe it
         // instead, because there the process is expected to exit at once.
+        // The supervisor's stderr goes to a file, not a pipe: a pipe could
+        // fill up and block the supervisor on its own output, which looks
+        // exactly like a hang. A file can be read after a failure, which is
+        // the only reason it exists.
+        let log = std::fs::File::create(scratch.at("sup.log")).expect("create the log file");
+        let err = log.try_clone().expect("clone the log");
         let child = sup_command(scratch)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(err))
             .spawn()
             .expect("cannot spawn `zinit --sup`");
         Sup {
@@ -769,7 +836,8 @@ fn a_stop_in_progress_does_not_resurrect_a_pending_restart() {
     // guard, comes straight back up.
     assert!(
         wait_until(REAP_DEADLINE_MS, || pid_gone(pid)),
-        "the service never died: the stop did not escalate to SIGKILL"
+        "the service never died: the stop did not escalate to SIGKILL\n{}",
+        scratch.tail("sup.log")
     );
     sleep_ms(1500);
     assert_eq!(
@@ -811,15 +879,11 @@ fn the_control_socket_refuses_a_mutation_from_an_unknown_peer() {
     let mut sup = Sup::start(&scratch);
     let _pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
 
-    let ask = |frame: &str| -> String {
-        let mut stream =
-            UnixStream::connect(scratch.at("ctl")).expect("connect to the control socket");
-        stream.write_all(frame.as_bytes()).expect("send the frame");
-        let mut reader = BufReader::new(&stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).expect("read the reply");
-        line
-    };
+    // The peer must not be root: root may do everything, by design, so a
+    // root peer would prove nothing. Where the test runs as root (the CI
+    // containers do) the peer is a child that drops to `nobody` first;
+    // where it does not, the peer is already unprivileged.
+    let ask = |frame: &str| -> String { ask_as_nobody(&scratch.at("ctl"), frame) };
 
     // Reading works for anybody who got this far.
     let listed = ask("C 1 list\n");
