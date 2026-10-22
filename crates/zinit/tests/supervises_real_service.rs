@@ -229,6 +229,36 @@ impl Drop for Scratch {
 
 // ── the service descriptions ─────────────────────────────────────────────────
 
+/// The `zctl` binary, if this build produced one.
+///
+/// `zctl` is another workspace package, so `CARGO_BIN_EXE_zctl` does not
+/// exist here; the binary sits next to the test executable in the target
+/// directory. A run that only built this package has no `zctl`, and the
+/// tests that need it say so instead of failing for the wrong reason.
+fn zctl_path() -> Option<PathBuf> {
+    let mut dir = std::env::current_exe().ok()?;
+    dir.pop();
+    if dir.ends_with("deps") {
+        dir.pop();
+    }
+    let bin = dir.join("zctl");
+    if bin.is_file() { Some(bin) } else { None }
+}
+
+/// Run the real `zctl` against this test's supervisor.
+///
+/// The control socket refuses a mutation from a peer that is not the known
+/// client, so a test that wants to change something has to go through the
+/// same binary an operator uses.
+fn zctl(scratch: &Scratch, args: &[&str]) -> std::process::Output {
+    let bin = zctl_path().expect("the zctl binary was not built");
+    Command::new(bin)
+        .args(args)
+        .env("ZINIT_SOCKET", scratch.at("ctl"))
+        .output()
+        .expect("cannot run zctl")
+}
+
 /// A service description with the boilerplate every test here needs.
 ///
 /// * `type = script` — a `process` command is split on whitespace with no
@@ -744,10 +774,11 @@ fn a_reparented_orphan_is_reaped_not_left_a_zombie() {
 /// service must stay dead.
 #[test]
 fn a_stop_in_progress_does_not_resurrect_a_pending_restart() {
-    use std::io::{BufRead, Read, Write};
-    use std::os::unix::net::UnixStream;
-
     let _one = serial();
+    if zctl_path().is_none() {
+        eprintln!("skipped: this build has no zctl binary (build the whole workspace)");
+        return;
+    }
     let scratch = Scratch::new("stopping-restart");
     // The service ignores SIGTERM: the supervisor has to escalate to
     // SIGKILL after `stop-timeout`, which is the window in which the stop
@@ -764,24 +795,14 @@ fn a_stop_in_progress_does_not_resurrect_a_pending_restart() {
     let mut sup = Sup::start(&scratch);
     let pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
 
-    // Ask for the restart. The service is Running, so the supervisor stops it
-    // and remembers to start it again.
-    let mut stream = UnixStream::connect(scratch.at("ctl")).expect("connect to the control socket");
-    stream
-        .write_all(b"C 1 restart probe\n")
-        .expect("send the restart");
-    // One line, not the whole stream: the server holds the connection open,
-    // and reading to EOF would wait for the supervisor to die.
-    let mut reply = String::new();
-    let mut line = String::new();
-    {
-        let mut reader = std::io::BufReader::new(&stream);
-        reader.read_line(&mut line).expect("read the reply");
-    }
-    reply.push_str(&line);
+    // Ask for the restart, through the real client: the control socket only
+    // lets a known client (`zctl`) touch the machine, so a test that wrote
+    // raw frames would be refused before it got anywhere.
+    let out = zctl(&scratch, &["restart", "probe"]);
     assert!(
-        reply.starts_with("R 1 0"),
-        "the restart was refused: {reply:?}"
+        out.status.success(),
+        "the restart was refused: {}",
+        String::from_utf8_lossy(&out.stdout)
     );
 
     // Now the machine starts stopping. The service is still alive (it
@@ -806,4 +827,66 @@ fn a_stop_in_progress_does_not_resurrect_a_pending_restart() {
         sup.exited().is_none(),
         "the supervisor exited while stopping"
     );
+}
+
+/// The control socket knows who is calling.
+///
+/// The socket is `0600`, so only its owner can connect at all — but "the
+/// owner" is every process of that user, and one of them writing
+/// `C 1 poweroff` into the socket is enough to take the machine down.
+/// The server therefore checks the peer's credentials, and a peer that is
+/// not the known client (`zctl`) may look but not touch.
+///
+/// The test peer is this test binary: same user as the supervisor, and not
+/// a client. Reading must work; mutating must be refused with code `6`.
+#[test]
+fn the_control_socket_refuses_a_mutation_from_an_unknown_peer() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let _one = serial();
+    let scratch = Scratch::new("peercred");
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 30", scratch.at("svc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    let _pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
+
+    let ask = |frame: &str| -> String {
+        let mut stream =
+            UnixStream::connect(scratch.at("ctl")).expect("connect to the control socket");
+        stream.write_all(frame.as_bytes()).expect("send the frame");
+        let mut reader = BufReader::new(&stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read the reply");
+        line
+    };
+
+    // Reading works for anybody who got this far.
+    let listed = ask("C 1 list\n");
+    assert!(
+        listed.starts_with("R 1 0"),
+        "a read-only verb must be answered for any peer: {listed:?}"
+    );
+
+    // Powering the machine off does not: that verb takes the known client
+    // or root. (Managing services is the socket's own job and stays open
+    // to its owner, or the C4 contract would mean nothing.)
+    let refused = ask("C 1 poweroff\n");
+    assert!(
+        refused.starts_with("E 1 6"),
+        "a power verb from an unknown peer must be refused with code 6: {refused:?}"
+    );
+
+    // And the service is still running: the refusal happened before the
+    // command became an action.
+    assert!(
+        scratch.pid("svc.pid").is_some(),
+        "the service vanished although the power verb was refused"
+    );
+    assert!(sup.exited().is_none(), "the supervisor exited");
 }

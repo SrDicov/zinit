@@ -706,6 +706,19 @@ impl Sup {
         if self.power.is_some() {
             return ctl::render_ok(id, "power action already in progress");
         }
+        // Only the machine's own supervisor may end the machine. PID 1 forks
+        // exactly one supervisor, so "my parent is PID 1" is the test. A
+        // supervisor somebody started by hand — a second one, over the same
+        // socket — must not be able to power the box off, and a test
+        // supervisor must not be able to power off the machine it runs on.
+        if zrt::sys::getppid() != 1 {
+            return ctl::render_err(
+                id,
+                4,
+                "this supervisor is not the machine's init (its parent is not PID 1); \
+                 refusing to power the machine off",
+            );
+        }
         let cap = self.power_cap_ms();
         self.stopping = true;
         for idx in 0..self.runtime.len() {

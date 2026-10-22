@@ -204,7 +204,9 @@ fn mount_minimum() {
         ) {
             Ok(()) => {}
             Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
-            Err(e) => announce_degradation(&format!("cannot mount devtmpfs on /dev ({e}); continuing")),
+            Err(e) => {
+                announce_degradation(&format!("cannot mount devtmpfs on /dev ({e}); continuing"))
+            }
         }
     }
 }

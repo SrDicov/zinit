@@ -694,6 +694,164 @@ pub fn unix_accept(listener: RawFd) -> io::Result<RawFd> {
     Ok(fd)
 }
 
+/// The identity of the process on the other end of a unix socket.
+///
+/// `pid` is `0` where the platform does not report one (BSD's `getpeereid`
+/// answers with the credentials only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerCred {
+    /// The peer's process id, or `0` when the platform does not report it.
+    pub pid: i32,
+    /// The peer's effective user id.
+    pub uid: u32,
+    /// The peer's effective group id.
+    pub gid: u32,
+}
+
+/// The peer's credentials on a connected unix socket.
+///
+/// Linux answers with `SO_PEERCRED` (pid, uid, gid in one call); the BSDs
+/// and macOS answer with `getpeereid` (uid, gid, no pid). Where neither
+/// exists the call says so instead of inventing a zeroed identity: a
+/// caller that treats "unknown" as "root" is exactly the bug this
+/// function exists to prevent.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn peercred(fd: RawFd) -> io::Result<PeerCred> {
+    let mut cred: libc::ucred = unsafe { core::mem::zeroed() };
+    let mut len = core::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `cred` is a live `ucred` of exactly the length passed in, and
+    // `len` says how many bytes the kernel may write. The descriptor is a
+    // socket the caller owns.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast::<core::ffi::c_void>(),
+            &raw mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(PeerCred {
+        pid: cred.pid,
+        uid: cred.uid,
+        gid: cred.gid,
+    })
+}
+
+/// The peer's credentials on a connected unix socket, BSD flavour.
+///
+/// `getpeereid(2)` gives the effective uid and gid of the peer and no pid.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+pub fn peercred(fd: RawFd) -> io::Result<PeerCred> {
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    // SAFETY: both pointers are live and of the type the call writes.
+    let rc = unsafe { libc::getpeereid(fd, &raw mut uid, &raw mut gid) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(PeerCred {
+        pid: 0,
+        uid: uid as u32,
+        gid: gid as u32,
+    })
+}
+
+/// The peer's credentials: not available on this platform.
+///
+/// The supervisor treats this as "unknown peer" and refuses the mutating
+/// verbs. A platform that cannot say who is calling gets the strict
+/// answer, not the permissive one.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)))]
+pub fn peercred(_fd: RawFd) -> io::Result<PeerCred> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "peer credentials are not available on this platform",
+    ))
+}
+
+/// `geteuid(2)`: the effective user id of this process.
+///
+/// The control socket compares the peer against it, so it lives here with
+/// the other identity calls instead of being open-coded at the call site.
+pub fn geteuid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments and has no preconditions.
+    unsafe { libc::geteuid() as u32 }
+}
+
+/// `getppid(2)`: the pid of this process's parent.
+///
+/// The supervisor uses it to tell "the machine's supervisor" (a child of
+/// PID 1) from "a supervisor somebody started by hand".
+pub fn getppid() -> i32 {
+    // SAFETY: `getppid` takes no arguments and has no preconditions.
+    unsafe { libc::getppid() }
+}
+
+/// `flock(2)`: take an exclusive lock on `fd`, or fail if someone holds it.
+///
+/// Used for the supervisor's single-instance lock: two supervisors over one
+/// control socket is not a configuration, it is a race.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+pub fn flock_exclusive(fd: RawFd) -> io::Result<()> {
+    // SAFETY: `fd` is a descriptor the caller owns; `flock` only needs it to
+    // be open. The lock is released when the descriptor is closed.
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `flock(2)`: not available on this platform.
+///
+/// The supervisor then cannot prove a first instance is gone, so it says so
+/// instead of pretending.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)))]
+pub fn flock_exclusive(_fd: RawFd) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "flock is not available on this platform",
+    ))
+}
+
 /// `prctl(PR_SET_CHILD_SUBREAPER, 1)`: orphaned grandchildren reparent to us.
 ///
 /// A `Forking` daemon's real process is a grandchild that outlives its

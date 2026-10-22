@@ -413,13 +413,14 @@ fn reload_newcomer_honors_enabled() {
 fn demand_start_wakes_on_connection() {
     use std::net::TcpStream;
 
-    // A high port the neighbours are unlikely to want; probed free before
-    // the supervisor ever hears about it, so a squatted port fails loudly
-    // here instead of wedging the supervisor later.
-    let port = [48121u16, 48122, 48123]
-        .into_iter()
-        .find(|p| std::net::TcpListener::bind(format!("127.0.0.1:{p}")).is_ok())
-        .expect("a free probe port");
+    // A port nobody else has: the kernel picks it, and the probe listener is
+    // dropped before the supervisor ever hears about it. A hardcoded list
+    // fails the whole suite the moment a neighbour — or a leftover from a
+    // killed run — squats one of them.
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        probe.local_addr().expect("the probe has an address").port()
+    };
     let scratch = Scratch::new("demand");
     scratch.conf(
         "lazy.conf",
