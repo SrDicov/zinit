@@ -864,9 +864,6 @@ fn a_stop_in_progress_does_not_resurrect_a_pending_restart() {
 /// a client. Reading must work; mutating must be refused with code `6`.
 #[test]
 fn the_control_socket_refuses_a_mutation_from_an_unknown_peer() {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
-
     let _one = serial();
     let scratch = Scratch::new("peercred");
     scratch.conf(
