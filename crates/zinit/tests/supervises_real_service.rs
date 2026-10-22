@@ -53,8 +53,6 @@ use std::time::{Duration, Instant};
 const POLL_MS: u64 = 25;
 /// How long a supervisor may take to start a service.
 const START_DEADLINE_MS: u64 = 10_000;
-/// How long a supervisor that must *refuse* may take to say so.
-const EXIT_DEADLINE_MS: u64 = 10_000;
 /// How long a terminated process may take to become a name nobody can find.
 const REAP_DEADLINE_MS: u64 = 5_000;
 
@@ -409,64 +407,6 @@ impl Drop for Sup<'_> {
     }
 }
 
-/// Run `zinit --sup <scratch>` to completion and return its status and stderr.
-///
-/// For the refusal tests only: they expect the supervisor to die quickly, so a
-/// pipe cannot fill up and its stderr is the interesting part of the failure.
-fn run_to_exit(scratch: &Scratch) -> (ExitStatus, String) {
-    let mut child = sup_command(scratch)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("cannot spawn `zinit --sup`");
-
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait().expect("waiting on the supervisor failed") {
-            Some(status) => break status,
-            None if start.elapsed() >= Duration::from_millis(EXIT_DEADLINE_MS) => {
-                // Clean up before failing: this is the one path where the
-                // supervisor may have started services nobody recorded.
-                let group = child.id() as i32;
-                // SAFETY: signal 9 to a process group this test created.
-                unsafe { libc::kill(-group, libc::SIGKILL) };
-                let _ = child.wait();
-                panic!(
-                    "the supervisor is still running after {EXIT_DEADLINE_MS}ms with {dir} \
-                     loaded: a configuration it must refuse left it supervising anyway, and \
-                     whatever it started is still running",
-                    dir = scratch.path().display()
-                );
-            }
-            None => sleep_ms(POLL_MS),
-        }
-    };
-    // Safe to read to the end: the process has exited, so the pipe is at EOF.
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        use std::io::Read;
-        let _ = pipe.read_to_string(&mut stderr);
-    }
-    (status, stderr)
-}
-
-/// The refusal contract: a supervisor that cannot build a plan says so and
-/// exits non-zero (`DESIGN.md` §2.4 — never exit 0 on an error). Anything else
-/// means the machine booted half-configured.
-fn assert_refused(status: &ExitStatus, stderr: &str, what: &str) {
-    match status.code() {
-        Some(0) => panic!(
-            "the supervisor exited 0 with {what} configured (stderr: {stderr}): booting half a \
-             system is the one outcome this must never produce"
-        ),
-        Some(_) => {}
-        None => panic!(
-            "the supervisor died from a signal ({status}) with {what} configured instead of \
-             exiting non-zero (stderr: {stderr})"
-        ),
-    }
-}
-
 /// Nothing the refused plan started may still be running.
 fn assert_nothing_left_running(scratch: &Scratch, files: &[&str]) {
     for file in files {
@@ -694,7 +634,7 @@ fn a_root_service_keeps_setuid_working() {
 /// supervisor must refuse the whole directory rather than start the half of it
 /// it happens to understand.
 #[test]
-fn a_dependency_cycle_refuses_to_start() {
+fn a_dependency_cycle_starts_in_emergency_mode() {
     let _one = serial();
     let scratch = Scratch::new("cycle");
     // Both services are perfectly runnable. It is the *plan* that cannot exist,
@@ -705,16 +645,25 @@ fn a_dependency_cycle_refuses_to_start() {
         scratch.conf(file, &body);
     }
 
-    let (status, stderr) = run_to_exit(&scratch);
-    assert_refused(&status, &stderr, "a dependency cycle");
+    // A plan that cannot exist must not be half-loaded: the machine comes
+    // up in emergency mode (a shell on the console, no services of its own)
+    // instead of supervising a configuration nobody wrote.
+    let mut sup = Sup::start(&scratch);
+    sleep_ms(500);
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor exited on a cyclic plan: the machine would spin"
+    );
     assert_nothing_left_running(&scratch, &["a.pid", "b.pid"]);
 }
 
-/// One unparseable file stops the boot. A supervisor that skips the broken file
-/// and starts the rest is a machine that comes up in a configuration nobody
-/// wrote, which is worse than one that stays down and says why.
+/// One unparseable file stops the plan. A supervisor that skips the broken
+/// file and starts the rest is a machine that comes up in a configuration
+/// nobody wrote, which is worse than one that says why and waits. It waits
+/// in emergency mode: a shell on the console, and no service of the broken
+/// plan running.
 #[test]
-fn an_unparseable_config_refuses_to_start() {
+fn an_unparseable_config_starts_in_emergency_mode() {
     let _one = serial();
     let scratch = Scratch::new("unparseable");
     // A valid service next to the broken one: the point is that one bad file
@@ -725,8 +674,14 @@ fn an_unparseable_config_refuses_to_start() {
     let broken = format!("{}\nrestart = sometimes\n", desc("exec /bin/sleep 30", ""));
     scratch.conf("broken.conf", &broken);
 
-    let (status, stderr) = run_to_exit(&scratch);
-    assert_refused(&status, &stderr, "an unparseable service description");
+    let mut sup = Sup::start(&scratch);
+    sleep_ms(500);
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor exited on an unparseable file: the machine would spin"
+    );
+    // The good service next to the broken one must not have run: the plan
+    // as a whole is what failed.
     assert_nothing_left_running(&scratch, &["good.pid"]);
 }
 
@@ -943,5 +898,71 @@ fn a_second_supervisor_steps_aside() {
     assert!(
         first.exited().is_none(),
         "the first supervisor exited when the second one appeared"
+    );
+}
+
+/// A configuration that does not load must not take the machine with it.
+///
+/// The old behaviour: the supervisor exited, PID 1 relaunched it, it
+/// exited again, and the machine spun in front of the operator with no
+/// control socket, no services and no way in. The emergency mode puts a
+/// shell on the console and keeps the control socket up, so `zctl
+/// reload-all` can pick the real plan up once the file is fixed.
+#[test]
+fn a_broken_configuration_starts_in_emergency_mode() {
+    let _one = serial();
+    if zctl_path().is_none() {
+        eprintln!("skipped: this build has no zctl binary (build the whole workspace)");
+        return;
+    }
+    let scratch = Scratch::new("emergency");
+    // A file the parser cannot read: the plan will not load.
+    scratch.conf("broken.conf", "not-a-directive\n");
+
+    let mut sup = Sup::start(&scratch);
+
+    // The supervisor is alive: it did not exit and let PID 1 relaunch it
+    // in a loop.
+    sleep_ms(500);
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor exited on a broken configuration: the machine would spin"
+    );
+
+    // The control socket answers, and the only service is the emergency
+    // shell.
+    let out = zctl(&scratch, &["list"]);
+    assert!(
+        out.status.success(),
+        "no control socket in emergency mode: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let listed = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        listed.contains("emergency"),
+        "the emergency plan is not the one being supervised: {listed}"
+    );
+
+    // Fix the file and reload: the real plan takes over.
+    std::fs::remove_file(scratch.path().join("broken.conf")).expect("remove the broken file");
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 30", scratch.at("svc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let out = zctl(&scratch, &["reload-all"]);
+    assert!(
+        out.status.success(),
+        "the reload was refused: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let _pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
+    let after = zctl(&scratch, &["list"]);
+    let listed = String::from_utf8_lossy(&after.stdout);
+    assert!(
+        listed.contains("probe"),
+        "the real plan did not take over: {listed}"
     );
 }

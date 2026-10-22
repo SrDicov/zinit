@@ -979,24 +979,47 @@ fn child_step_fds(p: ChildPlan) -> bool {
         if p.notify_r >= 0 {
             libc::close(p.notify_r);
         }
-        let null_r = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
-        if null_r < 0 {
-            return false;
-        }
-        if libc::dup2(null_r, 0) < 0 {
-            return false;
-        }
-        if null_r > 0 {
-            libc::close(null_r);
-        }
-        if libc::dup2(p.log_fd, 1) < 0 {
-            return false;
-        }
-        if libc::dup2(p.log_fd, 2) < 0 {
-            return false;
-        }
-        if p.log_fd > 2 {
-            libc::close(p.log_fd);
+        if p.is_console && !p.tty.is_null() {
+            // A console service *is* the terminal: stdin, stdout and stderr
+            // are the tty, not `/dev/null` and not the log. A getty that
+            // reads from `/dev/null` sees EOF at once, and a shell that
+            // writes to the log is a shell nobody can talk to. The log
+            // descriptor is closed: the console shows everything, and a
+            // service that writes to a log *and* to the terminal is
+            // writing every line twice.
+            let tty = libc::open(p.tty, libc::O_RDWR);
+            if tty < 0 {
+                return false;
+            }
+            if libc::dup2(tty, 0) < 0 || libc::dup2(tty, 1) < 0 || libc::dup2(tty, 2) < 0 {
+                return false;
+            }
+            if tty > 2 {
+                libc::close(tty);
+            }
+            if p.log_fd > 2 {
+                libc::close(p.log_fd);
+            }
+        } else {
+            let null_r = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+            if null_r < 0 {
+                return false;
+            }
+            if libc::dup2(null_r, 0) < 0 {
+                return false;
+            }
+            if null_r > 0 {
+                libc::close(null_r);
+            }
+            if libc::dup2(p.log_fd, 1) < 0 {
+                return false;
+            }
+            if libc::dup2(p.log_fd, 2) < 0 {
+                return false;
+            }
+            if p.log_fd > 2 {
+                libc::close(p.log_fd);
+            }
         }
         if p.notify_w >= 0 {
             if libc::dup2(p.notify_w, p.notify_no) < 0 {

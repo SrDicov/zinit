@@ -98,8 +98,55 @@ pub fn run(config: Option<&Path>) -> io::Result<()> {
     if config_dirs.is_empty() {
         announce_degradation("no configuration layers: supervising nothing until reload-all");
     }
-    let (plan, descs) = load_all(&config_dirs, &gen_dir)?;
-    Sup::new(plan, descs, config_dirs, gen_dir)?.supervise()
+    // A plan that does not load is a machine with no init: the supervisor
+    // exits, PID 1 relaunches it, it exits again, and the machine spins in
+    // front of the operator with no control socket, no services and no way
+    // in. The emergency mode is the way out: the plan is set aside, a shell
+    // is put on the console, and the control socket stays up so that
+    // `zctl reload-all` can pick the real plan up once the operator has
+    // fixed the file.
+    let (plan, descs, emergency_dir) = match load_all(&config_dirs, &gen_dir) {
+        Ok((plan, descs)) => (plan, descs, None),
+        Err(e) => {
+            announce_degradation(&format!(
+                "cannot load the plan ({e}); starting in emergency mode with a console shell"
+            ));
+            let (plan, descs, dir) = emergency_plan()?;
+            announce_degradation(&format!(
+                "emergency mode: the machine is running {}; fix the configuration and \
+                 run `zctl reload-all`",
+                dir.display()
+            ));
+            (plan, descs, Some(dir))
+        }
+    };
+    let mut sup = Sup::new(plan, descs, config_dirs, gen_dir)?;
+    sup.emergency_dir = emergency_dir;
+    sup.supervise()
+}
+
+/// The emergency plan: one console shell, and nothing else.
+///
+/// The shell is the only way into a machine whose configuration does not
+/// load: there is no `sshd` (it is a service), no `agetty` (it is a
+/// service), and no control socket until the supervisor binds it. So the
+/// plan is written out as an ordinary description and loaded like any
+/// other layer — the same parser, the same spawn path, the same console
+/// handover — instead of a second, parallel way of running a shell.
+///
+/// It restarts always: the whole point of the shell is to be there, and a
+/// machine nobody is sitting at must not be able to kill itself.
+fn emergency_plan() -> io::Result<(Plan, Vec<Option<zconfig::desc::ServiceDesc>>, PathBuf)> {
+    let dir = std::env::temp_dir().join(format!("zinit-emergency-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let conf = dir.join("emergency.conf");
+    std::fs::write(
+        &conf,
+        "type = console\ncommand = /bin/sh\ntty = /dev/console\nready = none\n\
+         log = none\nrestart = always\n",
+    )?;
+    let (plan, descs) = load_all(std::slice::from_ref(&dir), &dir.join("gen"))?;
+    Ok((plan, descs, dir))
 }
 
 /// A machine-power verb waiting for quiescence.
@@ -176,6 +223,10 @@ struct Sup {
     /// have no plan entry anymore, so the core cannot reason about them;
     /// they are sent TERM once, reaped like any other child, then dropped.
     retired: Vec<Retired>,
+    /// The scratch directory holding the emergency plan, when the machine is
+    /// in emergency mode. Removed once the real plan loads: the shell it
+    /// describes is gone, and the directory is litter.
+    emergency_dir: Option<PathBuf>,
     /// The single-instance lock: an open descriptor holding an exclusive
     /// `flock` on `<socket>.lock`. It lives as long as the supervisor does,
     /// because closing it is what releases the lock.
@@ -449,6 +500,7 @@ impl Sup {
             retired: Vec::new(),
             subreaper,
             _instance_lock: lock,
+            emergency_dir: None,
         })
     }
 
@@ -1403,6 +1455,11 @@ impl Sup {
             Ok(ok) => ok,
             Err(e) => return Err(e.to_string()),
         };
+        // The real plan loaded: the emergency shell is no longer part of it
+        // (it will be retired below), and its scratch directory is litter.
+        if let Some(dir) = self.emergency_dir.take() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
         let adoption = adopt_names(&self.plan, &new_plan);
         let mut old_slots: HashMap<String, Slot> = HashMap::new();
         for slot in self.slots.drain(..) {
