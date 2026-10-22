@@ -1461,6 +1461,15 @@ fn merged_environment(
     for (k, v) in std::env::vars_os() {
         pairs.push((k.as_encoded_bytes().to_vec(), v.as_encoded_bytes().to_vec()));
     }
+    // A supervisor started by PID 1 inherits the kernel's environment, which
+    // carries no PATH. Then `env = PATH=${PATH}:/opt/bin` expanded to
+    // `/opt/bin` (the prefix lost), and every service that expected a
+    // search path found nothing. The fallback is the one `path_of` already
+    // used to resolve a bare command name; here it also exists so that
+    // `${PATH}` has something to expand.
+    if !pairs.iter().any(|(k, _)| k == b"PATH") {
+        pairs.push((b"PATH".to_vec(), DEFAULT_PATH.as_bytes().to_vec()));
+    }
     for (k, v) in overlay {
         if k.is_empty() || k.bytes().any(|b| b == b'=' || b == 0) {
             return Err(io::Error::new(
@@ -1507,8 +1516,15 @@ fn path_of(env: &[(Vec<u8>, Vec<u8>)]) -> String {
         .rev()
         .find(|(k, _)| k == b"PATH")
         .and_then(|(_, v)| String::from_utf8(v.clone()).ok())
-        .unwrap_or_else(|| String::from("/usr/bin:/bin"))
+        .unwrap_or_else(|| String::from(DEFAULT_PATH))
 }
+
+/// The search path a service gets when the supervisor inherited none.
+///
+/// The kernel hands PID 1 an empty environment, so without this every
+/// `env = PATH=${PATH}:/opt/bin` lost its prefix and every bare command
+/// name had nowhere to look.
+const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Look up a name in an ordered environment, last binding wins (mirrors
 /// what `execve` consumers observe). Shared by overlay expansion and by

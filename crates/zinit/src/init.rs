@@ -185,6 +185,28 @@ fn mount_minimum() {
             Err(e) => announce_degradation(&format!("cannot mount {target} ({e}); continuing")),
         }
     }
+
+    // `/dev` needs the kernel's device nodes. Without them there is no
+    // `/dev/null`, no `/dev/console` and no `/dev/tty1`, so every console
+    // service dies at `open` and the machine has no terminal at all.
+    //
+    // Mounted only when nothing else provided them: an initramfs `/dev`
+    // usually carries extra directories (`/dev/pts`, `/dev/shm`,
+    // `/dev/mqueue`) that a fresh devtmpfs would hide, and hiding them is
+    // worse than the missing nodes.
+    if !Path::new("/dev/null").exists() {
+        match zrt::sys::mount(
+            Some(Path::new("devtmpfs")),
+            Path::new("/dev"),
+            Some("devtmpfs"),
+            flags,
+            None,
+        ) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+            Err(e) => announce_degradation(&format!("cannot mount devtmpfs on /dev ({e}); continuing")),
+        }
+    }
 }
 
 /// Mount `/proc`, `/sys` and a tmpfs `/run`.
