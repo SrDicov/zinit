@@ -469,3 +469,59 @@ fn demand_start_wakes_on_connection() {
         "traffic never woke the service"
     );
 }
+
+/// A `reload-all` does not disturb a service that already said it was ready.
+///
+/// A `ready = notify` service is `Running` only because the handshake
+/// completed; the supervisor's evidence is a line on the notify fd, and the
+/// fact lives in the runtime, not in the description. A reload that rebuilds
+/// the plan must keep that fact. If it does not, the readiness deadline fires
+/// for a service that is perfectly healthy and the supervisor restarts it
+/// under the reload — and again after the next one, which is a restart loop
+/// nobody asked for. That is the shape of a loop seen on real hardware.
+#[test]
+fn reload_all_keeps_a_notified_service_ready() {
+    let scratch = Scratch::new("reload-notify");
+    let pidfile = scratch.dir.join("n.pid");
+    scratch.conf(
+        "n.conf",
+        &format!(
+            "type = script\ncommand = echo $$ > {}; echo READY=1 >&$ZINIT_NOTIFY_FD; \
+             exec /bin/sleep 30\nready = notify\nstart-timeout = 1s\nlog = none\n",
+            pidfile.display()
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    let mut ctl = Ctl::connect(&scratch.sock());
+    assert!(
+        wait_until(START_DEADLINE_MS, || {
+            scratch
+                .state_of("n")
+                .is_some_and(|s| s.contains("state=Running"))
+        }),
+        "the notified service never reached Running: {:?}",
+        scratch.state_of("n")
+    );
+    let before = pidfile_pid(&pidfile).expect("pidfile has a pid");
+    sup.services.push(before);
+
+    let reply = ctl.ask("C 1 reload-all\n");
+    assert_eq!(reply, "R 1 0 1 services", "reload reply: {reply}");
+
+    // Longer than `start-timeout`: a reload that forgot the handshake has
+    // had every chance to time out and restart the service by now.
+    sleep_ms(1_500);
+    assert!(pid_alive(before), "the reload killed the notified service");
+    assert_eq!(
+        pidfile_pid(&pidfile),
+        Some(before),
+        "the service was restarted after the reload: the handshake was lost"
+    );
+    assert!(
+        scratch
+            .state_of("n")
+            .is_some_and(|s| s.contains("state=Running")),
+        "the service is no longer Running after the reload: {:?}",
+        scratch.state_of("n")
+    );
+}
