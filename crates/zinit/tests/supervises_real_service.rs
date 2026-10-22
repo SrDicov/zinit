@@ -1229,9 +1229,19 @@ fn zinit_boots_as_pid_one_in_a_namespace() {
     let ns_pid1 = children_pid(child.id());
     if comm.trim() != "zinit" {
         // No user namespace on this machine: the test has nothing to say.
+        // The namespace's PID 1 (if there is one) goes first, then the
+        // `unshare` process. Never a pid of 0 and never a process group:
+        // `kill(0, ...)` is "every process in my group" and a group kill
+        // would take the test runner (and the shell that started it) with
+        // it.
+        if ns_pid1 > 1 {
+            // SAFETY: the pid came from this test's own /proc entry.
+            unsafe {
+                libc::kill(ns_pid1 as i32, libc::SIGKILL);
+            }
+        }
         // SAFETY: the pid is this test's own child.
         unsafe {
-            libc::kill(-(child.id() as i32), libc::SIGKILL);
             libc::kill(child.id() as i32, libc::SIGKILL);
         }
         let _ = child.wait();
