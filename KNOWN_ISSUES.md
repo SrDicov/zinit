@@ -169,3 +169,42 @@ soak restarts on the release binary.
 - **Timers**: resuelto por la vía de no hacerlos. La máquina trae
   `cronie`/`crond` (evidencia en `z-dinit-generator/evidence/`), así que un
   planificador dentro de zinit sería la misma función dos veces. 
+
+## El filtro de syscalls no filtraba: era `SECCOMP_MODE_STRICT` (2026-10-22)
+
+Lo que se creía una ventaja del proyecto — `syscall-filter = enforce|errno` —
+no funcionaba, y no podía funcionar:
+
+- `SECCOMP_MODE_FILTER` estaba escrito como `1`. El valor 1 es
+  `SECCOMP_MODE_STRICT`: el kernel instala **su propio** filtro de cuatro
+  syscalls y mata el proceso con `SIGKILL` en cuanto intenta `execve`. Todo
+  servicio con filtro moría al arrancar; `strace` lo enseñaba como
+  `prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT)` y `killed by SIGKILL` una
+  línea después. El valor correcto es `2`.
+- Instalar un filtro sin `CAP_SYS_ADMIN` exige `no_new_privs`, y NNP sólo se
+  ponía cuando el servicio cambiaba de identidad, así que el `prctl` fallaba
+  con `EPERM` en todos los demás. Ahora NNP se pone siempre que hay filtro:
+  un servicio filtrado que aún puede ganar privilegios por un binario setuid
+  tiene una puerta que el filtro no ve.
+- Faltaban en la tabla y en la base implícita `getpgrp` (111, syscall propia
+  en x86_64, no un alias de `getpgid`), `getresuid` (118), `getresgid` (120),
+  `wait4`, `waitid` y `vfork` (58). Sin ellas un shell no arranca, no puede
+  esperar a un hijo y no puede hacer fork+exec: `dash` respondía
+  `Cannot fork` y ningún `type = script` filtrado ejecutaba su comando.
+
+Por qué nadie lo vio: el único test que lo cubría exigía root y se saltaba
+en CI (que corre sin privilegios), y además **escribía las tres respuestas en
+el mismo fichero** mientras las aserciones leían tres ficheros distintos: no
+podía pasar ni como root. Los tres fallos están arreglados y con test que
+corre en CI (`a_filtered_service_starts_and_does_its_work`) más el de sandbox
+como root (`the_sandbox_really_confines`, verificado en contenedor
+privilegiado). Evidencia del arreglo: servicio filtrado en `errno` y en
+`enforce` que arranca, escribe su fichero y sale con 0; shell filtrado que
+hace `unshare` (EPERM, como debe) y luego escribe su código de salida.
+
+**Límite honesto**: la tabla de números está verificada sólo para
+**x86_64 Linux**. En cualquier otra arquitectura un `syscall-filter`
+configurado es rechazo de spawn (fail-closed), no un filtro aproximado.
+Añadir la tabla de aarch64 es trabajo mecánico con riesgo real (un número
+equivocado es un agujero, no una errata): se hará con la misma disciplina,
+una tabla y sus números críticos verificados contra el kernel.

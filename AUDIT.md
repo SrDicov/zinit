@@ -89,3 +89,10 @@ trabajo del día. Lo que ya está arreglado y verificado **no** se repite.
 - Evidencia real pegada en el informe final; "verde en CI" no es
   comportamiento en vivo.
 - 3 fallos seguidos en el mismo bug → hard stop, `STATUS.md`, salir limpio.
+
+- [x] **C9** `syscall-filter` estaba roto de raíz (modo STRICT, NNP no puesto
+  sin drop de identidad, base implícita sin `getpgrp`/`getresuid`/
+  `getresgid`/`wait4`/`waitid`/`vfork`). Arreglado con tres commits
+  (`375641d`, `94a533f`, `46e0d5f`), test en CI para x86_64 y test de sandbox
+  como root verificado en contenedor. Limitación declarada: tabla sólo
+  x86_64.
