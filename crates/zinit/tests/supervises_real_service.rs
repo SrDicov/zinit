@@ -272,6 +272,12 @@ fn sup_command(scratch: &Scratch) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_zinit"));
     cmd.arg("--sup").arg(scratch.path());
     cmd.stdin(Stdio::null()).process_group(0);
+    // The control socket and the state directory live in the scratch
+    // directory: the default paths are under `/run`, which a test that does
+    // not run as root cannot write, and a socket shared by every test on
+    // the machine is a race nobody wants to debug.
+    cmd.env("ZINIT_SOCKET", scratch.at("ctl"));
+    cmd.env("ZINIT_STATE_DIR", scratch.at("state"));
     cmd
 }
 
@@ -721,5 +727,83 @@ fn a_reparented_orphan_is_reaped_not_left_a_zombie() {
         wait_until(REAP_DEADLINE_MS, || pid_gone(gc)),
         "orphan {gc} was never reaped: it still answers kill(0), \
          so a zombie is sitting under the supervisor"
+    );
+}
+
+/// A machine that is going down must not resurrect a service.
+///
+/// The bug: `zctl restart` leaves a *pending restart* behind, and when the
+/// service finally dies the supervisor brings it back up. If the machine is
+/// stopping at that moment — a power verb, an `on-fatal`, or a signal — the
+/// service comes back up in the middle of the power epilogue, which is
+/// waiting for exactly that service to stay down. The stop deadline then
+/// expires and the machine powers off "loudly anyway".
+///
+/// The test: a service that ignores SIGTERM (so the stop escalates to
+/// SIGKILL and takes a moment), a restart requested, then a stop. The
+/// service must stay dead.
+#[test]
+fn a_stop_in_progress_does_not_resurrect_a_pending_restart() {
+    use std::io::{BufRead, Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let _one = serial();
+    let scratch = Scratch::new("stopping-restart");
+    // The service ignores SIGTERM: the supervisor has to escalate to
+    // SIGKILL after `stop-timeout`, which is the window in which the stop
+    // and the pending restart overlap.
+    let command = format!(
+        "/bin/sh -c 'trap \"\" TERM; echo $$ > {}; sleep 300'",
+        scratch.at("svc.pid")
+    );
+    scratch.conf(
+        "probe.conf",
+        &desc(&command, "restart = always\nstop-timeout = 1s\n"),
+    );
+
+    let mut sup = Sup::start(&scratch);
+    let pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
+
+    // Ask for the restart. The service is Running, so the supervisor stops it
+    // and remembers to start it again.
+    let mut stream = UnixStream::connect(scratch.at("ctl")).expect("connect to the control socket");
+    stream
+        .write_all(b"C 1 restart probe\n")
+        .expect("send the restart");
+    // One line, not the whole stream: the server holds the connection open,
+    // and reading to EOF would wait for the supervisor to die.
+    let mut reply = String::new();
+    let mut line = String::new();
+    {
+        let mut reader = std::io::BufReader::new(&stream);
+        reader.read_line(&mut line).expect("read the reply");
+    }
+    reply.push_str(&line);
+    assert!(
+        reply.starts_with("R 1 0"),
+        "the restart was refused: {reply:?}"
+    );
+
+    // Now the machine starts stopping. The service is still alive (it
+    // ignores SIGTERM), so this is the moment the pending restart and the
+    // stop overlap.
+    signal(sup.pid(), libc::SIGTERM);
+
+    // The service dies (SIGKILL after the stop timeout) and, without the
+    // guard, comes straight back up.
+    assert!(
+        wait_until(REAP_DEADLINE_MS, || pid_gone(pid)),
+        "the service never died: the stop did not escalate to SIGKILL"
+    );
+    sleep_ms(1500);
+    assert_eq!(
+        scratch.pid("svc.pid"),
+        Some(pid),
+        "the service was restarted while the machine was stopping: the power \
+         epilogue waits for services to stay down, and this one came back"
+    );
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor exited while stopping"
     );
 }

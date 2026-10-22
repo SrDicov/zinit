@@ -812,8 +812,8 @@ impl Sup {
             self.runtime.set_desired(idx, Desired::Down);
         }
         announce_degradation(&format!(
-            "{} received: stopping every service. This build has no poweroff path, \
-             so the machine stays up and idle afterwards",
+            "{} received: stopping every service. The machine stays up and idle \
+             afterwards; `zctl poweroff` is what actually cuts the power",
             sig.name()
         ));
     }
@@ -1014,6 +1014,10 @@ impl Sup {
             if self.plan.services[idx].on_demand
                 && self.runtime.get(idx).desired == Desired::Down
                 && self.runtime.state_at(idx) == State::Stopped
+                // A machine that is going down does not wake up for a
+                // connection: the demand trigger would resurrect a service
+                // the power epilogue is waiting to see stay down.
+                && !self.stopping
             {
                 match self.slots[idx].svc.ensure_listeners(&self.plan) {
                     Ok(()) => {
@@ -1147,6 +1151,13 @@ impl Sup {
         while i < self.pending_restart.len() {
             let idx = self.pending_restart[i];
             if idx >= self.runtime.len() {
+                self.pending_restart.remove(i);
+            } else if self.stopping {
+                // The machine is going down (a power verb, an `on-fatal`, or
+                // a signal). A pending restart must not resurrect the
+                // service it was meant to restart: the power epilogue waits
+                // for quiescence, and a service that comes back up is a
+                // service the epilogue never sees stop again.
                 self.pending_restart.remove(i);
             } else if self.runtime.state_at(idx) == State::Stopped {
                 self.runtime.set_desired(idx, Desired::Up);
