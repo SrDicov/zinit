@@ -638,6 +638,7 @@ mod tests {
     /// wrong entry) is a filter that blocks what it says it allows, and the
     /// symptom is a shell failing at `getpgrp` with `EPERM`.
     #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn the_program_allows_every_implicit_syscall() {
         let prog = super::build(&[], super::OnViolation::Errno).expect("filter builds");
         for name in super::IMPLICIT {
