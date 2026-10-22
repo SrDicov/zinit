@@ -1840,3 +1840,54 @@ fn a_log_that_cannot_be_opened_is_a_refusal() {
         "the supervisor died over a bad log path"
     );
 }
+
+/// A reload does not repeat a warning it already announced.
+///
+/// The advice is about a file; re-reading an unchanged file says nothing new,
+/// and a plan with a hundred `ready = none` services would print a hundred
+/// warnings (plus their help lines) on every single reload — burying the one
+/// line the operator reloaded to read.
+#[test]
+fn a_reload_does_not_repeat_warnings_it_already_announced() {
+    let _one = serial();
+    let scratch = Scratch::new("warnings-once");
+    if zctl_path().is_none() {
+        let _ = std::fs::write(scratch.at("skipped"), "no zctl binary\n");
+        return;
+    }
+    // `ready = none` on a `process` service is W003: a real warning, announced
+    // once at load. (A `script` gets no W003 — its readiness is the script.)
+    scratch.conf(
+        "probe.conf",
+        "type = process\ncommand = /bin/sleep 30\nready = none\nlog = none\n",
+    );
+    let mut sup = Sup::start(&scratch);
+    let warnings = || {
+        scratch
+            .read("sup.log")
+            .unwrap_or_default()
+            .matches("W003")
+            .count()
+    };
+    assert!(
+        wait_until(START_DEADLINE_MS, || warnings() > 0),
+        "the warning was never announced at load:\n{}",
+        scratch.tail("sup.log")
+    );
+    for _ in 0..2 {
+        let out = zctl(&scratch, &["reload-all"]);
+        assert!(
+            out.status.success(),
+            "reload failed: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+    sleep_ms(500);
+    assert_eq!(
+        warnings(),
+        1,
+        "the reload repeated a warning it had already announced:\n{}",
+        scratch.tail("sup.log")
+    );
+    assert!(sup.exited().is_none(), "the supervisor died");
+}

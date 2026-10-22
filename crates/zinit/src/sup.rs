@@ -2335,6 +2335,29 @@ fn run_one_generator(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
+/// Warnings already announced, so a reload does not repeat them.
+///
+/// Process-wide because the loader is a free function and the plan it
+/// describes is process-wide too, and a `Vec` rather than a set because a
+/// plan has a handful of warnings: a linear scan of a few strings costs less
+/// than the hashing machinery. Never cleared on purpose — a warning that stops
+/// and comes back is a new finding.
+static ANNOUNCED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// True the first time `text` is seen, false for a repeat.
+fn note_announced(text: &str) -> bool {
+    let Ok(mut seen) = ANNOUNCED.lock() else {
+        // A poisoned lock means a previous announcement panicked. Saying the
+        // warning again is better than swallowing it.
+        return true;
+    };
+    if seen.iter().any(|s| s == text) {
+        return false;
+    }
+    seen.push(text.to_string());
+    true
+}
+
 /// Parse one file's text, announcing its warnings.
 ///
 /// A file that does not parse is fatal: a plan built from the files that
@@ -2346,7 +2369,17 @@ fn parse_file(name: &str, text: &str, file: String) -> io::Result<ServiceDesc> {
             // `zconfig`'s own words, so they are reported and the service is
             // loaded anyway.
             for warning in parsed.warnings.iter() {
-                announce_degradation(warning.render(&file).trim());
+                let rendered = warning.render(&file);
+                let text = rendered.trim();
+                // Once per process is enough: the warning is advice about a
+                // file, and a reload that re-reads an unchanged file says
+                // nothing new. Without this, `reload-all` on a plan with a
+                // hundred `ready = none` services prints a hundred warnings
+                // (and a hundred help lines) every single time, which buries
+                // the one line the operator was reloading to read.
+                if note_announced(text) {
+                    announce_degradation(text);
+                }
             }
             let mut desc = parsed.desc;
             desc.source = file;
