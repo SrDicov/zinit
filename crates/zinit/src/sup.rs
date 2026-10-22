@@ -3022,8 +3022,14 @@ mod tests {
     }
 
     /// A fresh, empty scratch directory named after `tag`.
+    /// A scratch directory, unique to this process.
+    ///
+    /// The pid is in the name on purpose: a fixed name would collide with a
+    /// leftover from a killed run, and the supervisor's single-instance lock
+    /// would then refuse to start — a failure that has nothing to do with
+    /// the code under test.
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zinit-sup-{tag}"));
+        let dir = std::env::temp_dir().join(format!("zinit-sup-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         dir
