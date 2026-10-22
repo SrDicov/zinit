@@ -1030,3 +1030,50 @@ fn a_broken_configuration_starts_in_emergency_mode() {
         "the real plan did not take over: {listed}"
     );
 }
+
+/// The visible state must describe the machine that is running.
+///
+/// Two things used to go wrong: a service deleted from the configuration
+/// left its state file behind, so the file kept claiming a service that no
+/// longer existed; and the file was written in place, so a reader could
+/// see half of the new content and half of the old one.
+#[test]
+fn the_visible_state_follows_the_plan() {
+    let _one = serial();
+    if zctl_path().is_none() {
+        eprintln!("skipped: this build has no zctl binary (build the whole workspace)");
+        return;
+    }
+    let scratch = Scratch::new("state");
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 30", scratch.at("svc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    let _pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
+
+    // The state file exists and says the service is running.
+    let state = scratch.read("state/probe").expect("the state file");
+    assert!(
+        state.contains("state=Running"),
+        "the state file does not describe a running service: {state}"
+    );
+
+    // Remove the service and reload: its state file must go with it.
+    std::fs::remove_file(scratch.path().join("probe.conf")).expect("remove the description");
+    let out = zctl(&scratch, &["reload-all"]);
+    assert!(
+        out.status.success(),
+        "the reload was refused: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    sleep_ms(500);
+    assert!(
+        scratch.read("state/probe").is_none(),
+        "the state file of a deleted service survived the reload: it describes a \\
+         machine that is not this one"
+    );
+}

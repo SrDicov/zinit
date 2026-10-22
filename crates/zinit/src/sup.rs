@@ -479,6 +479,21 @@ impl Sup {
             }
         };
 
+        // Descriptors are the supervisor's scarcest resource: every
+        // service costs an exec pipe, a notify pipe and a log. The default
+        // soft limit (1024) is not enough for a machine with a few hundred
+        // services, and the failure ("cannot spawn") says nothing about
+        // the real cause.
+        if let Err(e) = zrt::sys::raise_nofile_limit() {
+            announce_degradation(&format!("cannot raise the open-file limit ({e})"));
+        }
+
+        // Whatever the previous boot left in the state directory describes
+        // a machine that is not this one.
+        if state_usable {
+            prune_state_dir(&state_dir, &plan);
+        }
+
         Ok(Sup {
             plan,
             runtime,
@@ -1460,6 +1475,9 @@ impl Sup {
         if let Some(dir) = self.emergency_dir.take() {
             let _ = std::fs::remove_dir_all(&dir);
         }
+        if self.state_usable {
+            prune_state_dir(&self.state_dir, &new_plan);
+        }
         let adoption = adopt_names(&self.plan, &new_plan);
         let mut old_slots: HashMap<String, Slot> = HashMap::new();
         for slot in self.slots.drain(..) {
@@ -1599,7 +1617,7 @@ impl Sup {
                 continue;
             }
             let path = self.state_dir.join(&self.plan.services[idx].name);
-            match std::fs::write(&path, content.as_bytes()) {
+            match write_state_atomically(&path, content.as_bytes()) {
                 Ok(()) => {
                     self.last_state_dump[idx] = content;
                 }
@@ -2539,6 +2557,51 @@ fn ctl_state_dir() -> PathBuf {
     std::env::var_os(ctl::STATE_DIR_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(ctl::DEFAULT_STATE_DIR))
+}
+
+/// Write a state file so a reader never sees half of it.
+///
+/// `std::fs::write` truncates in place: a `cat` at that moment reads the
+/// first half of the new content and the second half of the old one. The
+/// state files exist to be read by a human or a script, so a torn file is
+/// a lie. Write to a temporary name and rename: the rename is atomic, and
+/// a reader sees either the old file or the new one.
+fn write_state_atomically(path: &Path, content: &[u8]) -> io::Result<()> {
+    let tmp = path.with_file_name(format!(
+        ".{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    std::fs::write(&tmp, content)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Remove the state files of services that are no longer in the plan.
+///
+/// A service that was deleted from the configuration leaves its file
+/// behind, and the file keeps saying the service is running: the visible
+/// state then describes a machine that does not exist.
+fn prune_state_dir(state_dir: &Path, plan: &Plan) {
+    let Ok(entries) = std::fs::read_dir(state_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // The temporary names are not services; they belong to whoever is
+        // writing one right now.
+        if name.starts_with('.') {
+            continue;
+        }
+        if plan.index_of(name).is_none() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// The exit code that says "another supervisor already owns the socket".

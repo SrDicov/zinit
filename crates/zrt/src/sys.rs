@@ -807,6 +807,35 @@ pub fn getppid() -> i32 {
     unsafe { libc::getppid() }
 }
 
+/// `setrlimit(2)`: raise the soft limit of `resource` to its hard limit.
+///
+/// A supervisor that inherits the default `RLIMIT_NOFILE` (1024 on most
+/// systems) runs out of descriptors at a couple of hundred services: every
+/// service costs an exec pipe, a notify pipe and a log, and the failure
+/// looks like a service that cannot be spawned for no reason. The hard
+/// limit is the ceiling the system allows, so raising the soft limit to it
+/// is the one adjustment an init should make.
+pub fn raise_nofile_limit() -> io::Result<()> {
+    let mut cur: libc::rlimit = unsafe { core::mem::zeroed() };
+    // SAFETY: `cur` is a live, zeroed `rlimit` the kernel fills with the
+    // current limits; it is not retained.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut cur) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if cur.rlim_cur >= cur.rlim_max {
+        return Ok(());
+    }
+    let wanted = libc::rlimit {
+        rlim_cur: cur.rlim_max,
+        rlim_max: cur.rlim_max,
+    };
+    // SAFETY: `wanted` is a live `rlimit` the kernel copies.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const wanted) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `flock(2)`: take an exclusive lock on `fd`, or fail if someone holds it.
 ///
 /// Used for the supervisor's single-instance lock: two supervisors over one
