@@ -265,7 +265,10 @@ fn ask_as_nobody(socket: &str, frame: &str) -> String {
     // unprivileged.
     const NOBODY: u32 = 65534;
 
-    let (mut reader, mut writer) = std::io::pipe().expect("pipe");
+    // A socket pair is the channel: the child writes its answer on one end,
+    // the parent reads it on the other. (`std::io::pipe` would be shorter
+    // but it is newer than this workspace's MSRV.)
+    let (mut parent_end, mut child_end) = UnixStream::pair().expect("socket pair");
     // SAFETY: a fork whose child does nothing but async-signal-safe work:
     // it drops its privileges, connects, writes, reads and exits. The
     // parent only reads the pipe.
@@ -286,14 +289,14 @@ fn ask_as_nobody(socket: &str, frame: &str) -> String {
             let _ = stream.write_all(frame.as_bytes());
             let mut line = String::new();
             let _ = BufReader::new(&stream).read_line(&mut line);
-            let _ = writer.write_all(line.as_bytes());
+            let _ = child_end.write_all(line.as_bytes());
             std::process::exit(0);
         }
         -1 => panic!("cannot fork the peer"),
         _ => {}
     }
     let mut answer = String::new();
-    let _ = BufReader::new(&mut reader).read_line(&mut answer);
+    let _ = BufReader::new(&mut parent_end).read_line(&mut answer);
     // Reap the child: a test that leaves a corpse is a test that makes the
     // next one flakier.
     // SAFETY: the pid is this test's own child.
