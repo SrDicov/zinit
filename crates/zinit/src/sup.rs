@@ -1471,7 +1471,8 @@ impl Sup {
                         &id,
                         "status <name> | list | start <name> | stop <name> | \
                          restart <name> | kick <name> | reload-all | poweroff | \
-                         reboot | halt | suspend | hibernate | version | help",
+                         reboot | halt | suspend | hibernate | emergency | \
+                         version | help",
                     ),
                 );
             }
