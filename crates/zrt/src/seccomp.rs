@@ -762,9 +762,14 @@ mod tests {
                 0u64,
             )
         };
-        if rc >= 0 {
+        if rc == 0 {
+            // The *new* child, not the caller: it leaves at once, which is
+            // also how a successful clone reports itself.
             // SAFETY: `_exit` never returns.
             unsafe { libc::_exit(0) };
+        }
+        if rc > 0 {
+            return true;
         }
         // SAFETY: reading the errno of the call above.
         let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -799,13 +804,26 @@ mod tests {
                 // filter is installed first — stacking is allowed with NNP —
                 // so the same probe can be run before ours.
                 let permissive = [super::stmt(super::BPF_RET | super::BPF_K, super::RET_ALLOW)];
-                let allowed_before = super::install(&permissive).is_ok()
-                    && super::install(&prog).is_ok()
-                    && probe_namespace_clone();
-                if !allowed_before {
-                    // Either a filter would not install, or the kernel denies
-                    // the namespace on its own: the rule cannot be attributed
-                    // here, and the test says so instead of pretending.
+                // Order matters and it is the whole point: the probe must run
+                // under the *permissive* filter only. Chaining `install(&prog)`
+                // before the probe put the strict filter on top, so the probe
+                // saw our own EPERM, concluded "the environment denies it" and
+                // exited 22 — a green test that never ran the check. An
+                // installation failure is not "inconclusive" either, so it
+                // keeps its own code.
+                if super::install(&permissive).is_err() {
+                    // SAFETY: `_exit` never returns.
+                    unsafe { libc::_exit(10) };
+                }
+                let ns_allowed = probe_namespace_clone();
+                let tiocsti_allowed = probe_tiocsti();
+                if super::install(&prog).is_err() {
+                    // SAFETY: `_exit` never returns.
+                    unsafe { libc::_exit(10) };
+                }
+                if !ns_allowed {
+                    // The kernel denies an unprivileged user namespace on its
+                    // own: an EPERM below could not be blamed on the rule.
                     // SAFETY: `_exit` never returns.
                     unsafe { libc::_exit(22) };
                 }
@@ -862,7 +880,13 @@ mod tests {
                     unsafe { libc::_exit(14) };
                 }
                 let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                unsafe { libc::_exit(if errno == libc::EPERM { 0 } else { 15 }) };
+                if errno != libc::EPERM {
+                    unsafe { libc::_exit(15) };
+                }
+                // Kernel 6.2+ refuses TIOCSTI without CAP_SYS_ADMIN, and a
+                // hardened container may too: if the permissive filter was
+                // already denied, this run did not verify our rule.
+                unsafe { libc::_exit(if tiocsti_allowed { 0 } else { 23 }) };
             }
             pid => {
                 let mut status = 0;
@@ -874,11 +898,34 @@ mod tests {
                     -1
                 };
                 assert!(
-                    code == 0 || code == 22,
+                    code == 0 || code == 22 || code == 23,
                     "10=install, 11=new-user-namespace allowed, 12=wrong errno,                      13=fork() broke, 14=TIOCSTI allowed, 15=wrong errno"
                 );
             }
         }
+    }
+
+    /// Does this environment allow `TIOCSTI` at all? Same question as the
+    /// namespace probe, and the same reason: an `EPERM` that the kernel would
+    /// have given anyway cannot be blamed on the rule.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn probe_tiocsti() -> bool {
+        let byte: u8 = b'x';
+        // SAFETY: a live one-byte buffer and an integer request.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_ioctl,
+                0 as libc::c_int,
+                TIOCSTI as libc::c_ulong,
+                &byte as *const u8,
+            )
+        };
+        if rc >= 0 {
+            return true;
+        }
+        // SAFETY: reading the errno of the call above.
+        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        !matches!(errno, libc::EPERM | libc::EACCES)
     }
 
     /// The mode number is the difference between a filter and a kill switch.
