@@ -1079,6 +1079,7 @@ mod tests {
     /// continue` retry and the next read are exercised deterministically —
     /// a fixed 100 ms handoff instead of a racy one-second alarm.
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn drain_notify_retries_on_eintr() {
         arm_sigalrm_waker();
         let (r, w) = zrt::sys::pipe2(true).expect("pipe"); // blocking
@@ -1205,7 +1206,11 @@ mod tests {
     /// caller must be (about to be) parked inside the syscall whose EINTR
     /// behaviour is under test.
     fn sigalrm_here_after(delay_ms: u64) -> std::thread::JoinHandle<()> {
-        // SAFETY: both ids describe this very process/thread.
+        // The thread-targeted delivery is Linux's: `gettid` and
+        // `SYS_tgkill` do not exist on the BSDs, where the signal tests
+        // below are not compiled either. The fallback keeps the helper (and
+        // the `"alarm"` probe arm) compiling there; it is never reached.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let (pid, tid) = unsafe { (libc::getpid(), libc::gettid()) };
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(delay_ms));
@@ -1213,7 +1218,14 @@ mod tests {
             // musl bindings of the `libc` crate do not declare `tgkill` (the
             // symbol exists in musl; the declaration is missing), so the raw
             // syscall is used instead of a cfg fork: same call, one code path.
-            unsafe { libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGALRM) };
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            unsafe {
+                libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGALRM)
+            };
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGALRM)
+            };
         })
     }
 
@@ -1254,6 +1266,7 @@ mod tests {
     /// check behind those annotations: shrink one pair and this test fails
     /// exactly when a claimed equivalence stops holding.
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn annotated_or_flags_are_disjoint_bitsets() {
         assert_eq!(libc::O_RDWR & libc::O_CLOEXEC, 0, "open(/dev/null) flags");
         assert_eq!(libc::POLLIN & libc::POLLHUP, 0, "poll events");
@@ -1428,6 +1441,7 @@ mod tests {
     /// A signal must not break the in-progress probe any more than a read:
     /// the poll restarts after EINTR and still reports the timeout calmly.
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn probe_tcp_poll_survives_a_signal() {
         assert!(
             probe_child("alarm").success(),
@@ -1438,6 +1452,7 @@ mod tests {
     /// `interrupted => continue` in `poll_readable`: a signal mid-wait is a
     /// retry, not an error, and the data that arrives after it is still seen.
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn poll_readable_retries_when_interrupted() {
         arm_sigalrm_waker();
         let (r, w) = zrt::sys::pipe2(true).expect("pipe");
