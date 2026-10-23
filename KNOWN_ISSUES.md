@@ -251,6 +251,13 @@ se descartó porque rompía `zctl hibernate`/`poweroff` legítimos en macOS: un
 vez** en el job `macos-aarch64` (run `39890730246`) y pasó en los demás,
 incluida la repetición del mismo commit (`a5c8508`, dos pasadas verdes).
 
+**Medido, no supuesto**: el job de macOS repite el test `ZINIT_FLAKE_RUNS=3000`
+veces desde `9e81b0f` (cuesta ~1 s), y la primera medida es **0 fallos en
+3000**. También 600 iteraciones locales en Linux (debug y release), 0 fallos.
+Sigue abierto sólo si aparece en uso real; no bloquea beta. Lo que el bucle
+no reproduce es una causa *ambiental* distinta de la carga del propio job
+(el resto de tests no corre a la vez dentro de una iteración).
+
 - Qué hace el test: `fork`, en el hijo ejecuta el `drop_privileges` real
   contra nuestros propios ids, y el padre exige "o baja y verifica, o falla
   sin tocar nada".
@@ -264,6 +271,8 @@ incluida la repetición del mismo commit (`a5c8508`, dos pasadas verdes).
 - Siguiente paso si vuelve: el mensaje nuevo dice el desenlace exacto; con
   eso se decide entre endurecer el hijo (preparar todo antes del `fork`) o
   gatear el test a Linux, donde vive el camino de producción (`setresuid`).
+  La tasa queda medida en cada run de macOS, así que "volvió" ya viene con
+  contexto.
 
 ## Lo que la auditoría independiente encontró (2026-10-23)
 
