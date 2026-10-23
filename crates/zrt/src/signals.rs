@@ -803,9 +803,18 @@ impl SignalSource for KqueueSignalSource {
         }
         let mut out = Vec::with_capacity(n as usize);
         for ev in buf.iter().take(n as usize) {
-            // `fflags` holds the signal number for a triggered EVFILT_SIGNAL
-            // (and NOTE_TRIGGERED is set alongside it).
-            if let Some(sig) = Signal::from_raw(Into::<u64>::into(ev.fflags) as u32 as i32) {
+            // For `EVFILT_SIGNAL` the signal number is the event's **`ident`**
+            // — the same field `kevent` was given when the filter was
+            // registered — while `data` carries how many times it arrived and
+            // `fflags` is not used. Reading `fflags` here meant no signal was
+            // ever reported on the BSDs: `SIGTERM` was ignored in silence, the
+            // worst possible failure for the one signal an operator uses to
+            // stop a machine. Linux passed either way, because `signalfd`
+            // never goes through this code.
+            if ev.filter as i32 != libc::EVFILT_SIGNAL as i32 {
+                continue;
+            }
+            if let Some(sig) = Signal::from_raw(ev.ident as i32) {
                 out.push(sig);
             }
         }
@@ -1126,6 +1135,26 @@ mod tests {
         let got = src.drain().expect("drain");
         assert!(!got.is_empty(), "at least one delivery must be visible");
         assert!(got.iter().all(|s| *s == Signal::Usr1));
+    }
+
+    /// Whatever the backend, a watched signal is reported by `drain`.
+    ///
+    /// This is the kqueue backend's whole contract, and it is where the BSD
+    /// path was silently broken: it read the signal number out of `fflags`
+    /// instead of `ident`, so `drain` returned nothing and the supervisor
+    /// ignored `SIGTERM` without a single line of log. Linux could not catch
+    /// it (the `signalfd` path does not share the code), which is why the test
+    /// is written against the interface and runs everywhere.
+    #[test]
+    fn a_signal_source_reports_what_it_watches() {
+        block(SignalSet::with(Signal::Usr2)).expect("block SIGUSR2");
+        let mut src = new_signal_source(SignalSet::with(Signal::Usr2)).expect("source");
+        raise_to_self(Signal::Usr2).expect("raise SIGUSR2");
+        let seen = src.drain().expect("drain");
+        assert!(
+            seen.contains(&Signal::Usr2),
+            "the signal source did not report the signal it watches: {seen:?}"
+        );
     }
 
     #[test]
