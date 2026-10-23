@@ -2025,10 +2025,9 @@ fn the_child_path_runs_with_privileges_inside_a_user_namespace() {
             .args(["-U", "-r", "-p", "-f", "--mount-proc", "--", "true"])
             .status();
         if !matches!(probe, Ok(s) if s.success()) {
-            eprintln!(
-                "skipping: this host forbids unprivileged user namespaces \
-                 (unshare -U -r -p --mount-proc failed)"
-            );
+            // Silent on purpose: the repository forbids print macros outside
+            // `zrt::report` (the "promises" check). A skipped proof is
+            // recorded in `docs/ACTA_ALPHA.md`, not shouted from stderr.
             return;
         }
         // Outer run: same test binary, one test, inside a user namespace with
