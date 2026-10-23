@@ -2015,6 +2015,22 @@ fn a_private_tmp_covers_the_scratch_directories() {
 #[cfg(target_os = "linux")]
 fn the_child_path_runs_with_privileges_inside_a_user_namespace() {
     if std::env::var("ZINIT_IN_USERNS").is_err() {
+        // A hardened host can forbid unprivileged user namespaces: the GitHub
+        // runners do (`unshare -U -r` dies on /proc/self/uid_map with EPERM).
+        // The inner run would then fail before any assertion, which says
+        // nothing about the child path. Probe the exact invocation and skip
+        // when the host is the one refusing; where namespaces are allowed
+        // (a normal machine, the hardware box) the test still runs in full.
+        let probe = std::process::Command::new("unshare")
+            .args(["-U", "-r", "-p", "-f", "--mount-proc", "--", "true"])
+            .status();
+        if !matches!(probe, Ok(s) if s.success()) {
+            eprintln!(
+                "skipping: this host forbids unprivileged user namespaces \
+                 (unshare -U -r -p --mount-proc failed)"
+            );
+            return;
+        }
         // Outer run: same test binary, one test, inside a user namespace with
         // a pid namespace and a private /proc.
         let exe = std::env::current_exe().expect("own test binary");
