@@ -208,3 +208,39 @@ configurado es rechazo de spawn (fail-closed), no un filtro aproximado.
 Añadir la tabla de aarch64 es trabajo mecánico con riesgo real (un número
 equivocado es un agujero, no una errata): se hará con la misma disciplina,
 una tabla y sus números críticos verificados contra el kernel.
+
+## En BSD/macOS el supervisor no oía ninguna señal (2026-10-23)
+
+Encontrado por el job `macos-aarch64` de CI, no por la máquina:
+
+- El backend `EVFILT_SIGNAL` descodificaba el número de señal de `fflags`.
+  En kqueue el número va en **`ident`** (el mismo campo con el que se
+  registró el filtro); `data` es la cuenta y `fflags` no se usa. Resultado:
+  `drain()` devolvía una lista vacía **siempre**, y `SIGTERM`/`SIGINT`/`SIGHUP`
+  al supervisor se ignoraban en silencio. La evidencia fue el propio log del
+  test que para la máquina: ni una línea de "SIGTERM received" y el servicio
+  seguía `Running` diez segundos después.
+- Linux nunca lo vio porque su camino es `signalfd`, que no pasa por ese
+  código. Arreglado leyendo `ident` y filtrando por `EVFILT_SIGNAL`.
+- **No se puede cubrir con un test unitario propio**: un `SIGUSR2`
+  process-directed en un binario de tests multihilo mata el proceso (signal
+  12) porque `block()` sólo enmascara el hilo que llama; lo vi en CI. La
+  cobertura es el test de integración que manda un `SIGTERM` real a un
+  supervisor real (`a_stop_in_progress_does_not_resurrect_a_pending_restart`):
+  en BSD sólo converge a `Stopped`/`Down` si la señal llega.
+
+**Límite honesto**: la verificación es la de CI (macOS aarch64) y la
+deducción del campo documentado por kqueue; no hay una máquina BSD a mano
+para un soak de señales.
+
+## El verbo de potencia en plataformas sin `/proc`
+
+El chequeo "sólo `zctl`/`zinit` apagan la máquina" se apoya en
+`/proc/<pid>/exe`. Donde no hay `/proc` (BSDs) no se puede nombrar el
+ejecutable del cliente, así que queda la frontera del socket (`0600`): puede
+pedirlo cualquier proceso del usuario dueño. Es el modelo de amenaza
+documentado (guarda contra un accidente, no contra el código del dueño), pero
+es un chequeo **más débil**: ahora el supervisor lo anuncia al arrancar en
+vez de que lo descubra un informe de bug. Rechazarlo (fail-closed) se probó y
+se descartó porque rompía `zctl hibernate`/`poweroff` legítimos en macOS: un
+`zctl` que deja de funcionar es peor que una guarda floja y anunciada.

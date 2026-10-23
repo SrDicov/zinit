@@ -25,12 +25,17 @@ commit). Base: `2f449e3`.
 | C10 | Ctrl-Alt-Del reinicia | `f1e5968` | `SIGINT` a PID 1 pedía `poweroff`; el contrato del kernel es reiniciar. Test de los dos verbos por el socket falso |
 | C11 | `syscall-allow` de extremo a extremo | `476b10a` | mismo comando: sin filtro 0, filtrado rechazado, filtrado con `syscall-allow = kill` 0 |
 | C12 | Log que no se puede abrir = rechazo | `ce967ab` | `ENOTDIR` en el camino del log: el servicio no corre y el supervisor sobrevive |
+| C13 | En BSD/macOS el supervisor no oía señales | `22ddfde` | `EVFILT_SIGNAL` leía `fflags` en vez de `ident`: `SIGTERM` se ignoraba en silencio. Evidencia: el log del job macOS sin una sola línea de parada y con el servicio `Running`; tras el arreglo, macOS converge |
+| C14 | El test de parada y el de credenciales son honestos | `7f47ec7` + `9bf8717` | la parada espera **convergencia** (no un pid concreto) y el rechazo de `poweroff` se afirma sólo donde hay `/proc` para probarlo; la plataforma sin `/proc` se anuncia al arrancar |
+| C15 | La suite dice por qué falla un cliente | `ef9e3cd` | el supervisor escribe su log en `<scratch>/sup.log` y el test de reload falla citando sus últimas líneas (antes: `WouldBlock` a secas) |
 | — | Un reload no reinicia lo que ya dijo READY | `5c474cc` | `ready = notify` de extremo a extremo (nunca se había probado): tras `reload-all` el pid es el mismo y sigue `Running` pasado el `start-timeout`. Cierra el sospechoso del bucle de chronyd |
 
-Suite local: **577 tests, 0 fallos**; clippy `-D warnings` limpio; `fmt`
-limpio; `zinit` release = **676 KiB** (presupuesto 1 MiB). CI: matriz en
-GitHub Actions sobre el tip de `testing`; el único job que falla por código
-ajeno es `check riscv32gc-unknown-linux-gnu` (std de nightly, documentado).
+Suite: verificada **sólo por CI** desde la orden de no compilar en este PC
+(último run: `39890406294`, `success` en toda la matriz Linux glibc/musl ×
+x86_64/i686/aarch64, macOS aarch64, los `check` de BSD, msrv 1.85, purity,
+size y los drivers). El único job rojo es `check
+riscv32gc-unknown-linux-gnu` (std de nightly, `SYS_futex`): ajeno y
+documentado. `zinit` release = **676 KiB** (presupuesto 1 MiB).
 
 ## Bloqueado (necesita la caja)
 
