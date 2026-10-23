@@ -160,7 +160,14 @@ jobs:
           key: ${{ runner.os }}-macos-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-macos-
       - run: cargo build --workspace --all-targets
-      - run: cargo test --workspace
+      - name: Test
+        # `ZINIT_FLAKE_RUNS` repeats the identity self-drop inside the test,
+        # which failed once on this job and nowhere else. 3000 iterations cost
+        # about a second and turn "it failed once" into a rate measured on
+        # every run here, instead of a hypothesis.
+        env:
+          ZINIT_FLAKE_RUNS: "3000"
+        run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets
       - run: cargo fmt --all --check
 

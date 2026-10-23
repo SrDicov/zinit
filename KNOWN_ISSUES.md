@@ -317,3 +317,19 @@ zinit sólo aplica el plazo con `ready = notify`) e `inittab-*` (sin utmp).
 Doce claves mapeadas no tienen test. Nada de esto es de este repo: se
 arregla allí, y es la razón por la que quitar dinit no es sólo desinstalar
 un paquete.
+
+## devmon sigue siendo de dinit (decisión, no bug)
+
+`dinit-base` se queda instalado. zinit reemplaza a **dinit como init**; el
+paquete de dinit se mantiene por `devmon`, su demonio de monitorización de
+dispositivos, que arranca servicios cuando aparece hardware (USB, drm, etc.).
+
+- zinit **no** tiene disparo por dispositivo: tiene activación por socket
+  (`listen =`) y `wants/` estáticos. Un servicio que dinit arrancaba al
+  enchufar un dispositivo no arranca solo bajo zinit.
+- El generador **no** intenta convertir devmon y no lo menciona: si alguien
+  desinstala `dinit-base`, pierde esa notificación en silencio. Riesgo real
+  y por eso la decisión es mantenerlo.
+- v0.3: `listen = device:` en zinit (issue abierto en el repo). Hasta
+  entonces la migración es "zinit es PID 1, dinit-base sigue instalado por
+  su demonio", y eso hay que decirlo así en cualquier README de la máquina.
