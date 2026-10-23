@@ -281,6 +281,11 @@ fn rotate(h: &mut LogHandle) -> io::Result<()> {
         // Reopen the live path even if the rotation half-finished; the error
         // still propagates so the supervisor can report it.
         if h.fd < 0 {
+            // equivalent (cargo-mutants): with `result.is_err()` the fd is
+            // still -1 here (`close` set it above; `h.fd` is only assigned
+            // once the reopen `open` already succeeded, i.e. `result` was
+            // `Ok`), so `<` and `<=` cannot differ;
+            // `rotation_failure_reopens_the_live_fd` pins that state.
             match open_append(&path) {
                 Ok(fd) => h.fd = fd,
                 Err(_) => return result,
@@ -343,6 +348,9 @@ fn open_append(path: &Path) -> io::Result<RawFd> {
     let fd = unsafe {
         libc::open(
             c.as_ptr(),
+            // equivalent (cargo-mutants): the flags are disjoint bitsets
+            // (see the `annotated_or_flags_are_disjoint_bitsets` test), so
+            // `|` cannot differ from `^` here.
             libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_CLOEXEC,
             0o644 as libc::c_uint,
         )
@@ -356,6 +364,9 @@ fn open_append(path: &Path) -> io::Result<RawFd> {
 /// Open `/dev/null` for writing.
 fn open_devnull() -> io::Result<RawFd> {
     // SAFETY: static literal, NUL-terminated by construction; the fd is fresh.
+    // equivalent (cargo-mutants): the flags are disjoint bitsets (see the
+    // `annotated_or_flags_are_disjoint_bitsets` test), so `|` cannot differ
+    // from `^` here.
     let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
@@ -492,6 +503,7 @@ mod tests {
         let dir = tmpdir("syslog-roundtrip");
         let path = dir.join("dev-log.sock");
         let listener = bind_dgram(&path);
+        bound_recv(listener);
         let mut h = open_syslog_at(&path).expect("daemon present");
         write_line(&mut h, b"hello").expect("write");
         h.close();
@@ -539,6 +551,34 @@ mod tests {
         assert_eq!(rc, 0, "bind: {}", io::Error::last_os_error());
         zrt::sys::set_cloexec(fd, true).expect("cloexec");
         fd
+    }
+
+    /// The receive-side watchdog: a mutant that turns a write into `Ok(())`
+    /// without `write(2)` must make the datagram tests *fail* (~3 s later,
+    /// `EAGAIN` on the timed socket), not hang the whole test binary on a
+    /// silent blocking socket — a hung run is a `TIMEOUT`; a failed one is a
+    /// caught mutant.
+    fn bound_recv(fd: RawFd) {
+        let tv = libc::timeval {
+            tv_sec: 3,
+            tv_usec: 0,
+        };
+        // SAFETY: `fd` is an owned test socket; `SO_RCVTIMEO` reads exactly
+        // one `timeval` and retains nothing.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVTIMEO,
+                    &raw const tv as *const libc::c_void,
+                    core::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                )
+            },
+            0,
+            "setsockopt SO_RCVTIMEO: {}",
+            io::Error::last_os_error()
+        );
     }
 
     #[test]
@@ -593,6 +633,7 @@ mod tests {
         let dir = tmpdir("dgram-boundary");
         let path = dir.join("dev-log.sock");
         let listener = bind_dgram(&path);
+        bound_recv(listener);
         let mut h = open_syslog_at(&path).expect("daemon present");
         let edge = vec![b'z'; 4096];
         write_line(&mut h, &edge).expect("boundary datagram");
@@ -834,5 +875,151 @@ mod tests {
             "a second handle must append, not clobber offset 0: {content:?}"
         );
         assert!(content.ends_with(b"bbbbbbbbbbbb\n"));
+    }
+
+    /// The `|`s in `open_append` and `open_devnull` annotated
+    /// `// equivalent (cargo-mutants)` pair flags that are disjoint
+    /// bitsets, and only disjoint bitsets make `a | b` identical to
+    /// `a ^ b` for every input. These asserts are the machine check behind
+    /// those annotations: shrink one pair and this test fails exactly when
+    /// a claimed equivalence stops holding.
+    #[test]
+    fn annotated_or_flags_are_disjoint_bitsets() {
+        assert_eq!(libc::O_WRONLY & libc::O_CREAT, 0, "open_append: 1/2");
+        assert_eq!(libc::O_WRONLY & libc::O_APPEND, 0, "open_append: 1/3");
+        assert_eq!(libc::O_WRONLY & libc::O_CLOEXEC, 0, "open_append: 1/4");
+        assert_eq!(libc::O_CREAT & libc::O_APPEND, 0, "open_append: 2/3");
+        assert_eq!(libc::O_CREAT & libc::O_CLOEXEC, 0, "open_append: 2/4");
+        assert_eq!(libc::O_APPEND & libc::O_CLOEXEC, 0, "open_append: 3/4");
+    }
+
+    /// `Drop` runs `close`: a handle leaving scope must not leak the sink
+    /// descriptor into the table — `<impl Drop for LogHandle>::drop with ()`
+    /// would quietly burn an fd per service teardown.
+    #[test]
+    fn drop_closes_the_file_descriptor() {
+        let h = open_sink(&zcore::LogSink::None).expect("open");
+        let fd = h.fd();
+        drop(h);
+        // SAFETY: `F_GETFD` only observes one descriptor and retains nothing.
+        let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_eq!(
+            rc,
+            -1,
+            "dropping the handle must close its fd: {}",
+            io::Error::last_os_error()
+        );
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    }
+
+    /// A directory blocking a generation makes the shift's rename fail with
+    /// `EISDIR` — a *real* error, not a missing-generation `ENOENT`: the
+    /// guard must swallow only `ENOENT`. Its `true`-mutant swallows the
+    /// `EISDIR`, finishes the rotation anyway, and rewrites the history the
+    /// blocker was protecting.
+    #[test]
+    fn shift_reports_real_rename_errors_not_just_enoent() {
+        let dir = tmpdir("shift-eisdir");
+        let log = dir.join("svc.log");
+        std::fs::create_dir(log.with_extension("log.2")).expect("block .2");
+        let mut h = open_sink(&file_sink(&log, 4, 2)).expect("open");
+        write_line(&mut h, b"aaaa").expect("fill to 5 bytes (no rotate yet)");
+        write_line(&mut h, b"bbbb").expect("rotate 1: .1 := aaaa, live := bbbb");
+        write_line(&mut h, b"cc").expect_err("rename .1 -> .2 onto a directory is EISDIR");
+        h.close();
+        assert_eq!(
+            std::fs::read(&log).expect("live"),
+            b"bbbb\n",
+            "a failed shift must not move or truncate the live file"
+        );
+        assert_eq!(
+            std::fs::read(log.with_extension("log.1")).expect("gen1"),
+            b"aaaa\n",
+            "the blocked rename must abort the whole shift"
+        );
+    }
+
+    /// The live file may vanish between `fstat` (on the still-open fd) and
+    /// the final rename — an external `unlink(2)` in between is legal. The
+    /// final-rename `ENOENT` is recovery, not failure: the fresh reopen
+    /// recreates the path and the line lands. A `false`-mutant turns that
+    /// `ENOENT` into `Err`, keeping the service dark for a vanished file.
+    #[test]
+    fn rotate_survives_a_vanished_live_file() {
+        let dir = tmpdir("shift-gone");
+        let log = dir.join("svc.log");
+        let mut h = open_sink(&file_sink(&log, 4, 1)).expect("open");
+        write_line(&mut h, b"aaaa").expect("fill to 5 bytes");
+        std::fs::remove_file(&log).expect("unlink between fstat and rename");
+        write_line(&mut h, b"bbbb").expect("rotation must recover over a vanished live file");
+        h.close();
+        assert_eq!(
+            std::fs::read(&log).expect("recreated live file"),
+            b"bbbb\n",
+            "the fresh open(2) recreates the name and takes the line"
+        );
+        assert!(
+            !log.with_extension("log.1").exists(),
+            "nothing was available to rotate"
+        );
+    }
+
+    /// `open(2)` can legitimately hand back fd 0 for `/dev/null` too;
+    /// `fd < 0` mutants that read `<= 0` refuse the descriptor (and answer
+    /// with a stale errno, worse than the truth). Mirrors
+    /// `open_append_accepts_fd_zero`.
+    #[test]
+    fn open_devnull_accepts_fd_zero() {
+        // SAFETY: free fd 0 for the test; restore from the saved dup after.
+        let saved = unsafe { libc::dup(0) };
+        assert!(saved >= 0, "dup: {}", io::Error::last_os_error());
+        unsafe { libc::close(0) };
+        let h = open_sink(&zcore::LogSink::None).expect("open(2) may use fd 0 for /dev/null");
+        assert_eq!(h.fd(), 0, "/dev/null kept the freed low fd");
+        drop(h); // closes *our* fd 0 (/dev/null), not the runner's stdin
+        // SAFETY: restore the runner's original fd 0 from the saved dup.
+        assert_eq!(unsafe { libc::dup2(saved, 0) }, 0, "restore fd 0");
+        // SAFETY: the dup is no longer needed once fd 0 is restored.
+        unsafe { libc::close(saved) };
+    }
+
+    /// One rotation must terminate in microseconds. The sentinel waits 5 s
+    /// and then aborts the whole binary.
+    ///
+    /// WHY THIS IS THE FIRST (alphabetically ordered) TEST: the mutants
+    /// that make the generation-shift loop spin (`i -= 1` given `i /= 1`)
+    /// hang the *first* rotation with `backups > 1` — whatever test it is —
+    /// so the crash must be armed before any rotate runs, and only this
+    /// test sorts early enough. Without it those mutants burn the mutator's
+    /// full 60 s budget every run instead of failing.
+    #[test]
+    fn a_rotation_terminates_before_the_suite_spins() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let done: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let guard = std::thread::spawn(move || {
+            for _ in 0..50 {
+                if done.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            // crashes the whole test binary: that is the point — a hung
+            // mutant must fail fast, and the sentinel only fires on a hang.
+            std::process::abort()
+        });
+        let dir = tmpdir("shift-term");
+        let log = dir.join("svc.log");
+        std::fs::write(&log, b"0123456789").expect("seed at exactly max");
+        let mut h = open_sink(&file_sink(&log, 10, 2)).expect("open");
+        write_line(&mut h, b"ab").expect("one rotation must terminate");
+        h.close();
+        done.store(true, Ordering::Relaxed);
+        guard.join().expect("sentinel finishes");
+        assert_eq!(std::fs::read(&log).expect("live"), b"ab\n");
+        assert_eq!(
+            std::fs::read(log.with_extension("log.1")).expect("gen1"),
+            b"0123456789"
+        );
     }
 }
