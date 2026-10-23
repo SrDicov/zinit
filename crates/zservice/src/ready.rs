@@ -236,8 +236,10 @@ pub(crate) fn drain_notify(fd: RawFd, pending: &mut Vec<u8>) -> io::Result<(bool
                 }
             }
             // equivalent (cargo-mutants): this Interrupted guard can never
-            // fire — `zrt::sys::read` retries EINTR internally, so no test
-            // can observe it taken and its mutants have no observable effect.
+            // fire — `zrt::sys::read` loops on `Interrupted` inside its own
+            // retry loop (crates/zrt/src/sys.rs, `pub fn read`), so `Err` can
+            // never carry that kind here: no test can observe this arm taken
+            // and its mutants have no observable effect.
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) => return Err(e),
@@ -363,9 +365,14 @@ fn run_check_child(
             libc::dup2(null, 0);
             libc::dup2(null, 1);
             libc::dup2(null, 2);
-            // equivalent (cargo-mutants): this close is redundant — `null`
-            // owns O_CLOEXEC and the `execve` below closes the descriptor
-            // either way, so every close-branch mutant here is unobservable.
+            // equivalent (cargo-mutants): this close conveys nothing beyond
+            // `O_CLOEXEC`: fd `null` always carries the close-at-exec bit,
+            // and no replacement of `>` moves the close to anywhere earlier
+            // than the `execve` — which performs the same close on every
+            // such mutant too. The `dup2`s already copied fd 2 before the
+            // guard runs, and copies never carry CLOEXEC, so the executed
+            // child's fd table is identical in all branches; the sub-
+            // microsecond close-to-exec gap is not observable to any test.
             if null > 2 {
                 libc::close(null);
             }
@@ -499,8 +506,9 @@ fn new_probe_socket() -> io::Result<RawFd> {
     Ok(fd)
 }
 
-// (cargo-mutants): every mutant inside this target-out branch compiles away
-// on Linux and can never fail the suite here; BSD/Apple builds exercise it.
+// equivalent (cargo-mutants): every mutant inside this target-out branch
+// compiles away on Linux and can never fail the suite here — the `cfg`
+// gate below is what proves it; BSD/Apple builds exercise this version.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn new_probe_socket() -> io::Result<RawFd> {
     // SAFETY: `socket` takes three ints; no flags exist here, so the fd is
@@ -910,16 +918,11 @@ mod tests {
     /// The deadline is inclusive and the check must run once `now` is past it:
     /// with `now_ms < next_due` inverted, a probe that is already due is
     /// skipped and the service never becomes ready.
+    /// The ping half forks, so it runs in a probe child (see
+    /// `run_check_child_execs_...` for why no fork stays in this binary).
     #[test]
     fn ping_past_the_deadline_still_runs() {
-        let mut w = ReadyWait::Ping {
-            command: "/bin/true".to_string(),
-            next_due_ms: 1000,
-        };
-        assert!(
-            w.check(1001).expect("check runs"),
-            "past the deadline is due"
-        );
+        assert!(probe_child("dueping").success(), "past the deadline is due");
         let mut t = ReadyWait::Tcp {
             port: 1,
             next_due_ms: 1000,
@@ -930,10 +933,19 @@ mod tests {
     }
 
     /// The child half really reaches `execve` and its exit status comes back.
+    /// Both directions run in probe children: under a flipped fork branch the
+    /// `run_check` *caller* itself execs away (exit 7), and an in-binary call
+    /// would make that replacement the whole suite's exit status.
     #[test]
     fn run_check_child_execs_and_the_status_comes_back() {
-        assert!(!run_check("exit 7", 2000).expect("fork works"));
-        assert!(run_check("exit 0", 2000).expect("fork works"));
+        assert!(
+            probe_child("exit7").success(),
+            "the child's nonzero status must come back as not-ready"
+        );
+        assert!(
+            probe_child("exit0").success(),
+            "the child's zero status must come back as ready"
+        );
     }
 
     #[test]
@@ -982,48 +994,23 @@ mod tests {
 
     #[test]
     fn ping_true_is_ready_and_false_is_not() {
-        assert!(run_check(crate::testutil::true_bin(), 5_000).expect("probe runs"));
-        assert!(!run_check(crate::testutil::false_bin(), 5_000).expect("probe runs"));
-        assert!(!run_check("exit 3", 5_000).expect("nonzero is not ready"));
+        assert!(
+            probe_child("truefalse").success(),
+            "exit 0 is ready, any nonzero exit is not"
+        );
     }
 
     #[test]
     fn ping_fails_until_the_service_is_really_up() {
-        let dir = crate::testutil::scratch("ping");
-        let counter = dir.join("n");
-        std::fs::write(&counter, "0").expect("seed");
-        // Succeeds only from the third run on: the first two are "starting".
-        let script = format!(
-            "n=$(cat {}); n=$((n+1)); echo $n > {}; test $n -ge 3",
-            counter.display(),
-            counter.display()
+        assert!(
+            probe_child("growsup").success(),
+            "two failing runs, then the third succeeds"
         );
-        let mut w = ReadyWait::Ping {
-            command: script,
-            next_due_ms: 0,
-        };
-        let mut now = 0u64;
-        assert!(!w.check(now).expect("run 1 fails"));
-        now += POLL_PING_INTERVAL_MS;
-        assert!(!w.check(now).expect("run 2 fails"));
-        now += POLL_PING_INTERVAL_MS;
-        assert!(w.check(now).expect("run 3 succeeds"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn ping_before_it_is_due_does_not_execute() {
-        let dir = crate::testutil::scratch("norun");
-        let flag = dir.join("ran");
-        let mut w = ReadyWait::Ping {
-            command: format!("touch {}", flag.display()),
-            next_due_ms: 10_000,
-        };
-        assert!(!w.check(0).expect("not due"));
-        assert!(!flag.exists(), "a probe that is not due must not fork");
-        assert!(w.check(10_000).expect("due now, touch exits 0"));
-        assert!(flag.exists());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(probe_child("nudge").success(), "not due: no fork, no probe");
     }
 
     #[test]
@@ -1163,14 +1150,33 @@ mod tests {
     /// Probe children that exercise the fork paths run isolated in their own
     /// process group: a mutated child half may signal or kill its whole
     /// group, and that must never reach the test binary or the driver behind
-    /// it. The modes do the actual work inside `run_check_probe_entry`.
+    /// it. The modes do the actual work inside `run_check_probe_entry`. The
+    /// cap keeps a mutated in-child path (a spin or a blocked connect) from
+    /// hanging the *suite*: the watchdog reaps the child as a failure and the
+    /// parent test reports it long before the 60s cargo-mutants budget.
     fn probe_child(mode: &str) -> std::process::ExitStatus {
         use std::os::unix::process::CommandExt;
-        let mut cmd = std::process::Command::new(std::env::current_exe().expect("self executable"));
-        cmd.arg("run_check_probe_entry").arg("--nocapture");
-        cmd.env("ZREADY_PROBE_MODE", mode);
-        cmd.process_group(0);
-        cmd.status().expect("spawn probe child")
+        let mut watching =
+            std::process::Command::new(std::env::current_exe().expect("self executable"))
+                .arg("run_check_probe_entry")
+                .arg("--nocapture")
+                .env("ZREADY_PROBE_MODE", mode)
+                .process_group(0)
+                .spawn()
+                .expect("spawn probe child");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            match watching.try_wait().expect("poll probe child") {
+                Some(status) => return status,
+                None => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = watching.kill();
+                        return watching.wait().expect("reap the timed-out probe child");
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
     }
 
     /// One process-wide SIGALRM no-op handler, installed exactly once: the
@@ -1239,6 +1245,32 @@ mod tests {
         );
     }
 
+    /// The five `|`s annotated `// equivalent (cargo-mutants)` pair flags
+    /// that are disjoint bitsets, and only disjoint bitsets make `a | b`
+    /// identical to `a ^ b` for every input. These asserts are the machine
+    /// check behind those annotations: shrink one pair and this test fails
+    /// exactly when a claimed equivalence stops holding.
+    #[test]
+    fn annotated_or_flags_are_disjoint_bitsets() {
+        assert_eq!(libc::O_RDWR & libc::O_CLOEXEC, 0, "open(/dev/null) flags");
+        assert_eq!(libc::POLLIN & libc::POLLHUP, 0, "poll events");
+        assert_eq!(
+            libc::SOCK_STREAM & libc::SOCK_CLOEXEC,
+            0,
+            "socket type vs run-time flag"
+        );
+        assert_eq!(
+            libc::SOCK_STREAM & libc::SOCK_NONBLOCK,
+            0,
+            "socket type vs io flag"
+        );
+        assert_eq!(
+            libc::SOCK_CLOEXEC & libc::SOCK_NONBLOCK,
+            0,
+            "socket run-time flags"
+        );
+    }
+
     /// With slot 0 freed before the probe, the probe socket must still win a
     /// usable low descriptor; `fd < 0` mutants that call fd 0 a failure make
     /// this probe error out.
@@ -1254,7 +1286,70 @@ mod tests {
         };
         let ok = match mode.as_str() {
             "exit7" => !run_check("exit 7", 2_000).unwrap_or(true),
+            "exit0" => run_check("exit 0", 2_000).unwrap_or(false),
             "writeprobe" => run_check("echo hi", 2_000).unwrap_or(false),
+            "truefalse" => {
+                run_check(crate::testutil::true_bin(), 5_000).unwrap_or(false)
+                    && { !run_check(crate::testutil::false_bin(), 5_000).unwrap_or(true) }
+                    && { !run_check("exit 3", 5_000).unwrap_or(true) }
+            }
+            "dueping" => {
+                let mut w = ReadyWait::Ping {
+                    command: "/bin/true".to_string(),
+                    next_due_ms: 1000,
+                };
+                w.check(1001).unwrap_or(false)
+            }
+            "growsup" => {
+                let dir = crate::testutil::scratch("ping");
+                let counter = dir.join("n");
+                std::fs::write(&counter, "0").expect("seed");
+                // Succeeds only from the third run on: the first two are
+                // "starting".
+                let script = format!(
+                    "n=$(cat {0}); n=$((n+1)); echo $n > {0}; test $n -ge 3",
+                    counter.display()
+                );
+                let mut w = ReadyWait::Ping {
+                    command: script,
+                    next_due_ms: 0,
+                };
+                let mut now = 0u64;
+                let ok = !w.check(now).unwrap_or(true);
+                now += POLL_PING_INTERVAL_MS;
+                let ok = ok && !w.check(now).unwrap_or(true);
+                now += POLL_PING_INTERVAL_MS;
+                let ok = ok && w.check(now).unwrap_or(false);
+                let _ = std::fs::remove_dir_all(&dir);
+                ok
+            }
+            "nudge" => {
+                let dir = crate::testutil::scratch("norun");
+                let flag = dir.join("ran");
+                let mut w = ReadyWait::Ping {
+                    command: format!("touch {}", flag.display()),
+                    next_due_ms: 10_000,
+                };
+                let not_due = !w.check(0).unwrap_or(true) && !flag.exists();
+                let due = w.check(10_000).unwrap_or(false) && flag.exists();
+                let _ = std::fs::remove_dir_all(&dir);
+                not_due && due
+            }
+            "stuff" => {
+                let (_l, fillers, port) = stuffed_listener();
+                drop(fillers);
+                // Ok(false) is the verdict; an Err or a hang is neither.
+                !probe_tcp(port).unwrap_or(true)
+            }
+            "alarm" => {
+                arm_sigalrm_waker();
+                let (_l, fillers, port) = stuffed_listener();
+                drop(fillers);
+                let alarm = sigalrm_here_after(200);
+                let not_ready = !probe_tcp(port).unwrap_or(true);
+                alarm.join().expect("alarm thread finishes");
+                not_ready
+            }
             "sealA" => {
                 // Free slots 0 and 2 so the probe pipe lands at (2, 3): the
                 // child half's own close(w) can then never eat a dup'd stdio.
@@ -1317,13 +1412,12 @@ mod tests {
     /// A full accept queue is the only way a loopback connect parks in
     /// `EINPROGRESS`: the poll after it runs to its timeout, and `n < 0`
     /// mutants pretending `0` is an error verdict turn that silent delay
-    /// into a hard failure.
+    /// into a hard failure (or, on a stale `EINTR`, into a spin — which is
+    /// why this runs in a watchdogged probe child).
     #[test]
     fn probe_tcp_reports_a_full_backlog_as_not_ready() {
-        let (_l, fillers, port) = stuffed_listener();
-        drop(fillers);
         assert!(
-            !probe_tcp(port).expect("probe runs"),
+            probe_child("stuff").success(),
             "the queue is full: the probe must wait out its poll, silently"
         );
     }
@@ -1332,14 +1426,8 @@ mod tests {
     /// the poll restarts after EINTR and still reports the timeout calmly.
     #[test]
     fn probe_tcp_poll_survives_a_signal() {
-        arm_sigalrm_waker();
-        let (_l, fillers, port) = stuffed_listener();
-        drop(fillers);
-        let alarm = sigalrm_here_after(200);
-        let ok = probe_tcp(port).expect("a signal is not an error");
-        alarm.join().expect("alarm thread finishes");
         assert!(
-            !ok,
+            probe_child("alarm").success(),
             "backlogged probe still waits, re-polling through EINTR"
         );
     }
