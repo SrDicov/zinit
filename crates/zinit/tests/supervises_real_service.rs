@@ -2066,7 +2066,7 @@ fn the_child_path_runs_with_privileges_inside_a_user_namespace() {
             "drop-capabilities = all\nsyscall-filter = errno\n",
         ),
     );
-    let mut sup = Sup::start(&scratch);
+    let sup = Sup::start(&scratch);
     assert!(
         wait_until(START_DEADLINE_MS, || scratch.read("uid").is_some()),
         "the child path never completed: state={:?}\n{}",
