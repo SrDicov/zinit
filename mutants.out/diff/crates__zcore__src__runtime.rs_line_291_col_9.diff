@@ -1,0 +1,37 @@
+--- crates/zcore/src/runtime.rs
++++ replace Runtime::snapshot -> alloc::string::String with Default::default()
+@@ -283,33 +283,17 @@
+ 
+     /// Sum of services currently considered up.
+     pub fn count_running(&self) -> usize {
+         self.services.iter().filter(|s| s.state.is_up()).count()
+     }
+ 
+     /// A stable, human-readable dump. Used by tests and `zctl status --json`.
+     pub fn snapshot(&self, plan: &Plan) -> alloc::string::String {
+-        let mut out = String::new();
+-        for (idx, sp) in plan.services.iter().enumerate() {
+-            let s = &self.services[idx];
+-            out.push_str(&alloc::format!(
+-                "{} {} {:?} {:?} pid={:?} restarts={}\n",
+-                sp.name,
+-                match s.desired {
+-                    Desired::Up => "want-up",
+-                    Desired::Down => "want-down",
+-                },
+-                s.state,
+-                if s.pinned { "pinned" } else { "unpinned" },
+-                s.pid,
+-                s.restarts
+-            ));
+-        }
+-        out
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ impl Default for Runtime {
+     fn default() -> Self {
+         Runtime::new()
+     }
+ }

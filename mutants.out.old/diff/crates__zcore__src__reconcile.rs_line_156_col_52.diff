@@ -1,0 +1,21 @@
+--- crates/zcore/src/reconcile.rs
++++ replace && with || in reconcile
+@@ -148,17 +148,17 @@
+                 // `Up` - the operator still wants it - but the reconciler
+                 // must leave it alone until `zctl kick` or `zctl start`.
+                 if runtime.get(idx).restart_suppressed {
+                     continue;
+                 }
+                 // A oneshot that ran to completion is done, not dead.
+                 // `Desired` stays `Up` so status tells the truth, but there
+                 // is nothing to converge: only `kick` re-arms it.
+-                if sp.kind == ServiceKind::Oneshot && runtime.get(idx).completed {
++                if sp.kind == ServiceKind::Oneshot || /* ~ changed by cargo-mutants ~ */ runtime.get(idx).completed {
+                     continue;
+                 }
+                 // A service that has never run is not subject to the restart
+                 // budget: the budget exists to stop a *crash loop*, not to
+                 // ration first starts. `failed_starts` still counts them.
+                 let was_running_before =
+                     runtime.get(idx).failed_starts > 0 || runtime.get(idx).last_exit.is_some();
+                 if was_running_before {

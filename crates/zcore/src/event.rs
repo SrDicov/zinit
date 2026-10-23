@@ -220,3 +220,23 @@ mod tests {
         assert_eq!(Event::Signalled { idx: 0, signal: 9 }.exit_code(), None);
     }
 }
+#[cfg(test)]
+mod mutation_guards {
+    use super::*;
+
+    /// The names and indices are what a log line and a test failure message
+    /// are made of; `cargo mutants` could blank them all.
+    #[test]
+    fn names_and_indices_are_what_the_logs_show() {
+        assert_eq!(Event::ExecOk(3).name(), "exec-ok");
+        assert_eq!(Event::Ready(4).name(), "ready");
+        assert_eq!(Event::ReadyTimeout(5).name(), "ready-timeout");
+        assert_eq!(Event::ExecOk(7).idx(), 7);
+        assert_eq!(Event::ReadyTimeout(9).idx(), 9);
+        let rendered = alloc::format!("{}", Event::Ready(2));
+        assert!(
+            rendered.contains("ready"),
+            "Display must say which event it is: {rendered:?}"
+        );
+    }
+}

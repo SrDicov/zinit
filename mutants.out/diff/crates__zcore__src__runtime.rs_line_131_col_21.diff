@@ -1,0 +1,21 @@
+--- crates/zcore/src/runtime.rs
++++ replace && with || in ServiceState::invariants_hold
+@@ -123,17 +123,17 @@
+     /// pid check that catches a real process losing track of its child.
+     pub fn invariants_hold(&self, ready_is_handshook: bool, has_process: bool) -> bool {
+         match self.state {
+             State::Stopped => {
+                 // Nothing may be set that implies a live process or a pending
+                 // timer. A stale deadline here is how you get a service that
+                 // "stops" twice or never times out.
+                 self.pid.is_none()
+-                    && self.pgid.is_none()
++                    || /* ~ changed by cargo-mutants ~ */ self.pgid.is_none()
+                     && self.started_at.is_none()
+                     && self.term_sent_at.is_none()
+                     && self.ready_due_at.is_none()
+                     && self.start_due_at.is_none()
+                     && self.stop_due_at.is_none()
+             }
+             State::Starting => {
+                 self.pid.is_some()

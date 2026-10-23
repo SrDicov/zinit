@@ -1,0 +1,19 @@
+--- crates/zcore/src/lib.rs
++++ replace <impl core::fmt::Display for Error>::fmt -> core::fmt::Result with Ok(Default::default())
+@@ -67,15 +67,11 @@
+ #[derive(Clone, PartialEq, Eq, Debug)]
+ pub enum Error {
+     /// The plan is inconsistent with the runtime's view of it. Always a bug.
+     PlanMismatch { what: &'static str, idx: Idx },
+ }
+ 
+ impl core::fmt::Display for Error {
+     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+-        match self {
+-            Error::PlanMismatch { what, idx } => {
+-                write!(f, "plan mismatch: {what} for service #{idx}")
+-            }
+-        }
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ }

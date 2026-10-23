@@ -1,0 +1,26 @@
+--- crates/zcore/src/types.rs
++++ replace Bucket::take -> bool with true
+@@ -440,22 +440,17 @@
+     }
+ 
+     /// Consume one token, if available. Returns whether it was consumed.
+     ///
+     /// A restart attempt is counted even when the spawn subsequently fails:
+     /// the budget exists to stop a crash loop, and a spawn that fails is part
+     /// of the same loop.
+     pub fn take(&mut self, budget: &Budget, now_ms: u64) -> bool {
+-        if !self.allows(budget, now_ms) {
+-            return false;
+-        }
+-        self.tokens -= 1;
+-        self.last_take_ms = Some(now_ms);
+-        true
++        true /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// True when no token is available right now, after refilling.
+     ///
+     /// This is what distinguishes "the budget is empty" from "the delay is
+     /// still spacing attempts": `take` fails in both cases, but only an
+     /// empty bucket is exhaustion worth announcing. A delay-gated retry is
+     /// routine spacing — the reconciler stays silent and a later pass spends

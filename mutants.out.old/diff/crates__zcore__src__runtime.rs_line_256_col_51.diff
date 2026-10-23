@@ -1,0 +1,21 @@
+--- crates/zcore/src/runtime.rs
++++ delete ! in Runtime::after_satisfied
+@@ -248,17 +248,17 @@
+     /// of wedging behind it. Only a dependency that is wanted and never
+     /// attempted, or is a mid-flight oneshot, holds the gate.
+     pub fn after_satisfied(&self, idx: Idx, plan: &Plan) -> bool {
+         plan.services[idx].after.iter().all(|&d| {
+             let s = &self.services[d];
+             let oneshot = plan.services[d].kind == ServiceKind::Oneshot;
+             s.completed
+                 || matches!(s.state, State::Running | State::Stopping)
+-                || (s.state == State::Starting && !oneshot)
++                || (s.state == State::Starting &&  /* ~ changed by cargo-mutants ~ */oneshot)
+                 || s.desired == Desired::Down
+                 || s.restart_suppressed
+                 || s.failed_starts > 0
+                 || s.last_exit.is_some()
+         })
+     }
+ 
+     /// Convenience: set the desired state of a service.

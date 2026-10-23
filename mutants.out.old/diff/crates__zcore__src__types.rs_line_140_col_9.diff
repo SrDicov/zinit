@@ -1,0 +1,28 @@
+--- crates/zcore/src/types.rs
++++ replace ServiceKind::name -> &'static str with ""
+@@ -132,24 +132,17 @@
+     /// process is always signalled by pid, never by group: the supervisor
+     /// cannot prove the daemon made its own group, and signalling a group it
+     /// never owned is how a supervisor kills itself.
+     Forking,
+ }
+ 
+ impl ServiceKind {
+     pub const fn name(self) -> &'static str {
+-        match self {
+-            ServiceKind::Process => "process",
+-            ServiceKind::Script => "script",
+-            ServiceKind::Target => "target",
+-            ServiceKind::Console => "console",
+-            ServiceKind::Oneshot => "oneshot",
+-            ServiceKind::Forking => "forking",
+-        }
++        "" /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Targets never fork, so readiness and restart policy are meaningless.
+     pub const fn has_process(self) -> bool {
+         matches!(
+             self,
+             ServiceKind::Process
+                 | ServiceKind::Script

@@ -1,0 +1,31 @@
+crates/zcore/src/lib.rs:75:9: replace <impl core::fmt::Display for Error>::fmt -> core::fmt::Result with Ok(Default::default())
+crates/zcore/src/event.rs:166:13: delete match arm Event::Signalled{..} | Event::OrphanReaped(_) in Event::exit_code
+crates/zcore/src/reconcile.rs:79:44: replace || with && in reconcile
+crates/zcore/src/reconcile.rs:109:17: replace && with || in reconcile
+crates/zcore/src/reconcile.rs:108:17: replace && with || in reconcile
+crates/zcore/src/reconcile.rs:111:24: replace && with || in reconcile
+crates/zcore/src/reconcile.rs:118:32: replace && with || in reconcile
+crates/zcore/src/reconcile.rs:118:23: delete ! in reconcile
+crates/zcore/src/reconcile.rs:118:39: replace == with != in reconcile
+crates/zcore/src/reconcile.rs:163:56: replace || with && in reconcile
+crates/zcore/src/reconcile.rs:163:52: replace > with == in reconcile
+crates/zcore/src/reconcile.rs:163:52: replace > with < in reconcile
+crates/zcore/src/reconcile.rs:163:52: replace > with >= in reconcile
+crates/zcore/src/reconcile.rs:204:38: replace || with && in reconcile
+crates/zcore/src/reconcile.rs:258:26: replace > with >= in due_events
+crates/zcore/src/reconcile.rs:288:13: delete match arm State::Stopping in due_events
+crates/zcore/src/reconcile.rs:290:31: replace >= with < in due_events
+crates/zcore/src/runtime.rs:151:21: replace && with || in ServiceState::invariants_hold
+crates/zcore/src/runtime.rs:150:21: replace && with || in ServiceState::invariants_hold
+crates/zcore/src/runtime.rs:149:21: replace && with || in ServiceState::invariants_hold
+crates/zcore/src/runtime.rs:148:21: replace && with || in ServiceState::invariants_hold
+crates/zcore/src/runtime.rs:157:21: replace && with || in ServiceState::invariants_hold
+crates/zcore/src/runtime.rs:156:21: replace && with || in ServiceState::invariants_hold
+crates/zcore/src/runtime.rs:155:21: replace && with || in ServiceState::invariants_hold
+crates/zcore/src/runtime.rs:234:67: replace && with || in Runtime::deps_satisfied
+crates/zcore/src/runtime.rs:291:9: replace Runtime::snapshot -> alloc::string::String with Default::default()
+crates/zcore/src/transition.rs:60:9: replace Transition::is_empty -> bool with true
+crates/zcore/src/transition.rs:467:40: replace && with || in handle_death
+crates/zcore/src/transition.rs:582:29: replace || with && in kick
+crates/zcore/src/transition.rs:609:5: replace arm_start_deadlines with ()
+crates/zcore/src/types.rs:486:34: replace || with && in Bucket::refill

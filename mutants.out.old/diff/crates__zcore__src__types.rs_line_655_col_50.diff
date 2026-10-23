@@ -1,0 +1,21 @@
+--- crates/zcore/src/types.rs
++++ replace == with != in Plan::index_of
+@@ -647,17 +647,17 @@
+     pub order_up: Vec<Idx>,
+     pub order_down: Vec<Idx>,
+ }
+ 
+ impl Plan {
+     /// Look up a service by name. Linear, which is fine: the CLI does this
+     /// once per invocation and the runtime keeps its own index.
+     pub fn index_of(&self, name: &str) -> Option<Idx> {
+-        self.services.iter().position(|s| s.name == name)
++        self.services.iter().position(|s| s.name != /* ~ changed by cargo-mutants ~ */ name)
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
+     #[test]

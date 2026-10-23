@@ -1,0 +1,21 @@
+--- crates/zcore/src/reconcile.rs
++++ replace != with == in reconcile
+@@ -74,17 +74,17 @@
+         for &d in &plan.services[i].required {
+             if plan.services[d].enabled {
+                 continue;
+             }
+             let dr = runtime.get(d);
+             if dr.desired != Desired::Down || dr.restart_suppressed {
+                 continue;
+             }
+-            if dr.state != State::Stopped {
++            if dr.state == /* ~ changed by cargo-mutants ~ */ State::Stopped {
+                 continue;
+             }
+             runtime.set_desired(d, Desired::Up);
+             tick.changed.push(d);
+         }
+     }
+ 
+     // ── Pass 1: start, in topological order ───────────────────────────────

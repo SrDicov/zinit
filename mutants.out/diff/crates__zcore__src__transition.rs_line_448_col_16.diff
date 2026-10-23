@@ -1,0 +1,21 @@
+--- crates/zcore/src/transition.rs
++++ replace == with != in handle_death
+@@ -440,17 +440,17 @@
+     // status tells the truth (wanted, finished, quiet); the reconciler will
+     // not start it again until `kick` or an explicit `start` re-arms it; and
+     // dependents treat it as satisfied through `deps_satisfied`.
+     //
+     // Recorded whether or not the death was requested: a oneshot that ran to
+     // the end did so even if an operator asked it to stop halfway. The
+     // stopping path below still applies (a requested stop stays a clean
+     // stop), it just also remembers the work got done.
+-    if sp.kind == ServiceKind::Oneshot && code == Some(0) {
++    if sp.kind != /* ~ changed by cargo-mutants ~ */ ServiceKind::Oneshot && code == Some(0) {
+         let s = runtime.get_mut(idx);
+         s.completed = true;
+         s.failed_starts = 0;
+     }
+ 
+     if was_stopping {
+         // We asked for this. Not a failure; do not log at error, do not restart.
+         actions.push(Action::MarkDown {

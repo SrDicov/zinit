@@ -1,0 +1,179 @@
+
+*** crates/zcore/src/runtime.rs:278:55: replace && with || in Runtime::check_invariants
+
+*** mutation diff:
+--- crates/zcore/src/runtime.rs
++++ replace && with || in Runtime::check_invariants
+@@ -270,17 +270,17 @@
+     pub fn check_invariants(&self, plan: &Plan) -> alloc::vec::Vec<Idx> {
+         plan.services
+             .iter()
+             .enumerate()
+             .filter(|(idx, sp)| {
+                 !self.services[*idx].invariants_hold(sp.ready.is_handshake(), sp.kind.has_process())
+                     // Completion is a oneshot-only fact. Anywhere else it
+                     // means the machine recorded a meaning the plan never gave.
+-                    || (self.services[*idx].completed && sp.kind != ServiceKind::Oneshot)
++                    || (self.services[*idx].completed || /* ~ changed by cargo-mutants ~ */ sp.kind != ServiceKind::Oneshot)
+             })
+             .map(|(idx, _)| idx)
+             .collect()
+     }
+ 
+     /// Sum of services currently considered up.
+     pub fn count_running(&self) -> usize {
+         self.services.iter().filter(|s| s.state.is_up()).count()
+
+
+*** /home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --package=zcore@0.1.0
+       Dirty zcore v0.1.0 (/tmp/cargo-mutants-zinit-ROLlrA.tmp/crates/zcore): the file `crates/zcore/src/runtime.rs` has changed (1792733704.205871490s, 1s after last build at 1792733703.862861848s)
+   Compiling zcore v0.1.0 (/tmp/cargo-mutants-zinit-ROLlrA.tmp/crates/zcore)
+     Running `/home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name zcore --edition=2024 crates/zcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::all' --forbid=unsafe_code --warn=unreachable_pub --warn=missing_debug_implementations --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=bcb77c82f94ade4a -C extra-filename=-8a442e3a11d1606f --out-dir /tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps`
+     Running `/home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name zcore --edition=2024 crates/zcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::all' --forbid=unsafe_code --warn=unreachable_pub --warn=missing_debug_implementations --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=4e9189675acb7d5d -C extra-filename=-310425ea34117922 --out-dir /tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps`
+     Running `/home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name properties --edition=2024 crates/zcore/tests/properties.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::all' --forbid=unsafe_code --warn=unreachable_pub --warn=missing_debug_implementations --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=2f2b15698dea136f -C extra-filename=-178dfb830cb9a10b --out-dir /tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps --extern zcore=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps/libzcore-310425ea34117922.rlib`
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.26s
+  Executable `/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps/zcore-8a442e3a11d1606f`
+  Executable `/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps/properties-178dfb830cb9a10b`
+
+*** result: Success
+
+*** /home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo test --verbose --package=zcore@0.1.0
+       Fresh zcore v0.1.0 (/tmp/cargo-mutants-zinit-ROLlrA.tmp/crates/zcore)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running `/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps/zcore-8a442e3a11d1606f`
+
+running 56 tests
+test event::tests::death_detection ... ok
+test action::tests::every_action_reports_its_index ... ok
+test event::tests::idx_is_readable_on_every_variant ... ok
+test reconcile::tests::a_target_goes_running_without_a_process ... FAILED
+test reconcile::tests::after_edge_holds_spawn_until_first_attempt ... ok
+test reconcile::tests::a_wanted_service_spawns_in_dependency_order ... ok
+test reconcile::tests::after_releases_on_terminal_outcomes ... ok
+test reconcile::tests::budget_stops_a_crash_loop ... ok
+test reconcile::tests::delay_gated_retry_is_silent_not_exhausted ... ok
+test reconcile::tests::demand_start_single_pass ... ok
+test reconcile::tests::due_events_cover_ready_start_and_stop_deadlines ... ok
+test reconcile::tests::missing_required_holds_spawn_but_not_the_boot ... ok
+test reconcile::tests::non_strict_ready_expiry_becomes_ready ... ok
+test reconcile::tests::nothing_happens_when_nothing_is_wanted ... ok
+test reconcile::tests::stop_pass_flips_desired_for_running_services ... ok
+test runtime::tests::a_stopped_service_with_a_stale_deadline_is_caught ... ok
+test runtime::tests::fresh_service_is_stopped_and_clean ... ok
+test runtime::tests::from_plan_sizes_correctly ... FAILED
+test runtime::tests::targets_and_console_defaults_are_sane ... ok
+test runtime::tests::starting_requires_a_pid_and_a_start_deadline ... ok
+test transition::tests::a_deliberate_stop_does_not_count_as_a_failure ... FAILED
+test reconcile::tests::after_holds_while_a_oneshot_is_mid_flight ... ok
+test transition::tests::console_is_granted_and_revoked ... ok
+test transition::tests::crash_takes_a_budget_token_and_leaves_desired_up ... ok
+test transition::tests::dep_lost_cascades_a_stop ... ok
+test transition::tests::late_and_duplicate_events_are_ignored ... ok
+test transition::tests::dep_lost_respects_a_pin ... ok
+test transition::tests::lifecycle_tests::a_completed_oneshot_satisfies_its_dependents ... FAILED
+test transition::tests::lifecycle_tests::adoption_is_meaningless_elsewhere ... ok
+test transition::tests::lifecycle_tests::adoption_swaps_the_fork_pid_for_the_daemon ... FAILED
+test transition::tests::lifecycle_tests::completion_on_any_other_kind_is_an_invariant_violation ... ok
+test transition::tests::lifecycle_tests::kick_rearms_a_completed_oneshot_and_nothing_else ... ok
+test transition::tests::lifecycle_tests::oneshot_clean_exit_completes_and_never_respawns ... FAILED
+test transition::tests::lifecycle_tests::oneshot_completion_beats_an_always_policy ... ok
+test transition::tests::lifecycle_tests::oneshot_failure_follows_the_policy ... ok
+test transition::tests::lifecycle_tests::watchdog_pings_from_the_dead_are_ignored ... ok
+test transition::tests::lifecycle_tests::watchdog_expiry_stops_a_silent_service ... FAILED
+test transition::tests::lifecycle_tests::watchdog_pings_postpone_expiry ... ok
+test transition::tests::on_fatal_default_warns_and_never_halts ... ok
+test transition::tests::on_fatal_halt_emits_halt_action ... ok
+test transition::tests::on_fatal_ignore_logs_info ... ok
+test transition::tests::ready_moves_starting_to_running ... FAILED
+test transition::tests::on_fatal_reboot_emits_reboot_action ... ok
+test transition::tests::restart_never_leaves_desired_up_after_a_crash ... ok
+test transition::tests::start_timeout_escalates_and_cleans_deadlines ... FAILED
+test transition::tests::stop_timeout_sends_sigkill_and_rearms ... FAILED
+test transition::tests::strict_ready_timeout_is_an_error_but_still_goes_up ... FAILED
+test types::tests::bucket_never_permits_when_capacity_is_zero ... ok
+test types::tests::bucket_refill_rate_is_in_tokens_not_millitokens ... ok
+test types::tests::bucket_refills_over_the_window ... ok
+test types::tests::bucket_respects_delay_between_attempts_only ... ok
+test types::tests::bucket_starts_full_and_drains ... ok
+test types::tests::bucket_tolerates_a_backwards_clock ... ok
+test types::tests::budget_default_matches_design_doc ... ok
+test types::tests::reset_gives_the_operator_control_back ... ok
+test types::tests::restart_policy ... ok
+
+failures:
+
+---- reconcile::tests::a_target_goes_running_without_a_process stdout ----
+
+thread 'reconcile::tests::a_target_goes_running_without_a_process' (18086) panicked at crates/zcore/src/reconcile.rs:515:9:
+a Running target with no pid is by design, not a violation
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- runtime::tests::from_plan_sizes_correctly stdout ----
+
+thread 'runtime::tests::from_plan_sizes_correctly' (18101) panicked at crates/zcore/src/runtime.rs:377:9:
+assertion failed: rt.check_invariants(&p).is_empty()
+
+---- transition::tests::a_deliberate_stop_does_not_count_as_a_failure stdout ----
+
+thread 'transition::tests::a_deliberate_stop_does_not_count_as_a_failure' (18104) panicked at crates/zcore/src/transition.rs:834:9:
+assertion failed: rt.check_invariants(&p).is_empty()
+
+---- transition::tests::lifecycle_tests::a_completed_oneshot_satisfies_its_dependents stdout ----
+
+thread 'transition::tests::lifecycle_tests::a_completed_oneshot_satisfies_its_dependents' (18110) panicked at crates/zcore/src/transition.rs:1098:13:
+assertion failed: rt.check_invariants(&p).is_empty()
+
+---- transition::tests::lifecycle_tests::adoption_swaps_the_fork_pid_for_the_daemon stdout ----
+
+thread 'transition::tests::lifecycle_tests::adoption_swaps_the_fork_pid_for_the_daemon' (18112) panicked at crates/zcore/src/transition.rs:1189:13:
+assertion failed: rt.check_invariants(&p).is_empty()
+
+---- transition::tests::lifecycle_tests::oneshot_clean_exit_completes_and_never_respawns stdout ----
+
+thread 'transition::tests::lifecycle_tests::oneshot_clean_exit_completes_and_never_respawns' (18115) panicked at crates/zcore/src/transition.rs:1026:13:
+assertion failed: rt.check_invariants(&p).is_empty()
+
+---- transition::tests::lifecycle_tests::watchdog_expiry_stops_a_silent_service stdout ----
+
+thread 'transition::tests::lifecycle_tests::watchdog_expiry_stops_a_silent_service' (18118) panicked at crates/zcore/src/transition.rs:1139:13:
+assertion failed: rt.check_invariants(&p).is_empty()
+
+---- transition::tests::ready_moves_starting_to_running stdout ----
+
+thread 'transition::tests::ready_moves_starting_to_running' (18125) panicked at crates/zcore/src/transition.rs:659:9:
+[0]
+
+---- transition::tests::start_timeout_escalates_and_cleans_deadlines stdout ----
+
+thread 'transition::tests::start_timeout_escalates_and_cleans_deadlines' (18127) panicked at crates/zcore/src/transition.rs:765:9:
+state must be consistent: ServiceState { desired: Up, state: Stopped, pid: None, pgid: None, started_at: None, term_sent_at: None, ready_due_at: None, start_due_at: None, stop_due_at: None, bucket: Bucket { tokens: 0, last_refill_ms: 0, last_take_ms: None, started: false }, restarts: 0, pinned: false, is_console: false, last_exit: None, failed_starts: 2, restart_suppressed: false, completed: false, last_watchdog_ms: None }
+
+---- transition::tests::stop_timeout_sends_sigkill_and_rearms stdout ----
+
+thread 'transition::tests::stop_timeout_sends_sigkill_and_rearms' (18128) panicked at crates/zcore/src/transition.rs:871:9:
+assertion failed: rt.check_invariants(&p).is_empty()
+
+---- transition::tests::strict_ready_timeout_is_an_error_but_still_goes_up stdout ----
+
+thread 'transition::tests::strict_ready_timeout_is_an_error_but_still_goes_up' (18129) panicked at crates/zcore/src/transition.rs:943:9:
+assertion failed: rt.check_invariants(&p).is_empty()
+
+
+failures:
+    reconcile::tests::a_target_goes_running_without_a_process
+    runtime::tests::from_plan_sizes_correctly
+    transition::tests::a_deliberate_stop_does_not_count_as_a_failure
+    transition::tests::lifecycle_tests::a_completed_oneshot_satisfies_its_dependents
+    transition::tests::lifecycle_tests::adoption_swaps_the_fork_pid_for_the_daemon
+    transition::tests::lifecycle_tests::oneshot_clean_exit_completes_and_never_respawns
+    transition::tests::lifecycle_tests::watchdog_expiry_stops_a_silent_service
+    transition::tests::ready_moves_starting_to_running
+    transition::tests::start_timeout_escalates_and_cleans_deadlines
+    transition::tests::stop_timeout_sends_sigkill_and_rearms
+    transition::tests::strict_ready_timeout_is_an_error_but_still_goes_up
+
+test result: FAILED. 45 passed; 11 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p zcore --lib`
+
+*** result: Failure(101)

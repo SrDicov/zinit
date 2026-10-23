@@ -1,0 +1,21 @@
+--- crates/zcore/src/transition.rs
++++ replace == with != in Transition::for_service
+@@ -57,17 +57,17 @@
+     }
+ 
+     pub fn is_empty(&self) -> bool {
+         self.actions.is_empty()
+     }
+ 
+     /// Every action concerning one service.
+     pub fn for_service(&self, idx: Idx) -> impl Iterator<Item = &Action> {
+-        self.actions.iter().filter(move |a| a.idx() == idx)
++        self.actions.iter().filter(move |a| a.idx() != /* ~ changed by cargo-mutants ~ */ idx)
+     }
+ 
+     /// The signals issued for one service, in order.
+     pub fn signals_for(&self, idx: Idx) -> Vec<SignalKind> {
+         self.for_service(idx)
+             .filter_map(|a| match *a {
+                 Action::Signal { signal, .. } => Some(signal),
+                 _ => None,

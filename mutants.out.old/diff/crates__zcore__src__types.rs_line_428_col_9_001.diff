@@ -1,0 +1,32 @@
+--- crates/zcore/src/types.rs
++++ replace Bucket::allows -> bool with false
+@@ -420,28 +420,17 @@
+             last_refill_ms: 0,
+             last_take_ms: None,
+             started: false,
+         }
+     }
+ 
+     /// True when a restart is currently permitted. Does not consume.
+     pub fn allows(&mut self, budget: &Budget, now_ms: u64) -> bool {
+-        if budget.capacity == 0 {
+-            return false;
+-        }
+-        self.refill(budget, now_ms);
+-        if self.tokens == 0 {
+-            return false;
+-        }
+-        match self.last_take_ms {
+-            // Never attempted: no delay to respect.
+-            None => true,
+-            Some(prev) => now_ms.saturating_sub(prev) >= budget.delay_ms,
+-        }
++        false /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Consume one token, if available. Returns whether it was consumed.
+     ///
+     /// A restart attempt is counted even when the spawn subsequently fails:
+     /// the budget exists to stop a crash loop, and a spawn that fails is part
+     /// of the same loop.
+     pub fn take(&mut self, budget: &Budget, now_ms: u64) -> bool {

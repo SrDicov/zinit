@@ -1,0 +1,31 @@
+--- crates/zcore/src/runtime.rs
++++ replace Runtime::check_invariants -> alloc::vec::Vec<Idx> with vec![]
+@@ -263,27 +263,17 @@
+ 
+     /// Convenience: set the desired state of a service.
+     pub fn set_desired(&mut self, idx: Idx, desired: Desired) {
+         self.services[idx].desired = desired;
+     }
+ 
+     /// Check every service's internal invariants. Returns the offenders.
+     pub fn check_invariants(&self, plan: &Plan) -> alloc::vec::Vec<Idx> {
+-        plan.services
+-            .iter()
+-            .enumerate()
+-            .filter(|(idx, sp)| {
+-                !self.services[*idx].invariants_hold(sp.ready.is_handshake(), sp.kind.has_process())
+-                    // Completion is a oneshot-only fact. Anywhere else it
+-                    // means the machine recorded a meaning the plan never gave.
+-                    || (self.services[*idx].completed && sp.kind != ServiceKind::Oneshot)
+-            })
+-            .map(|(idx, _)| idx)
+-            .collect()
++        vec![] /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Sum of services currently considered up.
+     pub fn count_running(&self) -> usize {
+         self.services.iter().filter(|s| s.state.is_up()).count()
+     }
+ 
+     /// A stable, human-readable dump. Used by tests and `zctl status --json`.

@@ -1,0 +1,21 @@
+--- crates/zcore/src/runtime.rs
++++ replace || with && in Runtime::after_satisfied
+@@ -252,17 +252,17 @@
+             let s = &self.services[d];
+             let oneshot = plan.services[d].kind == ServiceKind::Oneshot;
+             s.completed
+                 || matches!(s.state, State::Running | State::Stopping)
+                 || (s.state == State::Starting && !oneshot)
+                 || s.desired == Desired::Down
+                 || s.restart_suppressed
+                 || s.failed_starts > 0
+-                || s.last_exit.is_some()
++                && /* ~ changed by cargo-mutants ~ */ s.last_exit.is_some()
+         })
+     }
+ 
+     /// Convenience: set the desired state of a service.
+     pub fn set_desired(&mut self, idx: Idx, desired: Desired) {
+         self.services[idx].desired = desired;
+     }
+ 

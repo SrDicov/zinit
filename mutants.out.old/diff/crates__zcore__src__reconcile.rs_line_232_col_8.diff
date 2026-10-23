@@ -1,0 +1,21 @@
+--- crates/zcore/src/reconcile.rs
++++ delete ! in should_restart
+@@ -224,17 +224,17 @@
+ ///
+ /// Returns `true` if `Desired` should remain `Up`, in which case the next
+ /// [`reconcile`] pass will spawn it subject to the budget.
+ pub fn should_restart(runtime: &Runtime, plan: &Plan, idx: Idx, code: Option<i32>) -> bool {
+     let sp = &plan.services[idx];
+     if !sp.kind.has_process() {
+         return false;
+     }
+-    if !sp.restart.wants_restart(code) {
++    if  /* ~ changed by cargo-mutants ~ */sp.restart.wants_restart(code) {
+         return false;
+     }
+     // A service we were deliberately stopping does not "restart".
+     if runtime.get(idx).desired == Desired::Down {
+         return false;
+     }
+     true
+ }

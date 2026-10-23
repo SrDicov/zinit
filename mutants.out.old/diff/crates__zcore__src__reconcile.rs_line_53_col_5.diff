@@ -1,0 +1,183 @@
+--- crates/zcore/src/reconcile.rs
++++ replace reconcile -> Tick with Default::default()
+@@ -45,179 +45,17 @@
+ 
+ /// Compute the actions that move `runtime` one step closer to its desired
+ /// state, as of `now_ms` (monotonic milliseconds).
+ ///
+ /// Pure: no clocks, no I/O, no globals. Calling it twice with the same
+ /// arguments and the same runtime yields the same output, which is what makes
+ /// the property tests meaningful.
+ pub fn reconcile(runtime: &mut Runtime, plan: &Plan, now_ms: u64) -> Tick {
+-    let mut tick = Tick::default();
+-
+-    // ── Pass 0: demand-start (dinit's `depends-on` activation) ────────────
+-    //
+-    // A dependency that was disabled at boot (`enabled = no`, believed
+-    // unreachable by the convert closure) becomes wanted-up exactly when
+-    // a service that really pulls it is actually running — mirrors dinit's
+-    // activation propagation instead of only the static plan. Only services
+-    // that were disabled at *load* participate (operator-stopped services
+-    // keep `enabled = true`, so `zctl stop` is never overridden by a
+-    // future dependent going up). `ponytail:` racy rescan is O(services*
+-    // edges) per tick; promote to a dirty flag when a reload adds an edge.
+-    for i in 0..runtime.len() {
+-        if runtime.get(i).desired != Desired::Up {
+-            continue;
+-        }
+-        // No state gate on the dependent: a service that is wanted up but
+-        // blocked behind a disabled dep must be allowed to pull that dep
+-        // even while still Stopped. Otherwise the enable never fires (the
+-        // trigger can only pull; it may not spawn), and the disabled service
+-        // stays down forever — exactly the Artix agetty chain.
+-        for &d in &plan.services[i].required {
+-            if plan.services[d].enabled {
+-                continue;
+-            }
+-            let dr = runtime.get(d);
+-            if dr.desired != Desired::Down || dr.restart_suppressed {
+-                continue;
+-            }
+-            if dr.state != State::Stopped {
+-                continue;
+-            }
+-            runtime.set_desired(d, Desired::Up);
+-            tick.changed.push(d);
+-        }
+-    }
+-
+-    // ── Pass 1: start, in topological order ───────────────────────────────
+-    //
+-    // Walking `order_up` forward means every dependency has already been
+-    // considered by the time we reach a dependent. One pass, no ordering
+-    // logic inside the loop.
+-    for &idx in &plan.order_up {
+-        let sp = &plan.services[idx];
+-
+-        if runtime.get(idx).desired == Desired::Down {
+-            continue;
+-        }
+-
+-        // Targets have no process: they are up exactly when their required
+-        // dependencies are. No spawn, no budget, no readiness. A dangling
+-        // required edge holds the target like any unmet requirement, loudly
+-        // at load and quietly here — never the boot.
+-        if !sp.kind.has_process() {
+-            let deps_ok = runtime.deps_satisfied(idx, plan)
+-                && runtime.after_satisfied(idx, plan)
+-                && sp.missing_required.is_empty();
+-            let cur = runtime.get(idx).state;
+-            if deps_ok && cur != State::Running {
+-                runtime.get_mut(idx).state = State::Running;
+-                runtime.get_mut(idx).pid = None;
+-                runtime.get_mut(idx).started_at = Some(now_ms);
+-                tick.actions.push(Action::MarkReady(idx));
+-                tick.actions.push(Action::DepsChanged(idx));
+-                tick.changed.push(idx);
+-            } else if !deps_ok && cur == State::Running {
+-                runtime.get_mut(idx).state = State::Stopped;
+-                runtime.get_mut(idx).pid = None;
+-                runtime.get_mut(idx).started_at = None;
+-                tick.actions.push(Action::MarkDown {
+-                    idx,
+-                    unexpected: false,
+-                });
+-                tick.actions.push(Action::DepsChanged(idx));
+-                tick.changed.push(idx);
+-            }
+-            continue;
+-        }
+-
+-        match runtime.get(idx).state {
+-            State::Stopped => {
+-                // Should this service be running at all right now?
+-                if !runtime.deps_satisfied(idx, plan) {
+-                    continue;
+-                }
+-                // Order-only edges: wait for the first attempt, never for
+-                // success. See `after_satisfied` for the release rule.
+-                if !runtime.after_satisfied(idx, plan) {
+-                    continue;
+-                }
+-                // Dangling required edges: hold, never spawn into the void.
+-                if !sp.missing_required.is_empty() {
+-                    continue;
+-                }
+-                // A death the policy refused to retry. `Desired` is still
+-                // `Up` - the operator still wants it - but the reconciler
+-                // must leave it alone until `zctl kick` or `zctl start`.
+-                if runtime.get(idx).restart_suppressed {
+-                    continue;
+-                }
+-                // A oneshot that ran to completion is done, not dead.
+-                // `Desired` stays `Up` so status tells the truth, but there
+-                // is nothing to converge: only `kick` re-arms it.
+-                if sp.kind == ServiceKind::Oneshot && runtime.get(idx).completed {
+-                    continue;
+-                }
+-                // A service that has never run is not subject to the restart
+-                // budget: the budget exists to stop a *crash loop*, not to
+-                // ration first starts. `failed_starts` still counts them.
+-                let was_running_before =
+-                    runtime.get(idx).failed_starts > 0 || runtime.get(idx).last_exit.is_some();
+-                if was_running_before {
+-                    let budget = sp.restart_budget;
+-                    // Take, not `allows`: this is the one place a token is
+-                    // spent, and it is spent exactly when the spawn is
+-                    // decided. A budget of N therefore permits N restarts.
+-                    if !runtime.get_mut(idx).bucket.take(&budget, now_ms) {
+-                        // A take fails two ways: the bucket is empty, or the
+-                        // delay is still spacing attempts. Only the first is
+-                        // exhaustion worth reporting; a delay-gated retry is
+-                        // routine, and the next passes spend the token in
+-                        // silence.
+-                        if !runtime.get_mut(idx).bucket.exhausted(&budget, now_ms) {
+-                            continue;
+-                        }
+-                        if !tick.budget_exhausted.contains(&idx) {
+-                            tick.budget_exhausted.push(idx);
+-                            tick.actions.push(Action::BudgetExhausted(idx));
+-                            tick.actions.push(log_action(
+-                                idx,
+-                                LogLevel::Error,
+-                                "restart budget exhausted; not retrying (use `zctl kick` to reset)",
+-                            ));
+-                        }
+-                        continue;
+-                    }
+-                }
+-                tick.actions.push(Action::Spawn(idx));
+-            }
+-            State::Starting | State::Running | State::Stopping => {}
+-        }
+-    }
+-
+-    // ── Pass 2: stop, in exact reverse topological order ──────────────────
+-    //
+-    // Reversed so a service is always torn down before its dependencies.
+-    // Note this pass only *requests* the stop; the actual `SIGTERM` is issued
+-    // by the transition function when `Desired` flips, so a stop is not
+-    // duplicated here.
+-    for &idx in plan.order_down.iter() {
+-        let st = runtime.get(idx);
+-        if st.desired == Desired::Up || st.pinned {
+-            continue;
+-        }
+-        if matches!(st.state, State::Running | State::Starting)
+-            && plan.services[idx].kind.has_process()
+-        {
+-            runtime.get_mut(idx).desired = Desired::Down;
+-            tick.changed.push(idx);
+-        }
+-    }
+-
+-    tick
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Decide whether a service that has just died should be started again.
+ ///
+ /// Called from the transition function once a death is known and the state has
+ /// been set to `Stopped`. Kept separate from [`reconcile`] because it is the
+ /// one place where the *policy* question ("should it come back?") is asked,
+ /// as distinct from the *bookkeeping* question ("is it up?").

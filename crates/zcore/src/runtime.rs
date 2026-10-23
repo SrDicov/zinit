@@ -387,3 +387,18 @@ mod tests {
         assert!(sp2.kind.has_process());
     }
 }
+#[cfg(test)]
+mod mutation_guards {
+    use super::*;
+
+    /// `is_empty` answers "does this machine have services at all", and both
+    /// constants were survivable.
+    #[test]
+    fn empty_means_no_services_not_a_constant() {
+        let mut rt = Runtime::new();
+        assert!(rt.is_empty());
+        rt.services.push(ServiceState::new());
+        assert!(!rt.is_empty());
+        assert_eq!(rt.len(), 1);
+    }
+}

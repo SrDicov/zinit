@@ -1,0 +1,21 @@
+--- crates/zcore/src/transition.rs
++++ replace Transition::is_empty -> bool with true
+@@ -52,17 +52,17 @@
+     fn single(a: Action) -> Transition {
+         Transition {
+             actions: alloc::vec![a],
+             changed: false,
+         }
+     }
+ 
+     pub fn is_empty(&self) -> bool {
+-        self.actions.is_empty()
++        true /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Every action concerning one service.
+     pub fn for_service(&self, idx: Idx) -> impl Iterator<Item = &Action> {
+         self.actions.iter().filter(move |a| a.idx() == idx)
+     }
+ 
+     /// The signals issued for one service, in order.

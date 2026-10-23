@@ -1,0 +1,92 @@
+
+*** crates/zcore/src/runtime.rs:210:9: replace Runtime::get_mut -> &mut ServiceState with Box::leak(Box::new(Default::default()))
+
+*** mutation diff:
+--- crates/zcore/src/runtime.rs
++++ replace Runtime::get_mut -> &mut ServiceState with Box::leak(Box::new(Default::default()))
+@@ -202,17 +202,17 @@
+ 
+     pub fn is_empty(&self) -> bool {
+         self.services.is_empty()
+     }
+ 
+     /// Mutable access. Panics if `idx` is out of range, which is a core bug.
+     #[inline]
+     pub fn get_mut(&mut self, idx: Idx) -> &mut ServiceState {
+-        &mut self.services[idx]
++        Box::leak(Box::new(Default::default())) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Shared access. Panics if `idx` is out of range, which is a core bug.
+     #[inline]
+     pub fn get(&self, idx: Idx) -> &ServiceState {
+         &self.services[idx]
+     }
+ 
+
+
+*** /home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --package=zcore@0.1.0
+       Dirty zcore v0.1.0 (/tmp/cargo-mutants-zinit-ROLlrA.tmp/crates/zcore): the file `crates/zcore/src/runtime.rs` has changed (1792733694.358594687s, 1s after last build at 1792733693.968583724s)
+   Compiling zcore v0.1.0 (/tmp/cargo-mutants-zinit-ROLlrA.tmp/crates/zcore)
+     Running `/home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name zcore --edition=2024 crates/zcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::all' --forbid=unsafe_code --warn=unreachable_pub --warn=missing_debug_implementations --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=bcb77c82f94ade4a -C extra-filename=-8a442e3a11d1606f --out-dir /tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps`
+     Running `/home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name zcore --edition=2024 crates/zcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::all' --forbid=unsafe_code --warn=unreachable_pub --warn=missing_debug_implementations --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=4e9189675acb7d5d -C extra-filename=-310425ea34117922 --out-dir /tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps`
+error[E0433]: cannot find type `Box` in this scope
+   --> crates/zcore/src/runtime.rs:210:9
+    |
+210 |         Box::leak(Box::new(Default::default())) /* ~ changed by cargo-mutants ~ */
+    |         ^^^ use of undeclared type `Box`
+    |
+help: consider importing this struct
+    |
+  9 + use alloc::boxed::Box;
+    |
+
+error[E0433]: cannot find type `Box` in this scope
+   --> crates/zcore/src/runtime.rs:210:19
+    |
+210 |         Box::leak(Box::new(Default::default())) /* ~ changed by cargo-mutants ~ */
+    |                   ^^^ use of undeclared type `Box`
+    |
+help: consider importing this struct
+    |
+  9 + use alloc::boxed::Box;
+    |
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `zcore` (lib) due to 2 previous errors
+
+Caused by:
+  process didn't exit successfully: `/home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name zcore --edition=2024 crates/zcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::all' --forbid=unsafe_code --warn=unreachable_pub --warn=missing_debug_implementations --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=4e9189675acb7d5d -C extra-filename=-310425ea34117922 --out-dir /tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps` (exit status: 1)
+warning: build failed, waiting for other jobs to finish...
+error[E0433]: cannot find type `Box` in this scope
+   --> crates/zcore/src/runtime.rs:210:9
+    |
+210 |         Box::leak(Box::new(Default::default())) /* ~ changed by cargo-mutants ~ */
+    |         ^^^ use of undeclared type `Box`
+    |
+help: consider importing one of these structs
+    |
+  9 + use std::boxed::Box;
+    |
+  9 + use alloc::boxed::Box;
+    |
+
+error[E0433]: cannot find type `Box` in this scope
+   --> crates/zcore/src/runtime.rs:210:19
+    |
+210 |         Box::leak(Box::new(Default::default())) /* ~ changed by cargo-mutants ~ */
+    |                   ^^^ use of undeclared type `Box`
+    |
+help: consider importing one of these structs
+    |
+  9 + use std::boxed::Box;
+    |
+  9 + use alloc::boxed::Box;
+    |
+
+error: could not compile `zcore` (lib test) due to 2 previous errors
+
+Caused by:
+  process didn't exit successfully: `/home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name zcore --edition=2024 crates/zcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::all' --forbid=unsafe_code --warn=unreachable_pub --warn=missing_debug_implementations --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=bcb77c82f94ade4a -C extra-filename=-8a442e3a11d1606f --out-dir /tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps` (exit status: 1)
+
+*** result: Failure(101)

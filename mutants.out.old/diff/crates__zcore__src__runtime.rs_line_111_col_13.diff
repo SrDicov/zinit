@@ -1,0 +1,21 @@
+--- crates/zcore/src/runtime.rs
++++ delete field desired from struct ServiceState expression in ServiceState::wanted_up
+@@ -103,17 +103,17 @@
+             completed: false,
+             last_watchdog_ms: None,
+         }
+     }
+ 
+     /// A service that wants to be up and has never been started.
+     pub fn wanted_up() -> ServiceState {
+         ServiceState {
+-            desired: Desired::Up,
++             /* ~ changed by cargo-mutants ~ */
+             ..ServiceState::new()
+         }
+     }
+ 
+     /// True when the state/timer bookkeeping is self-consistent.
+     ///
+     /// Checked after every transition; a violation is always a core bug and
+     /// is surfaced rather than papered over.

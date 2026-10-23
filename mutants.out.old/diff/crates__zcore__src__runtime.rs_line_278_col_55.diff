@@ -1,0 +1,21 @@
+--- crates/zcore/src/runtime.rs
++++ replace && with || in Runtime::check_invariants
+@@ -270,17 +270,17 @@
+     pub fn check_invariants(&self, plan: &Plan) -> alloc::vec::Vec<Idx> {
+         plan.services
+             .iter()
+             .enumerate()
+             .filter(|(idx, sp)| {
+                 !self.services[*idx].invariants_hold(sp.ready.is_handshake(), sp.kind.has_process())
+                     // Completion is a oneshot-only fact. Anywhere else it
+                     // means the machine recorded a meaning the plan never gave.
+-                    || (self.services[*idx].completed && sp.kind != ServiceKind::Oneshot)
++                    || (self.services[*idx].completed || /* ~ changed by cargo-mutants ~ */ sp.kind != ServiceKind::Oneshot)
+             })
+             .map(|(idx, _)| idx)
+             .collect()
+     }
+ 
+     /// Sum of services currently considered up.
+     pub fn count_running(&self) -> usize {
+         self.services.iter().filter(|s| s.state.is_up()).count()

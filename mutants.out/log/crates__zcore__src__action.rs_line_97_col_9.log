@@ -1,0 +1,73 @@
+
+*** crates/zcore/src/action.rs:97:9: replace Action::idx -> Idx with Default::default()
+
+*** mutation diff:
+--- crates/zcore/src/action.rs
++++ replace Action::idx -> Idx with Default::default()
+@@ -89,31 +89,17 @@
+     /// Only ever emitted for a service whose `on-fatal` says `Reboot`,
+     /// for the same reason as `Halt`.
+     Reboot { idx: Idx },
+ }
+ 
+ impl Action {
+     /// The service this action concerns.
+     pub const fn idx(&self) -> Idx {
+-        match *self {
+-            Action::Spawn(i)
+-            | Action::MarkReady(i)
+-            | Action::MarkDown { idx: i, .. }
+-            | Action::DepsChanged(i)
+-            | Action::BudgetExhausted(i)
+-            | Action::GrantConsole(i)
+-            | Action::RevokeConsole(i)
+-            | Action::Unpin(i) => i,
+-            Action::Signal { idx, .. } => idx,
+-            Action::Log { idx, .. } => idx,
+-            Action::CascadeStop { idx, .. } => idx,
+-            Action::Halt { idx } => idx,
+-            Action::Reboot { idx } => idx,
+-        }
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ /// Convenience for building a log action without a `String` literal dance.
+ pub fn log(idx: Idx, level: LogLevel, message: impl Into<String>) -> Action {
+     Action::Log {
+         idx,
+         level,
+
+
+*** /home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --package=zcore@0.1.0
+       Dirty zcore v0.1.0 (/tmp/cargo-mutants-zinit-Gfevm2.tmp/crates/zcore): the file `crates/zcore/src/lib.rs` has changed (1792733812.022902188s, 1s after last build at 1792733811.583889847s)
+   Compiling zcore v0.1.0 (/tmp/cargo-mutants-zinit-Gfevm2.tmp/crates/zcore)
+     Running `/home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name zcore --edition=2024 crates/zcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::all' --forbid=unsafe_code --warn=unreachable_pub --warn=missing_debug_implementations --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=bcb77c82f94ade4a -C extra-filename=-8a442e3a11d1606f --out-dir /tmp/cargo-mutants-zinit-Gfevm2.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-zinit-Gfevm2.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-zinit-Gfevm2.tmp/target/debug/deps`
+     Running `/home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name zcore --edition=2024 crates/zcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::all' --forbid=unsafe_code --warn=unreachable_pub --warn=missing_debug_implementations --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=4e9189675acb7d5d -C extra-filename=-310425ea34117922 --out-dir /tmp/cargo-mutants-zinit-Gfevm2.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-zinit-Gfevm2.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-zinit-Gfevm2.tmp/target/debug/deps`
+error[E0658]: cannot call conditionally-const associated function `<usize as Default>::default` in constant functions
+  --> crates/zcore/src/action.rs:97:9
+   |
+97 |         Default::default() /* ~ changed by cargo-mutants ~ */
+   |         ^^^^^^^^^^^^^^^^^^
+   |
+   = note: calls in constant functions are limited to constant functions, tuple structs and tuple variants
+   = note: see issue #143874 <https://github.com/rust-lang/rust/issues/143874> for more information
+
+error: `Default` is not yet stable as a const trait
+  --> crates/zcore/src/action.rs:97:9
+   |
+97 |         Default::default() /* ~ changed by cargo-mutants ~ */
+   |         ^^^^^^^^^^^^^^^^^^
+
+For more information about this error, try `rustc --explain E0658`.
+error: could not compile `zcore` (lib) due to 2 previous errors
+
+Caused by:
+  process didn't exit successfully: `/home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name zcore --edition=2024 crates/zcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::all' --forbid=unsafe_code --warn=unreachable_pub --warn=missing_debug_implementations --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=4e9189675acb7d5d -C extra-filename=-310425ea34117922 --out-dir /tmp/cargo-mutants-zinit-Gfevm2.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-zinit-Gfevm2.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-zinit-Gfevm2.tmp/target/debug/deps` (exit status: 1)
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `zcore` (lib test) due to 2 previous errors
+
+Caused by:
+  process didn't exit successfully: `/home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name zcore --edition=2024 crates/zcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::all' --forbid=unsafe_code --warn=unreachable_pub --warn=missing_debug_implementations --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=bcb77c82f94ade4a -C extra-filename=-8a442e3a11d1606f --out-dir /tmp/cargo-mutants-zinit-Gfevm2.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-zinit-Gfevm2.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-zinit-Gfevm2.tmp/target/debug/deps` (exit status: 1)
+
+*** result: Failure(101)

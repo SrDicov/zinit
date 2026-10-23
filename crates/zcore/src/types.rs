@@ -785,3 +785,41 @@ mod tests {
         assert!(Restart::Always.wants_restart(Some(0)));
     }
 }
+#[cfg(test)]
+mod mutation_guards {
+    use super::*;
+
+    /// `cargo mutants` replaced every one of these with `""`, `"xyzzy"`,
+    /// `true` or `false` and the whole suite stayed green: the strings the
+    /// state dump and the diagnostics are made of were never checked for
+    /// content, only for being present.
+    #[test]
+    fn every_name_and_predicate_says_something_specific() {
+        assert!(Desired::Up.is_up());
+        assert!(!Desired::Down.is_up());
+
+        for (kind, name) in [
+            (ServiceKind::Process, "process"),
+            (ServiceKind::Script, "script"),
+            (ServiceKind::Target, "target"),
+            (ServiceKind::Console, "console"),
+            (ServiceKind::Oneshot, "oneshot"),
+            (ServiceKind::Forking, "forking"),
+        ] {
+            assert_eq!(kind.name(), name);
+        }
+
+        assert!(!Ready::None.is_handshake());
+        assert!(Ready::Notify.is_handshake());
+        assert!(Ready::Strict(StrictReady::Notify).is_handshake());
+
+        assert_eq!(Ready::None.describe(), "none");
+        assert_eq!(Ready::Notify.describe(), "notify");
+        assert_eq!(Ready::Strict(StrictReady::Notify).describe(), "notify");
+        assert_eq!(
+            Ready::Strict(StrictReady::Notify).protocol(),
+            Some(StrictReady::Notify)
+        );
+        assert!(Ready::None.protocol().is_none());
+    }
+}

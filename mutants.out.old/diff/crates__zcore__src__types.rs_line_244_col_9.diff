@@ -1,0 +1,24 @@
+--- crates/zcore/src/types.rs
++++ replace Ready::is_handshake -> bool with true
+@@ -236,20 +236,17 @@
+ impl Ready {
+     /// True when this variant has a readiness protocol at all, and therefore
+     /// needs a `ready_due_at` deadline armed on the service.
+     ///
+     /// `Ready::Strict(_)` is included: a strict variant still waits, it merely
+     /// treats expiry as failure instead of success. Leaving it out here is
+     /// what previously made strict readiness a no-op.
+     pub const fn is_handshake(&self) -> bool {
+-        matches!(
+-            self,
+-            Ready::Notify | Ready::Ping(_) | Ready::Tcp(_) | Ready::Strict(_)
+-        )
++        true /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// True when expiry is a failure rather than a pass.
+     pub const fn is_strict(&self) -> bool {
+         matches!(self, Ready::Strict(_))
+     }
+ 
+     pub const fn describe(&self) -> &'static str {

@@ -1,0 +1,21 @@
+--- crates/zcore/src/runtime.rs
++++ replace || with && in Runtime::deps_satisfied
+@@ -226,17 +226,17 @@
+     /// True when every required dependency of `idx` is satisfied: `Running`,
+     /// or a completed oneshot. A oneshot that ran clean has no process by
+     /// design; requiring it to be `Running` would make every dependent wait
+     /// for a process that is never coming back.
+     #[inline]
+     pub fn deps_satisfied(&self, idx: Idx, plan: &Plan) -> bool {
+         plan.services[idx].required.iter().all(|&d| {
+             self.services[d].state.is_up()
+-                || (plan.services[d].kind == ServiceKind::Oneshot && self.services[d].completed)
++                && /* ~ changed by cargo-mutants ~ */ (plan.services[d].kind == ServiceKind::Oneshot && self.services[d].completed)
+         })
+     }
+ 
+     /// Order-only gate: every `after` edge must have been *attempted*.
+     ///
+     /// Weaker than up, stronger than forked: a started daemon releases
+     /// (its effects unfold over its lifetime, as under dinit), while a
+     /// started *oneshot* does not — its effects land at completion, and

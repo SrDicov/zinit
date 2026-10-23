@@ -1,0 +1,21 @@
+--- crates/zcore/src/reconcile.rs
++++ replace && with || in Tick::is_empty
+@@ -34,17 +34,17 @@
+     /// Services that hit an empty restart budget this pass.
+     pub budget_exhausted: Vec<Idx>,
+     /// Services whose state changed during this pass.
+     pub changed: Vec<Idx>,
+ }
+ 
+ impl Tick {
+     pub fn is_empty(&self) -> bool {
+-        self.actions.is_empty() && self.budget_exhausted.is_empty() && self.changed.is_empty()
++        self.actions.is_empty() || /* ~ changed by cargo-mutants ~ */ self.budget_exhausted.is_empty() && self.changed.is_empty()
+     }
+ }
+ 
+ /// Compute the actions that move `runtime` one step closer to its desired
+ /// state, as of `now_ms` (monotonic milliseconds).
+ ///
+ /// Pure: no clocks, no I/O, no globals. Calling it twice with the same
+ /// arguments and the same runtime yields the same output, which is what makes

@@ -1,0 +1,21 @@
+--- crates/zcore/src/transition.rs
++++ delete ! in apply
+@@ -325,17 +325,17 @@
+             if !matches!(runtime.state_at(idx), State::Running | State::Starting) {
+                 return Transition::quiet();
+             }
+             runtime.get_mut(idx).last_watchdog_ms = Some(now_ms);
+             Transition::quiet()
+         }
+ 
+         Event::WatchdogExpired(_) => {
+-            if !matches!(runtime.state_at(idx), State::Running | State::Starting) {
++            if  /* ~ changed by cargo-mutants ~ */matches!(runtime.state_at(idx), State::Running | State::Starting) {
+                 return Transition::quiet();
+             }
+             // A hung service is stopped and — `Desired` untouched — started
+             // again: the same shape as a start timeout (TERM now, the stop
+             // timeout below escalates to KILL, the reconciler respawns), with
+             // its own log line so the reason is never ambiguous.
+             let mut actions = alloc::vec![
+                 log(idx, LogLevel::Error, "watchdog expired; stopping"),

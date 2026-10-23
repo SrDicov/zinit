@@ -1,0 +1,41 @@
+--- crates/zcore/src/transition.rs
++++ replace become_running -> Transition with Default::default()
+@@ -364,37 +364,17 @@
+             LogLevel::Warn,
+             alloc::format!("i/o error while managing service: errno {errno}"),
+         )),
+     }
+ }
+ 
+ /// `Starting` -> `Running`, or ignore if not starting.
+ fn become_running(runtime: &mut Runtime, idx: Idx, now_ms: u64) -> Transition {
+-    if runtime.state_at(idx) != State::Starting {
+-        return Transition::quiet();
+-    }
+-    {
+-        let s = runtime.get_mut(idx);
+-        s.state = State::Running;
+-        s.ready_due_at = None;
+-        s.start_due_at = None;
+-        s.failed_starts = 0;
+-    }
+-    // `started_at` stays where the spawn set it: uptime should measure the
+-    // process, not the handshake.
+-    let _ = now_ms;
+-    let mut actions = alloc::vec![Action::MarkReady(idx), Action::DepsChanged(idx)];
+-    if runtime.get(idx).is_console {
+-        actions.push(Action::GrantConsole(idx));
+-    }
+-    Transition {
+-        actions,
+-        changed: true,
+-    }
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Common death handling: record, decide, and emit the teardown actions.
+ fn handle_death(
+     runtime: &mut Runtime,
+     plan: &Plan,
+     idx: Idx,
+     code: Option<i32>,

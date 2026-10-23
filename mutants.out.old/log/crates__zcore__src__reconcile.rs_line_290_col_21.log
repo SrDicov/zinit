@@ -1,0 +1,49 @@
+
+*** crates/zcore/src/reconcile.rs:290:21: replace && with || in due_events
+
+*** mutation diff:
+--- crates/zcore/src/reconcile.rs
++++ replace && with || in due_events
+@@ -282,17 +282,17 @@
+                 if let Some(due) = st.start_due_at
+                     && now_ms >= due
+                 {
+                     out.push(crate::Event::StartTimeout(idx));
+                 }
+             }
+             State::Stopping => {
+                 if let Some(due) = st.stop_due_at
+-                    && now_ms >= due
++                    || /* ~ changed by cargo-mutants ~ */ now_ms >= due
+                 {
+                     out.push(crate::Event::StopTimeout(idx));
+                 }
+             }
+             _ => {}
+         }
+     }
+     out
+
+
+*** /home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo test --no-run --verbose --package=zcore@0.1.0
+       Dirty zcore v0.1.0 (/tmp/cargo-mutants-zinit-ROLlrA.tmp/crates/zcore): the file `crates/zcore/src/reconcile.rs` has changed (1792733682.620264726s, 340009557ns after last build at 1792733682.280255169s)
+   Compiling zcore v0.1.0 (/tmp/cargo-mutants-zinit-ROLlrA.tmp/crates/zcore)
+     Running `/home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name zcore --edition=2024 crates/zcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::all' --forbid=unsafe_code --warn=unreachable_pub --warn=missing_debug_implementations --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=4e9189675acb7d5d -C extra-filename=-310425ea34117922 --out-dir /tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps`
+     Running `/home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name zcore --edition=2024 crates/zcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::all' --forbid=unsafe_code --warn=unreachable_pub --warn=missing_debug_implementations --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=bcb77c82f94ade4a -C extra-filename=-8a442e3a11d1606f --out-dir /tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps`
+error: `||` operators are not supported in let chain conditions
+   --> crates/zcore/src/reconcile.rs:290:21
+    |
+290 |                     || /* ~ changed by cargo-mutants ~ */ now_ms >= due
+    |                     ^^
+
+error: could not compile `zcore` (lib) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name zcore --edition=2024 crates/zcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::all' --forbid=unsafe_code --warn=unreachable_pub --warn=missing_debug_implementations --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=4e9189675acb7d5d -C extra-filename=-310425ea34117922 --out-dir /tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps` (exit status: 1)
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `zcore` (lib test) due to 1 previous error
+
+Caused by:
+  process didn't exit successfully: `/home/dicov/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name zcore --edition=2024 crates/zcore/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 '--warn=clippy::all' --forbid=unsafe_code --warn=unreachable_pub --warn=missing_debug_implementations --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=bcb77c82f94ade4a -C extra-filename=-8a442e3a11d1606f --out-dir /tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps -C incremental=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/incremental -L dependency=/tmp/cargo-mutants-zinit-ROLlrA.tmp/target/debug/deps` (exit status: 1)
+
+*** result: Failure(101)

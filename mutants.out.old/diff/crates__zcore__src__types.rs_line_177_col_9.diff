@@ -1,0 +1,32 @@
+--- crates/zcore/src/types.rs
++++ replace Restart::wants_restart -> bool with true
+@@ -169,28 +169,17 @@
+     OnFailure,
+     /// Restart on any exit.
+     Always,
+ }
+ 
+ impl Restart {
+     /// Decide whether a given death warrants a restart.
+     pub const fn wants_restart(self, code: Option<i32>) -> bool {
+-        match self {
+-            Restart::Never => false,
+-            Restart::Always => true,
+-            // `None` means "killed by signal" - always a failure.
+-            // SIGKILL/SIGTERM after our own stop request is handled by the
+-            // Desired check, not here.
+-            Restart::OnFailure => match code {
+-                None => true,
+-                Some(0) => false,
+-                Some(_) => true,
+-            },
+-        }
++        true /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ /// What a terminal service failure means for the machine.
+ ///
+ /// Decided by the operator per service (`on-fatal`), defaulting to `Warn`:
+ /// dinit tolerates a dead service and boots the rest, so zinit does too —
+ /// never halt or reboot the machine over a failure nobody marked as

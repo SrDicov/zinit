@@ -1,0 +1,21 @@
+--- crates/zcore/src/reconcile.rs
++++ replace != with == in reconcile
+@@ -58,17 +58,17 @@
+     // unreachable by the convert closure) becomes wanted-up exactly when
+     // a service that really pulls it is actually running — mirrors dinit's
+     // activation propagation instead of only the static plan. Only services
+     // that were disabled at *load* participate (operator-stopped services
+     // keep `enabled = true`, so `zctl stop` is never overridden by a
+     // future dependent going up). `ponytail:` racy rescan is O(services*
+     // edges) per tick; promote to a dirty flag when a reload adds an edge.
+     for i in 0..runtime.len() {
+-        if runtime.get(i).desired != Desired::Up {
++        if runtime.get(i).desired == /* ~ changed by cargo-mutants ~ */ Desired::Up {
+             continue;
+         }
+         // No state gate on the dependent: a service that is wanted up but
+         // blocked behind a disabled dep must be allowed to pull that dep
+         // even while still Stopped. Otherwise the enable never fires (the
+         // trigger can only pull; it may not spawn), and the disabled service
+         // stays down forever — exactly the Artix agetty chain.
+         for &d in &plan.services[i].required {

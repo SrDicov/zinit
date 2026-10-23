@@ -1,0 +1,26 @@
+--- crates/zcore/src/types.rs
++++ replace Ready::describe -> &'static str with "xyzzy"
+@@ -248,22 +248,17 @@
+     }
+ 
+     /// True when expiry is a failure rather than a pass.
+     pub const fn is_strict(&self) -> bool {
+         matches!(self, Ready::Strict(_))
+     }
+ 
+     pub const fn describe(&self) -> &'static str {
+-        match self {
+-            Ready::None => "none",
+-            Ready::Notify | Ready::Strict(StrictReady::Notify) => "notify",
+-            Ready::Ping(_) | Ready::Strict(StrictReady::Ping(_)) => "ping",
+-            Ready::Tcp(_) | Ready::Strict(StrictReady::Tcp(_)) => "tcp",
+-        }
++        "xyzzy" /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// The handshake payload, ignoring strictness. Owned, so the three
+     /// unit-like cases do not need a `'static` promotion that would leak a
+     /// temporary to the caller.
+     pub fn protocol(&self) -> Option<StrictReady> {
+         match self {
+             Ready::Strict(s) => Some(s.clone()),

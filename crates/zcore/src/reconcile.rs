@@ -652,3 +652,20 @@ mod tests {
         assert!(t.changed.contains(&0), "stop pass should mark the change");
     }
 }
+#[cfg(test)]
+mod mutation_guards {
+    use super::*;
+
+    /// A pass that changed something is not an empty pass, and the three
+    /// vectors are consulted independently.
+    #[test]
+    fn a_tick_is_empty_only_when_all_three_lists_are() {
+        let mut t = Tick::default();
+        assert!(t.is_empty());
+        t.changed.push(1);
+        assert!(!t.is_empty(), "a changed service is not an empty pass");
+        let mut t = Tick::default();
+        t.budget_exhausted.push(2);
+        assert!(!t.is_empty(), "an exhausted budget is not an empty pass");
+    }
+}

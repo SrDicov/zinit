@@ -1,0 +1,21 @@
+--- crates/zcore/src/transition.rs
++++ replace != with == in apply
+@@ -296,17 +296,17 @@
+ 
+         // ── Adoption (forking daemons) ─────────────────────────────────────
+         Event::AdoptedPid { pid, .. } => {
+             // Only a `Starting` forking service can adopt: anything else is a
+             // late or confused report, ignored like any other.
+             if runtime.state_at(idx) != State::Starting {
+                 return Transition::quiet();
+             }
+-            if sp.kind != ServiceKind::Forking {
++            if sp.kind == /* ~ changed by cargo-mutants ~ */ ServiceKind::Forking {
+                 return Transition::quiet();
+             }
+             {
+                 let s = runtime.get_mut(idx);
+                 s.pid = Some(pid);
+                 s.pgid = Some(pid);
+             }
+             // No signal, no log: the daemon is simply being watched from here

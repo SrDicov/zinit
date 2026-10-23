@@ -1,0 +1,40 @@
+--- crates/zcore/src/reconcile.rs
++++ delete match arm State::Starting in due_events
+@@ -260,36 +260,17 @@
+                 && now_ms.saturating_sub(st.last_watchdog_ms.or(st.started_at).unwrap_or(now_ms))
+                     >= window_ms
+             {
+                 out.push(crate::Event::WatchdogExpired(idx));
+                 continue;
+             }
+         }
+         match st.state {
+-            State::Starting => {
+-                // Ready deadline first: a service that became ready and then
+-                // blew its start deadline should not be reported twice.
+-                if let Some(due) = st.ready_due_at
+-                    && now_ms >= due
+-                {
+-                    if sp.ready.is_strict() {
+-                        out.push(crate::Event::ReadyTimeout(idx));
+-                    } else {
+-                        // Non-strict: expiry means "up anyway", with a warning.
+-                        out.push(crate::Event::Ready(idx));
+-                    }
+-                    continue;
+-                }
+-                if let Some(due) = st.start_due_at
+-                    && now_ms >= due
+-                {
+-                    out.push(crate::Event::StartTimeout(idx));
+-                }
+-            }
++             /* ~ changed by cargo-mutants ~ */
+             State::Stopping => {
+                 if let Some(due) = st.stop_due_at
+                     && now_ms >= due
+                 {
+                     out.push(crate::Event::StopTimeout(idx));
+                 }
+             }
+             _ => {}

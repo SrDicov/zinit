@@ -1,0 +1,25 @@
+--- crates/zcore/src/event.rs
++++ replace Event::exit_code -> Option<i32> with Some(-1)
+@@ -156,21 +156,17 @@
+         )
+     }
+ 
+     /// The exit code implied by this event, if it is a death.
+     ///
+     /// `None` means "killed by a signal", which [`Restart::wants_restart`](crate::Restart::wants_restart)
+     /// treats as a failure.
+     pub const fn exit_code(&self) -> Option<i32> {
+-        match *self {
+-            Event::Exited { code, .. } => Some(code),
+-            Event::Signalled { .. } | Event::OrphanReaped(_) => None,
+-            _ => None,
+-        }
++        Some(-1) /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ impl core::fmt::Display for Event {
+     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+         write!(f, "{}", self.name())
+     }
+ }

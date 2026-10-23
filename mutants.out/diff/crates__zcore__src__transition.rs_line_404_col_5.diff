@@ -1,0 +1,166 @@
+--- crates/zcore/src/transition.rs
++++ replace handle_death -> Transition with Default::default()
+@@ -396,162 +396,17 @@
+ fn handle_death(
+     runtime: &mut Runtime,
+     plan: &Plan,
+     idx: Idx,
+     code: Option<i32>,
+     _now_ms: u64,
+     signal: Option<i32>,
+ ) -> Transition {
+-    let was_stopping = runtime.state_at(idx) == State::Stopping;
+-    if !runtime.state_at(idx).has_process() {
+-        // A death for a service we believe is not running: a duplicate or late
+-        // event. Ignore it.
+-        return Transition::quiet();
+-    }
+-    let sp = &plan.services[idx];
+-
+-    let description = match (code, signal) {
+-        (Some(c), _) => alloc::format!("exited with status {c}"),
+-        (None, Some(s)) => alloc::format!("killed by signal {s}"),
+-        (None, None) => String::from("exited"),
+-    };
+-
+-    let mut actions = Vec::new();
+-
+-    {
+-        let s = runtime.get_mut(idx);
+-        s.state = State::Stopped;
+-        s.pid = None;
+-        s.pgid = None;
+-        s.started_at = None;
+-        s.term_sent_at = None;
+-        s.ready_due_at = None;
+-        s.start_due_at = None;
+-        s.stop_due_at = None;
+-        s.last_exit = code;
+-        if s.is_console {
+-            s.is_console = false;
+-            actions.push(Action::RevokeConsole(idx));
+-        }
+-    }
+-
+-    // A oneshot that exited cleanly is done — not crashed, not stopped, done.
+-    // Completion beats the restart policy by design: the policy governs
+-    // failures, and a clean oneshot exit is not one. `Desired` stays `Up` so
+-    // status tells the truth (wanted, finished, quiet); the reconciler will
+-    // not start it again until `kick` or an explicit `start` re-arms it; and
+-    // dependents treat it as satisfied through `deps_satisfied`.
+-    //
+-    // Recorded whether or not the death was requested: a oneshot that ran to
+-    // the end did so even if an operator asked it to stop halfway. The
+-    // stopping path below still applies (a requested stop stays a clean
+-    // stop), it just also remembers the work got done.
+-    if sp.kind == ServiceKind::Oneshot && code == Some(0) {
+-        let s = runtime.get_mut(idx);
+-        s.completed = true;
+-        s.failed_starts = 0;
+-    }
+-
+-    if was_stopping {
+-        // We asked for this. Not a failure; do not log at error, do not restart.
+-        actions.push(Action::MarkDown {
+-            idx,
+-            unexpected: false,
+-        });
+-        actions.push(Action::DepsChanged(idx));
+-        return Transition {
+-            actions,
+-            changed: true,
+-        };
+-    }
+-
+-    if sp.kind == ServiceKind::Oneshot && code == Some(0) {
+-        // Recorded above; reported here. A clean finish is information, not
+-        // failure: info level, a clean `MarkDown`, and no budget touched.
+-        actions.push(log(idx, LogLevel::Info, "completed"));
+-        actions.push(Action::MarkDown {
+-            idx,
+-            unexpected: false,
+-        });
+-        actions.push(Action::DepsChanged(idx));
+-        return Transition {
+-            actions,
+-            changed: true,
+-        };
+-    }
+-
+-    let restarting = should_restart(runtime, plan, idx, code);
+-    if restarting {
+-        actions.push(log(
+-            idx,
+-            LogLevel::Warn,
+-            alloc::format!("{}; restarting", description),
+-        ));
+-        {
+-            let s = runtime.get_mut(idx);
+-            s.restarts = s.restarts.saturating_add(1);
+-            s.failed_starts = s.failed_starts.saturating_add(1);
+-            s.restart_suppressed = false;
+-        }
+-        // The budget token is consumed by the *reconciler*, at the moment it
+-        // actually emits the spawn. Consuming it here as well would count
+-        // every crash twice, and a budget of 1 would permit zero restarts.
+-        // It still terminates a failing-to-start loop: spawn -> SpawnFailed ->
+-        // death -> reconcile -> one more token spent, until it is empty.
+-    } else {
+-        // Not restarting. `Desired` is deliberately left as the operator set
+-        // it, so `zctl status` reports the truth - wanted up, not running -
+-        // rather than quietly rewriting intent. The reconciler is told to
+-        // leave it alone via this flag, which only an operator clears.
+-        // What the failure means for the machine is the operator's call
+-        // (`on-fatal`, default `Warn`): an unmarked failure holds one
+-        // service, never the boot.
+-        runtime.get_mut(idx).restart_suppressed = true;
+-        match sp.on_fatal {
+-            OnFatal::Ignore => {
+-                actions.push(log(idx, LogLevel::Info, description));
+-            }
+-            OnFatal::Warn => {
+-                let (level, hint) = if sp.restart == Restart::Never {
+-                    (LogLevel::Warn, "; restart is disabled for this service")
+-                } else {
+-                    (LogLevel::Info, "; it will not be retried (use `zctl kick`)")
+-                };
+-                actions.push(log(idx, level, alloc::format!("{description}{hint}")));
+-            }
+-            OnFatal::Halt => {
+-                actions.push(log(
+-                    idx,
+-                    LogLevel::Warn,
+-                    alloc::format!("{description}; on-fatal = halt"),
+-                ));
+-                actions.push(Action::Halt { idx });
+-            }
+-            OnFatal::Reboot => {
+-                actions.push(log(
+-                    idx,
+-                    LogLevel::Warn,
+-                    alloc::format!("{description}; on-fatal = reboot"),
+-                ));
+-                actions.push(Action::Reboot { idx });
+-            }
+-        }
+-    }
+-
+-    actions.push(Action::MarkDown {
+-        idx,
+-        unexpected: true,
+-    });
+-    actions.push(Action::DepsChanged(idx));
+-
+-    Transition {
+-        actions,
+-        changed: true,
+-    }
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// Build a `MarkDown` action and mark the service stopped.
+ ///
+ /// Used by the `SpawnFailed` path, where the process never existed so there is
+ /// no prior state to unwind.
+ fn mark_down(runtime: &mut Runtime, idx: Idx, now_ms: u64, unexpected: bool) -> Action {
+     let s: &mut ServiceState = runtime.get_mut(idx);

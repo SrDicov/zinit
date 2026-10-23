@@ -1,0 +1,21 @@
+--- crates/zcore/src/reconcile.rs
++++ replace != with == in reconcile
+@@ -103,17 +103,17 @@
+         // dependencies are. No spawn, no budget, no readiness. A dangling
+         // required edge holds the target like any unmet requirement, loudly
+         // at load and quietly here — never the boot.
+         if !sp.kind.has_process() {
+             let deps_ok = runtime.deps_satisfied(idx, plan)
+                 && runtime.after_satisfied(idx, plan)
+                 && sp.missing_required.is_empty();
+             let cur = runtime.get(idx).state;
+-            if deps_ok && cur != State::Running {
++            if deps_ok && cur == /* ~ changed by cargo-mutants ~ */ State::Running {
+                 runtime.get_mut(idx).state = State::Running;
+                 runtime.get_mut(idx).pid = None;
+                 runtime.get_mut(idx).started_at = Some(now_ms);
+                 tick.actions.push(Action::MarkReady(idx));
+                 tick.actions.push(Action::DepsChanged(idx));
+                 tick.changed.push(idx);
+             } else if !deps_ok && cur == State::Running {
+                 runtime.get_mut(idx).state = State::Stopped;

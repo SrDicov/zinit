@@ -1,0 +1,21 @@
+--- crates/zcore/src/types.rs
++++ replace > with >= in Bucket::refill
+@@ -488,17 +488,17 @@
+         }
+         // Tokens earned, in whole tokens: a 3-per-60s budget earns one token
+         // every 20 s, and nothing at all in the first 19 999 ms. No scaling
+         // factor: `capacity * elapsed / window` is already in tokens, and an
+         // extra `* 1_000` here once refilled 1000x too fast — a crash loop
+         // the budget was built to stop sailed straight through it, caught
+         // only by a real machine (a fixed-clock unit test never refills).
+         let gained = (budget.capacity as u128 * elapsed as u128) / budget.window_ms as u128;
+-        if gained > 0 {
++        if gained >= /* ~ changed by cargo-mutants ~ */ 0 {
+             self.tokens = self
+                 .tokens
+                 .saturating_add(gained.min(u32::MAX as u128) as u32)
+                 .min(budget.capacity);
+             self.last_refill_ms = now_ms;
+         }
+     }
+ 

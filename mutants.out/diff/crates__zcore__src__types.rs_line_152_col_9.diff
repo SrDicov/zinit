@@ -1,0 +1,28 @@
+--- crates/zcore/src/types.rs
++++ replace ServiceKind::has_process -> bool with true
+@@ -144,24 +144,17 @@
+             ServiceKind::Console => "console",
+             ServiceKind::Oneshot => "oneshot",
+             ServiceKind::Forking => "forking",
+         }
+     }
+ 
+     /// Targets never fork, so readiness and restart policy are meaningless.
+     pub const fn has_process(self) -> bool {
+-        matches!(
+-            self,
+-            ServiceKind::Process
+-                | ServiceKind::Script
+-                | ServiceKind::Console
+-                | ServiceKind::Oneshot
+-                | ServiceKind::Forking
+-        )
++        true /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
+ pub enum Restart {
+     /// Never restart. A crash stays a crash until the operator intervenes.
+     Never,
+     /// Restart only on a non-zero exit or a fatal signal.

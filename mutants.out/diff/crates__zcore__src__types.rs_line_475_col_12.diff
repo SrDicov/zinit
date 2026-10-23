@@ -1,0 +1,21 @@
+--- crates/zcore/src/types.rs
++++ delete ! in Bucket::refill
+@@ -467,17 +467,17 @@
+             return true;
+         }
+         self.refill(budget, now_ms);
+         self.tokens == 0
+     }
+ 
+     /// Refill to at most `capacity`, proportional to elapsed time.
+     fn refill(&mut self, budget: &Budget, now_ms: u64) {
+-        if !self.started {
++        if  /* ~ changed by cargo-mutants ~ */self.started {
+             // First touch: the bucket starts full, and the delay does not
+             // apply because `last_take_ms` is `None`.
+             self.started = true;
+             self.tokens = budget.capacity;
+             self.last_refill_ms = now_ms;
+             return;
+         }
+         // Monotonic clock: a backwards jump yields zero elapsed, never a

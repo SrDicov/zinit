@@ -1,0 +1,21 @@
+--- crates/zcore/src/reconcile.rs
++++ delete ! in reconcile
+@@ -170,17 +170,17 @@
+                         // A take fails two ways: the bucket is empty, or the
+                         // delay is still spacing attempts. Only the first is
+                         // exhaustion worth reporting; a delay-gated retry is
+                         // routine, and the next passes spend the token in
+                         // silence.
+                         if !runtime.get_mut(idx).bucket.exhausted(&budget, now_ms) {
+                             continue;
+                         }
+-                        if !tick.budget_exhausted.contains(&idx) {
++                        if  /* ~ changed by cargo-mutants ~ */tick.budget_exhausted.contains(&idx) {
+                             tick.budget_exhausted.push(idx);
+                             tick.actions.push(Action::BudgetExhausted(idx));
+                             tick.actions.push(log_action(
+                                 idx,
+                                 LogLevel::Error,
+                                 "restart budget exhausted; not retrying (use `zctl kick` to reset)",
+                             ));
+                         }

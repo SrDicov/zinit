@@ -1,0 +1,21 @@
+--- crates/zcore/src/reconcile.rs
++++ delete ! in reconcile
+@@ -132,17 +132,17 @@
+         match runtime.get(idx).state {
+             State::Stopped => {
+                 // Should this service be running at all right now?
+                 if !runtime.deps_satisfied(idx, plan) {
+                     continue;
+                 }
+                 // Order-only edges: wait for the first attempt, never for
+                 // success. See `after_satisfied` for the release rule.
+-                if !runtime.after_satisfied(idx, plan) {
++                if  /* ~ changed by cargo-mutants ~ */runtime.after_satisfied(idx, plan) {
+                     continue;
+                 }
+                 // Dangling required edges: hold, never spawn into the void.
+                 if !sp.missing_required.is_empty() {
+                     continue;
+                 }
+                 // A death the policy refused to retry. `Desired` is still
+                 // `Up` - the operator still wants it - but the reconciler

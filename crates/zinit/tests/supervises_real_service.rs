@@ -1928,3 +1928,71 @@ fn a_reload_does_not_repeat_warnings_it_already_announced() {
     );
     assert!(sup.exited().is_none(), "the supervisor died");
 }
+
+/// `private-tmp` is a mount-namespace promise, and the promise is about every
+/// world-writable scratch directory, not just `/tmp`.
+///
+/// The comparison is the point: the same command runs twice, once with
+/// `private-tmp = yes` and once without, and the host looks for both markers.
+/// If the control's marker is missing the test proves nothing (the service
+/// never ran); if the private one's is present, the mount did not happen.
+///
+/// Root only: `unshare(CLONE_NEWNS)` needs `CAP_SYS_ADMIN`, and the spawn is
+/// refused without it (fail-closed), so a non-root run would be testing the
+/// refusal rather than the isolation.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_private_tmp_covers_the_scratch_directories() {
+    let _one = serial();
+    let scratch = Scratch::new("privtmp");
+    if unsafe { libc::geteuid() } != 0 {
+        let _ = std::fs::write(scratch.at("skipped"), "needs root\n");
+        return;
+    }
+    let tag = format!("zinit-priv-{}", std::process::id());
+    let marker = format!("/tmp/{tag}");
+    let control_marker = format!("/tmp/{tag}-control");
+    // Each instance writes its own marker into all three directories, so a
+    // single shared directory is enough to fail the test.
+    let probe = |name: &str| {
+        format!(
+            "/bin/sh -c 'for d in /tmp /var/tmp /dev/shm; do [ -d $d ] && echo x > $d/{tag}-{name}; done; \
+             echo ok > {}'",
+            scratch.at(&format!("{name}.done"))
+        )
+    };
+    scratch.conf(
+        "private.conf",
+        &desc(&probe("private"), "private-tmp = yes\n"),
+    );
+    scratch.conf("plain.conf", &desc(&probe("plain"), ""));
+    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&control_marker);
+
+    let _sup = Sup::start(&scratch);
+    assert!(
+        wait_until(START_DEADLINE_MS, || scratch.read("private.done").is_some()
+            && scratch.read("plain.done").is_some()),
+        "both services must have run: private={:?} plain={:?}\n{}",
+        scratch.read("private.done"),
+        scratch.read("plain.done"),
+        scratch.tail("sup.log")
+    );
+
+    // The control proves the probe would leave a marker in a shared
+    // directory, so a missing one below means isolation rather than a typo.
+    assert!(
+        std::path::Path::new(&control_marker).exists(),
+        "the unconfined service must leave its marker: the probe is broken"
+    );
+    for dir in ["/tmp", "/var/tmp", "/dev/shm"] {
+        let leaked = format!("{dir}/{tag}-private");
+        assert!(
+            !std::path::Path::new(&leaked).exists(),
+            "private-tmp leaked into {dir}"
+        );
+        let _ = std::fs::remove_file(format!("{dir}/{tag}-control"));
+    }
+    let _ = std::fs::remove_file(&control_marker);
+    let _ = std::fs::remove_file(&marker);
+}

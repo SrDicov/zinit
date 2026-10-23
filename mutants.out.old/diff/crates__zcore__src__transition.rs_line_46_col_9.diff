@@ -1,0 +1,24 @@
+--- crates/zcore/src/transition.rs
++++ replace Transition::quiet -> Transition with Default::default()
+@@ -38,20 +38,17 @@
+     /// Actions the runtime must perform, in order.
+     pub actions: Vec<Action>,
+     /// Set when the service's state actually changed.
+     pub changed: bool,
+ }
+ 
+ impl Transition {
+     fn quiet() -> Transition {
+-        Transition {
+-            actions: Vec::new(),
+-            changed: false,
+-        }
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn single(a: Action) -> Transition {
+         Transition {
+             actions: alloc::vec![a],
+             changed: false,
+         }
+     }

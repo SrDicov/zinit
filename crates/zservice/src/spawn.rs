@@ -1244,19 +1244,31 @@ fn child_step_mount(private_tmp: bool) -> bool {
             )
         };
         let tmpfs = (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong;
-        // SAFETY: static literals, NUL-terminated by construction; `mount`
-        // copies what it needs and retains nothing.
-        if unsafe {
-            libc::mount(
-                c"tmpfs".as_ptr(),
-                c"/tmp".as_ptr(),
-                c"tmpfs".as_ptr(),
-                tmpfs,
-                c"mode=1777".as_ptr().cast::<libc::c_void>(),
-            )
-        } != 0
-        {
-            return false;
+        // The three world-writable scratch directories. Covering `/tmp` alone
+        // was half a promise: a service that writes to `/var/tmp` or
+        // `/dev/shm` shared them with the host, and the operator who asked for
+        // a private `/tmp` has no way to know which one leaked. A directory
+        // the image does not have cannot be shared, so `ENOENT` is the one
+        // failure that is not a failure.
+        for (path, opts) in [
+            (c"/tmp", c"mode=1777"),
+            (c"/var/tmp", c"mode=1777"),
+            (c"/dev/shm", c"mode=1777"),
+        ] {
+            // SAFETY: static literals, NUL-terminated by construction; `mount`
+            // copies what it needs and retains nothing.
+            let rc = unsafe {
+                libc::mount(
+                    c"tmpfs".as_ptr(),
+                    path.as_ptr(),
+                    c"tmpfs".as_ptr(),
+                    tmpfs,
+                    opts.as_ptr().cast::<libc::c_void>(),
+                )
+            };
+            if rc != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+                return false;
+            }
         }
         true
     }

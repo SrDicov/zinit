@@ -1,0 +1,21 @@
+--- crates/zcore/src/types.rs
++++ replace Plan::index_of -> Option<Idx> with Some(Default::default())
+@@ -647,17 +647,17 @@
+     pub order_up: Vec<Idx>,
+     pub order_down: Vec<Idx>,
+ }
+ 
+ impl Plan {
+     /// Look up a service by name. Linear, which is fine: the CLI does this
+     /// once per invocation and the runtime keeps its own index.
+     pub fn index_of(&self, name: &str) -> Option<Idx> {
+-        self.services.iter().position(|s| s.name == name)
++        Some(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
+     #[test]

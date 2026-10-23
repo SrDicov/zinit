@@ -1,0 +1,21 @@
+--- crates/zcore/src/types.rs
++++ replace State::is_up -> bool with true
+@@ -69,17 +69,17 @@
+ impl State {
+     /// True when a child process is expected to exist.
+     pub const fn has_process(self) -> bool {
+         matches!(self, State::Starting | State::Running | State::Stopping)
+     }
+ 
+     /// True when the service counts as available to its dependents.
+     pub const fn is_up(self) -> bool {
+-        matches!(self, State::Running)
++        true /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ // ─────────────────────────────────────────────────────────────────────────────
+ // Signals
+ // ─────────────────────────────────────────────────────────────────────────────
+ 
+ /// Signal names as zinit refers to them.

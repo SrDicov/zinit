@@ -1,0 +1,25 @@
+--- crates/zcore/src/runtime.rs
++++ replace Runtime::from_plan -> Runtime with Default::default()
+@@ -184,21 +184,17 @@
+         }
+     }
+ 
+     /// A runtime sized for a plan, with every service stopped and wanted-down.
+     ///
+     /// The usual entry point. The caller then sets `Desired::Up` on whatever
+     /// should be running.
+     pub fn from_plan(plan: &Plan) -> Runtime {
+-        let mut rt = Runtime::new();
+-        for _ in &plan.services {
+-            rt.services.push(ServiceState::new());
+-        }
+-        rt
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     pub fn len(&self) -> usize {
+         self.services.len()
+     }
+ 
+     pub fn is_empty(&self) -> bool {
+         self.services.is_empty()

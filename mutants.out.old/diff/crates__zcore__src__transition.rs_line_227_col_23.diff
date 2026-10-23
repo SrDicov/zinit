@@ -1,0 +1,21 @@
+--- crates/zcore/src/transition.rs
++++ replace == with != in apply
+@@ -219,17 +219,17 @@
+         Event::DepLost { dep, .. } => {
+             if runtime.get(idx).pinned {
+                 return Transition::quiet();
+             }
+             // The dependency is gone. If we are only up because of it, we go
+             // down. `Desired` stays as it is: this is cascade, not operator
+             // intent, and the next reconcile pass must not resurrect it.
+             let wanted = runtime.get(idx).desired;
+-            if wanted == Desired::Down {
++            if wanted != /* ~ changed by cargo-mutants ~ */ Desired::Down {
+                 return Transition::quiet();
+             }
+             let mut actions = alloc::vec![log(
+                 idx,
+                 LogLevel::Warn,
+                 alloc::format!("required dependency `{}` is down", plan.services[dep].name),
+             )];
+             if matches!(runtime.state_at(idx), State::Running | State::Starting) {

@@ -1,0 +1,21 @@
+--- crates/zcore/src/runtime.rs
++++ replace Runtime::count_running -> usize with 1
+@@ -278,17 +278,17 @@
+                     || (self.services[*idx].completed && sp.kind != ServiceKind::Oneshot)
+             })
+             .map(|(idx, _)| idx)
+             .collect()
+     }
+ 
+     /// Sum of services currently considered up.
+     pub fn count_running(&self) -> usize {
+-        self.services.iter().filter(|s| s.state.is_up()).count()
++        1 /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// A stable, human-readable dump. Used by tests and `zctl status --json`.
+     pub fn snapshot(&self, plan: &Plan) -> alloc::string::String {
+         let mut out = String::new();
+         for (idx, sp) in plan.services.iter().enumerate() {
+             let s = &self.services[idx];
+             out.push_str(&alloc::format!(

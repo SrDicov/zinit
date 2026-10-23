@@ -1,0 +1,39 @@
+--- crates/zcore/src/event.rs
++++ replace Event::idx -> Idx with Default::default()
+@@ -96,35 +96,17 @@
+     /// opening its log, creating its cgroup, writing its pidfile. The service
+     /// itself is unaffected; the runtime decides severity.
+     IoError { idx: Idx, errno: i32 },
+ }
+ 
+ impl Event {
+     /// The service this event concerns.
+     pub const fn idx(&self) -> Idx {
+-        match *self {
+-            Event::ExecOk(i)
+-            | Event::Ready(i)
+-            | Event::ReadyTimeout(i)
+-            | Event::StartTimeout(i)
+-            | Event::StopTimeout(i)
+-            | Event::BudgetExhausted(i)
+-            | Event::Pinned(i)
+-            | Event::WatchdogPing(i)
+-            | Event::WatchdogExpired(i)
+-            | Event::OrphanReaped(i) => i,
+-            Event::SpawnFailed { idx, .. }
+-            | Event::Exited { idx, .. }
+-            | Event::Signalled { idx, .. }
+-            | Event::AdoptedPid { idx, .. }
+-            | Event::DepLost { idx, .. }
+-            | Event::DepFailed { idx, .. }
+-            | Event::IoError { idx, .. } => idx,
+-        }
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// A short stable name, for logs and for test failure messages.
+     pub const fn name(&self) -> &'static str {
+         match *self {
+             Event::ExecOk(_) => "exec-ok",
+             Event::SpawnFailed { .. } => "spawn-failed",
+             Event::Ready(_) => "ready",

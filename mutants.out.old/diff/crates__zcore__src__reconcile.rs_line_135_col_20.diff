@@ -1,0 +1,21 @@
+--- crates/zcore/src/reconcile.rs
++++ delete ! in reconcile
+@@ -127,17 +127,17 @@
+                 tick.changed.push(idx);
+             }
+             continue;
+         }
+ 
+         match runtime.get(idx).state {
+             State::Stopped => {
+                 // Should this service be running at all right now?
+-                if !runtime.deps_satisfied(idx, plan) {
++                if  /* ~ changed by cargo-mutants ~ */runtime.deps_satisfied(idx, plan) {
+                     continue;
+                 }
+                 // Order-only edges: wait for the first attempt, never for
+                 // success. See `after_satisfied` for the release rule.
+                 if !runtime.after_satisfied(idx, plan) {
+                     continue;
+                 }
+                 // Dangling required edges: hold, never spawn into the void.

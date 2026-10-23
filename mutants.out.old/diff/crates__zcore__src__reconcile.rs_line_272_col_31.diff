@@ -1,0 +1,21 @@
+--- crates/zcore/src/reconcile.rs
++++ replace >= with < in due_events
+@@ -264,17 +264,17 @@
+                 continue;
+             }
+         }
+         match st.state {
+             State::Starting => {
+                 // Ready deadline first: a service that became ready and then
+                 // blew its start deadline should not be reported twice.
+                 if let Some(due) = st.ready_due_at
+-                    && now_ms >= due
++                    && now_ms < /* ~ changed by cargo-mutants ~ */ due
+                 {
+                     if sp.ready.is_strict() {
+                         out.push(crate::Event::ReadyTimeout(idx));
+                     } else {
+                         // Non-strict: expiry means "up anyway", with a warning.
+                         out.push(crate::Event::Ready(idx));
+                     }
+                     continue;

@@ -1,0 +1,21 @@
+--- crates/zcore/src/transition.rs
++++ replace != with == in apply
+@@ -95,17 +95,17 @@
+         return Transition::quiet();
+     }
+     let sp = &plan.services[idx];
+ 
+     match *event {
+         // ── Spawn lifecycle ────────────────────────────────────────────────
+         Event::ExecOk(_) => {
+             // execve succeeded: the process image is real now.
+-            if runtime.state_at(idx) != State::Starting {
++            if runtime.state_at(idx) == /* ~ changed by cargo-mutants ~ */ State::Starting {
+                 return Transition::quiet();
+             }
+             if sp.ready.is_handshake() {
+                 // Wait for the handshake, or for the ready deadline.
+                 Transition::quiet()
+             } else {
+                 // `ready = none`: there is nothing to wait for, so being
+                 // alive *is* being ready. Going through a timer here would

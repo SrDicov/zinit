@@ -1,0 +1,21 @@
+--- crates/zcore/src/runtime.rs
++++ replace Runtime::is_empty -> bool with true
+@@ -196,17 +196,17 @@
+         rt
+     }
+ 
+     pub fn len(&self) -> usize {
+         self.services.len()
+     }
+ 
+     pub fn is_empty(&self) -> bool {
+-        self.services.is_empty()
++        true /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Mutable access. Panics if `idx` is out of range, which is a core bug.
+     #[inline]
+     pub fn get_mut(&mut self, idx: Idx) -> &mut ServiceState {
+         &mut self.services[idx]
+     }
+ 

@@ -1,0 +1,21 @@
+--- crates/zcore/src/reconcile.rs
++++ replace == with != in should_restart
+@@ -228,17 +228,17 @@
+     let sp = &plan.services[idx];
+     if !sp.kind.has_process() {
+         return false;
+     }
+     if !sp.restart.wants_restart(code) {
+         return false;
+     }
+     // A service we were deliberately stopping does not "restart".
+-    if runtime.get(idx).desired == Desired::Down {
++    if runtime.get(idx).desired != /* ~ changed by cargo-mutants ~ */ Desired::Down {
+         return false;
+     }
+     true
+ }
+ 
+ /// Deadlines that have expired at `now_ms`, as `Event`s.
+ ///
+ /// Expiry is a *function of time*, not of a signal, so the core asks the

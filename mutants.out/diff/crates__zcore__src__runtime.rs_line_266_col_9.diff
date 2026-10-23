@@ -1,0 +1,21 @@
+--- crates/zcore/src/runtime.rs
++++ replace Runtime::set_desired with ()
+@@ -258,17 +258,17 @@
+                 || s.restart_suppressed
+                 || s.failed_starts > 0
+                 || s.last_exit.is_some()
+         })
+     }
+ 
+     /// Convenience: set the desired state of a service.
+     pub fn set_desired(&mut self, idx: Idx, desired: Desired) {
+-        self.services[idx].desired = desired;
++        () /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Check every service's internal invariants. Returns the offenders.
+     pub fn check_invariants(&self, plan: &Plan) -> alloc::vec::Vec<Idx> {
+         plan.services
+             .iter()
+             .enumerate()
+             .filter(|(idx, sp)| {

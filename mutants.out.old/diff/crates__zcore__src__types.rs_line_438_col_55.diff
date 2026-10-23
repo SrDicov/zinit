@@ -1,0 +1,21 @@
+--- crates/zcore/src/types.rs
++++ replace >= with < in Bucket::allows
+@@ -430,17 +430,17 @@
+         }
+         self.refill(budget, now_ms);
+         if self.tokens == 0 {
+             return false;
+         }
+         match self.last_take_ms {
+             // Never attempted: no delay to respect.
+             None => true,
+-            Some(prev) => now_ms.saturating_sub(prev) >= budget.delay_ms,
++            Some(prev) => now_ms.saturating_sub(prev) < /* ~ changed by cargo-mutants ~ */ budget.delay_ms,
+         }
+     }
+ 
+     /// Consume one token, if available. Returns whether it was consumed.
+     ///
+     /// A restart attempt is counted even when the spawn subsequently fails:
+     /// the budget exists to stop a crash loop, and a spawn that fails is part
+     /// of the same loop.

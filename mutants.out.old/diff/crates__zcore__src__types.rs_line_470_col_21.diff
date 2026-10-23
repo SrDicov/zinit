@@ -1,0 +1,21 @@
+--- crates/zcore/src/types.rs
++++ replace == with != in Bucket::exhausted
+@@ -462,17 +462,17 @@
+     /// the token. (A real machine caught the conflation: with the default
+     /// 250 ms delay every restart cycle announced "budget empty" while
+     /// holding tokens.)
+     pub fn exhausted(&mut self, budget: &Budget, now_ms: u64) -> bool {
+         if budget.capacity == 0 {
+             return true;
+         }
+         self.refill(budget, now_ms);
+-        self.tokens == 0
++        self.tokens != /* ~ changed by cargo-mutants ~ */ 0
+     }
+ 
+     /// Refill to at most `capacity`, proportional to elapsed time.
+     fn refill(&mut self, budget: &Budget, now_ms: u64) {
+         if !self.started {
+             // First touch: the bucket starts full, and the delay does not
+             // apply because `last_take_ms` is `None`.
+             self.started = true;

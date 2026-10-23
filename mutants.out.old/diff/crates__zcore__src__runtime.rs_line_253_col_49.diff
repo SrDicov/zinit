@@ -1,0 +1,21 @@
+--- crates/zcore/src/runtime.rs
++++ replace == with != in Runtime::after_satisfied
+@@ -245,17 +245,17 @@
+     /// suppressed, and operator-stopped (`Desired::Down`, i.e. disabled
+     /// at load) all release: a failed dependency releases even when a
+     /// retry is coming, so the waiter runs alongside the retry instead
+     /// of wedging behind it. Only a dependency that is wanted and never
+     /// attempted, or is a mid-flight oneshot, holds the gate.
+     pub fn after_satisfied(&self, idx: Idx, plan: &Plan) -> bool {
+         plan.services[idx].after.iter().all(|&d| {
+             let s = &self.services[d];
+-            let oneshot = plan.services[d].kind == ServiceKind::Oneshot;
++            let oneshot = plan.services[d].kind != /* ~ changed by cargo-mutants ~ */ ServiceKind::Oneshot;
+             s.completed
+                 || matches!(s.state, State::Running | State::Stopping)
+                 || (s.state == State::Starting && !oneshot)
+                 || s.desired == Desired::Down
+                 || s.restart_suppressed
+                 || s.failed_starts > 0
+                 || s.last_exit.is_some()
+         })

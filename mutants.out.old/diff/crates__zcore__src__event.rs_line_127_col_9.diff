@@ -1,0 +1,39 @@
+--- crates/zcore/src/event.rs
++++ replace Event::name -> &'static str with ""
+@@ -119,35 +119,17 @@
+             | Event::DepLost { idx, .. }
+             | Event::DepFailed { idx, .. }
+             | Event::IoError { idx, .. } => idx,
+         }
+     }
+ 
+     /// A short stable name, for logs and for test failure messages.
+     pub const fn name(&self) -> &'static str {
+-        match *self {
+-            Event::ExecOk(_) => "exec-ok",
+-            Event::SpawnFailed { .. } => "spawn-failed",
+-            Event::Ready(_) => "ready",
+-            Event::ReadyTimeout(_) => "ready-timeout",
+-            Event::StartTimeout(_) => "start-timeout",
+-            Event::Exited { .. } => "exited",
+-            Event::Signalled { .. } => "signalled",
+-            Event::OrphanReaped(_) => "orphan-reaped",
+-            Event::StopTimeout(_) => "stop-timeout",
+-            Event::DepLost { .. } => "dep-lost",
+-            Event::DepFailed { .. } => "dep-failed",
+-            Event::BudgetExhausted(_) => "budget-exhausted",
+-            Event::Pinned(_) => "pinned",
+-            Event::AdoptedPid { .. } => "adopted-pid",
+-            Event::WatchdogPing(_) => "watchdog-ping",
+-            Event::WatchdogExpired(_) => "watchdog-expired",
+-            Event::IoError { .. } => "io-error",
+-        }
++        "" /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// True when this event means the process is gone.
+     ///
+     /// The core does not branch on this itself, but the runtime needs it to
+     /// decide whether to reap.
+     pub const fn means_process_gone(&self) -> bool {
+         matches!(

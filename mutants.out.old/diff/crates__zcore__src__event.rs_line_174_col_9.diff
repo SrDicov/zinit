@@ -1,0 +1,21 @@
+--- crates/zcore/src/event.rs
++++ replace <impl core::fmt::Display for Event>::fmt -> core::fmt::Result with Ok(Default::default())
+@@ -166,17 +166,17 @@
+             Event::Signalled { .. } | Event::OrphanReaped(_) => None,
+             _ => None,
+         }
+     }
+ }
+ 
+ impl core::fmt::Display for Event {
+     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+-        write!(f, "{}", self.name())
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
+     #[test]

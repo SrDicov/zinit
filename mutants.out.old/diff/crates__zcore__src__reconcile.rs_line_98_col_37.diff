@@ -1,0 +1,21 @@
+--- crates/zcore/src/reconcile.rs
++++ replace == with != in reconcile
+@@ -90,17 +90,17 @@
+     // ── Pass 1: start, in topological order ───────────────────────────────
+     //
+     // Walking `order_up` forward means every dependency has already been
+     // considered by the time we reach a dependent. One pass, no ordering
+     // logic inside the loop.
+     for &idx in &plan.order_up {
+         let sp = &plan.services[idx];
+ 
+-        if runtime.get(idx).desired == Desired::Down {
++        if runtime.get(idx).desired != /* ~ changed by cargo-mutants ~ */ Desired::Down {
+             continue;
+         }
+ 
+         // Targets have no process: they are up exactly when their required
+         // dependencies are. No spawn, no budget, no readiness. A dangling
+         // required edge holds the target like any unmet requirement, loudly
+         // at load and quietly here — never the boot.
+         if !sp.kind.has_process() {

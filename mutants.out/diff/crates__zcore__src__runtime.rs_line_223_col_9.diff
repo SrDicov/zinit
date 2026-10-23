@@ -1,0 +1,21 @@
+--- crates/zcore/src/runtime.rs
++++ replace Runtime::state_at -> State with Default::default()
+@@ -215,17 +215,17 @@
+     pub fn get(&self, idx: Idx) -> &ServiceState {
+         &self.services[idx]
+     }
+ 
+     /// A single state, by index. The common case in the reconciler's inner
+     /// loop, and allocation-free.
+     #[inline]
+     pub fn state_at(&self, idx: Idx) -> State {
+-        self.services[idx].state
++        Default::default() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// True when every required dependency of `idx` is satisfied: `Running`,
+     /// or a completed oneshot. A oneshot that ran clean has no process by
+     /// design; requiring it to be `Running` would make every dependent wait
+     /// for a process that is never coming back.
+     #[inline]
+     pub fn deps_satisfied(&self, idx: Idx, plan: &Plan) -> bool {

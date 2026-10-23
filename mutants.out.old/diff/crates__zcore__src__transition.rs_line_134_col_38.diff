@@ -1,0 +1,21 @@
+--- crates/zcore/src/transition.rs
++++ replace != with == in apply
+@@ -126,17 +126,17 @@
+             ],
+             changed: true,
+         },
+ 
+         // ── Readiness ──────────────────────────────────────────────────────
+         Event::Ready(_) => become_running(runtime, idx, now_ms),
+ 
+         Event::ReadyTimeout(_) => {
+-            if runtime.state_at(idx) != State::Starting {
++            if runtime.state_at(idx) == /* ~ changed by cargo-mutants ~ */ State::Starting {
+                 return Transition::quiet();
+             }
+             // Only strict readiness reaches here as a failure.
+             let mut t = become_running(runtime, idx, now_ms);
+             t.actions.insert(
+                 0,
+                 log(idx, LogLevel::Error, "readiness handshake timed out"),
+             );

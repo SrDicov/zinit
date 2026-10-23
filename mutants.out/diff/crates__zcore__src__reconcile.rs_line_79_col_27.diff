@@ -1,0 +1,21 @@
+--- crates/zcore/src/reconcile.rs
++++ replace != with == in reconcile
+@@ -71,17 +71,17 @@
+         // even while still Stopped. Otherwise the enable never fires (the
+         // trigger can only pull; it may not spawn), and the disabled service
+         // stays down forever — exactly the Artix agetty chain.
+         for &d in &plan.services[i].required {
+             if plan.services[d].enabled {
+                 continue;
+             }
+             let dr = runtime.get(d);
+-            if dr.desired != Desired::Down || dr.restart_suppressed {
++            if dr.desired == /* ~ changed by cargo-mutants ~ */ Desired::Down || dr.restart_suppressed {
+                 continue;
+             }
+             if dr.state != State::Stopped {
+                 continue;
+             }
+             runtime.set_desired(d, Desired::Up);
+             tick.changed.push(d);
+         }
