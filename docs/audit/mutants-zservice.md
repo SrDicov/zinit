@@ -1,37 +1,36 @@
 # Mutantes de `zservice` — medición parcial y plan
 
 Run: `cargo mutants -p zservice --timeout 60 --no-shuffle` (657 mutantes según
-`--list`). El run se interrumpió con **88 de 99** evaluados: la tasa
-completa sigue sin medirse, y con $MISS/99 no se puede extrapolar.
+`--list`). Interrumpido con **89 MISSED de 99 evaluados**: la tasa completa
+sigue sin medirse, y 89/99 no se extrapola a 657.
 
 ## Desglose por archivo (lo evaluado)
 
-```
-     46 crates/zservice/src/ready.rs
-     31 crates/zservice/src/log.rs
-     11 crates/zservice/src/identity.rs
-```
+| archivo | MISSED |
+|---|---|
+| `crates/zservice/src/ready.rs` | 46 |
+| `crates/zservice/src/log.rs` | 31 |
+| `crates/zservice/src/identity.rs` | 11 |
+| resto | 1 |
 
-## Lectura
+**Corrección.** Una nota anterior atribuía el grueso a `spawn.rs`. El desglose
+del log dice otra cosa: `spawn.rs` no aparece en la lista. `ready.rs` y `log.rs`
+son funciones con entrada y salida normales — se testean sin root, sin fork y
+sin supervisor. El diagnóstico cómodo era el equivocado.
 
-Casi todo es `spawn.rs`, y no por falta de tests sino por el diseño: los
-pasos viven en el hijo, después del `fork`, y no vuelven al llamante. Un
-test unitario no puede alcanzarlos; sólo un supervisor real.
-
-## Lo que ya tiene red
+## `spawn.rs`: lo que sí tiene red
 
 `crates/zinit/tests/supervises_real_service.rs::
 the_child_path_runs_with_privileges_inside_a_user_namespace` re-ejecuta el
-test bajo `unshare -U -r -p -f --mount-proc` (sin root real) y verifica dos
-efectos observables: `CapBnd` a cero tras `drop-capabilities = all`, y
-`unshare -m` rechazado por el filtro. Probado por mutación: anulando
-`child_step_capdrop` el test falla con `CapBnd: 000001ffffffffff`.
+test bajo `unshare -U -r -p -f --mount-proc` y verifica dos efectos
+observables: `CapBnd` a cero tras `drop-capabilities = all`, y `unshare -m`
+rechazado por el filtro. Probado por mutación: anulando `child_step_capdrop`
+el test falla con `CapBnd: 000001ffffffffff`.
 
-## Lo que no es testeable así, con evidencia
+## Lo que no es testeable sin root, con evidencia
 
-El paso de ids (`setgroups`) y, por tanto, el orden `capdrop` antes de
-`ids`, necesitan root real. Comprobado el 2026-10-23 con tres variantes de
-`unshare`:
+El paso de ids (`setgroups`) y el orden `capdrop` antes de `ids` exigen root
+real. Tres invocaciones probadas el 2026-10-23:
 
 | invocación | uid/gid dentro | `setgroups` |
 |---|---|---|
@@ -40,16 +39,18 @@ El paso de ids (`setgroups`) y, por tanto, el orden `capdrop` antes de
 | `-U --map-groups=0:1000:1` | 65534/0 | **-1 (EPERM)** |
 
 `unshare -r` deja `/proc/self/setgroups` en `deny`; habilitarlo exige
-`CAP_SETGID` en el namespace *padre*, que es justo lo que un runner no
-tiene. No es una limitación de zinit.
+`CAP_SETGID` en el namespace *padre*, que es lo que un runner no tiene. No es
+una limitación de zinit.
 
-## Plan para cerrarlo
+Plan: test root-gated (patrón de `private-tmp`) con `user = nobody` +
+`drop-capabilities = all`, que exige `Running` con `CapBnd=0` y uid 65534 —
+invertir el orden lo mata con EPERM —, cableado al job que corre como root
+(podman `--privileged`), nunca al job no-root. Hasta entonces no se declara
+cubierto: un test que no se puede ejecutar aquí no es evidencia.
 
-1. Test root-gated (mismo patrón que `private-tmp`) con `user = nobody` +
-   `drop-capabilities = all`: el hijo debe llegar a `Running` con
-   `/proc/<pid>/status` → `CapBnd=0` y uid 65534. Con el orden invertido
-   muere con EPERM en el capdrop, así que el test lo distingue.
-2. Cablearlo al job que corre como root (podman `--privileged`), no al
-   job no-root.
-3. Hasta entonces: **no** se declara cubierto. Un test que no se puede
-   ejecutar aquí no es evidencia.
+## Siguiente paso, en orden de coste
+
+1. `ready.rs` (46): funciones puras; un test por rama. El más barato de los tres.
+2. `log.rs` (31): rotación/line-splitting; unitario.
+3. `identity.rs` (11): comparación de credenciales; unitario.
+4. `spawn.rs`: sólo con root, como queda dicho.
