@@ -69,3 +69,41 @@ mata los 10 de golpe.
 Un timeout con el mutante aplicado **no es un flake**: es un test que espera un
 resultado que el mutante impide. Se lee la traza antes de llamarlo flake, y si
 es un bucle que no avanza se añade el caso de borde que lo corta.
+
+## Cierre alpha — los caros que no se matan
+
+### `spawn.rs` — 152 missed (56 % del crate)
+
+El archivo *es* el camino del hijo: todo lo que ocurre entre `fork` y `execve`.
+Cada mutante mueve, invierte o borra un paso de la secuencia
+`sigmask → setsid → fds → chdir → rlimits → cgroup → ids → NNP → ctty → execve`.
+
+- **Cubierto y verificado por mutación:** `capdrop` (bounding set a cero) y el
+  filtro seccomp, por `the_child_path_runs_with_privileges_inside_a_user_namespace`
+  (`crates/zinit/tests/supervises_real_service.rs`); anular `child_step_capdrop`
+  lo rompe (`CapBnd: 000001ffffffffff`).
+- **Root-gated:** el paso de ids (`setgroups`+`setgid`+`setuid`). Dentro de un
+  user namespace `setgroups` devuelve `EPERM` en las tres variantes probadas
+  (`--map-groups=0:0:1` rechazado; `--map-users/--map-groups` da uid=gid=0 pero
+  `setgroups -1`). Necesita root real, no userns.
+- **El resto (la mayoría):** observar el orden exige que el hijo reporte su
+  propio estado después de cada paso (fd extra + pipe) o `ptrace`. Coste 4-6 h y
+  toca código PID-1-adyacente: no se hace en alpha, se hace con hardware delante.
+
+### `service.rs` — 27 missed
+
+Máquina de estados del supervisor. Los mutantes caen en ramas que sólo se
+alcanzan con un hijo real en un instante concreto:
+
+| grupo | n | por qué no muere hoy |
+|---|---|---|
+| `ensure_listeners` | 8 | comparadores de tamaño/índice sobre la lista de sockets; pide un plan con N listeners exactos y comprobar el error de cada frontera |
+| `poll_forking_adopt` | 4 | adopción por `pid-file`: el mutante cambia el orden de lectura y sondeo; pide un launcher que escriba el pid tarde y de forma controlada |
+| `poll_exec` | 4 | carrera del pipe de exec: el mutante altera el acumulador de bytes y la guarda `WouldBlock`; determinista sólo con un hijo que escriba a plazos |
+| `on_waitpid` | 3 | reaparición del pid / señal negativa: instantánea, no reproducible a voluntad |
+| `pid`/`adopt`/`adopted`/`cleanup`/`poll_ready`/`stop_signal`/`unstick` | 8 | estado observable sólo entre el reap y la transición; el supervisor ya documenta que el estado visible se escribe *después* del reap |
+
+**Post-alpha (~2 h):** un reloj/hijo inyectable en `ManagedService` (traits de
+una sola implementación en producción, doble en test) hace deterministas
+`poll_exec`, `poll_forking_adopt` y `on_waitpid` de golpe. No se hace antes de
+alpha porque añade indirección al camino caliente del supervisor.
