@@ -343,6 +343,23 @@ pub fn ensure_cgroup(service: &str, cgroup: &str) -> io::Result<PathBuf> {
                 return Err(e);
             }
         }
+        // The directory existing says nothing: on a plain directory
+        // (cgroup2 not mounted) the child's open of cgroup.procs fails
+        // with a bare ENOENT far from here. Fail now, loudly, naming
+        // the actual cause, while the service name is still attached.
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .open(&procs)
+            .is_err()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "service `{service}`: {} not writable; is a cgroup2 filesystem mounted on /sys/fs/cgroup?",
+                    procs.display()
+                ),
+            ));
+        }
         Ok(procs)
     }
 }
@@ -462,6 +479,29 @@ pub(crate) fn current_ids() -> (u32, u32, u32, u32) {
 mod tests {
     use super::*;
 
+    /// An absolute cgroup path under a plain directory: the directory gets
+    /// created, but there is no `cgroup.procs` to write, so the refusal must
+    /// name the file and the cause instead of handing the child a path that
+    /// fails with a bare ENOENT after the fork.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn ensure_cgroup_refuses_a_directory_without_cgroup_procs() {
+        let dir = std::env::temp_dir().join(format!(
+            "zinit-cg-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let err = ensure_cgroup("svc", &dir.to_string_lossy())
+            .expect_err("no cgroup.procs to write inside");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains("cgroup.procs"),
+            "the aviso must name the missing file: {err}"
+        );
+        let _ = std::fs::remove_dir(&dir);
+    }
+
     #[test]
     fn resolves_nobody_to_the_platform_convention() {
         let (uid, gid) = resolve_user("nobody").expect("nobody must exist");
@@ -484,6 +524,24 @@ mod tests {
     fn unknown_user_is_not_found() {
         let e = resolve_user("zinit-no-such-user-xyz").expect_err("must fail");
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn cgroup_without_a_cgroupfs_fails_loudly() {
+        // A plain directory is not a cgroup hierarchy: the child's open
+        // of cgroup.procs would die with a bare ENOENT far from any
+        // context. The parent must name the cause while it still can.
+        let dir = std::env::temp_dir().join(format!("zinit-cgroup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let e = ensure_cgroup("probe", dir.to_str().expect("tmpdir is UTF-8"))
+            .expect_err("plain dir, no cgroup.procs inside");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("cgroup2"),
+            "must name the missing filesystem, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -573,26 +631,61 @@ mod tests {
     /// twice sharing every fd, so it `_exit`s with the verdict.
     #[test]
     fn dropping_to_our_own_ids_is_either_clean_or_untouched() {
+        // `ZINIT_FLAKE_RUNS=N` hammers the same fork in one process, which is
+        // how a "it failed once on macOS" report becomes a rate instead of an
+        // anecdote. Unset (every CI run) means one iteration, exactly as
+        // before.
+        let runs = std::env::var("ZINIT_FLAKE_RUNS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(1);
+        for _ in 0..runs {
+            self_drop_once();
+        }
+    }
+
+    fn self_drop_once() {
         let (ruid, _, rgid, _) = current_ids();
         // SAFETY: `fork` takes no arguments; the child below `_exit`s with the verdict, never returning to the harness.
         match unsafe { libc::fork() } {
             -1 => panic!("fork failed"),
             0 => {
                 let before = current_ids();
-                let verdict = match drop_privileges(ruid, rgid) {
-                    Ok(()) => current_ids() == (ruid, ruid, rgid, rgid),
-                    Err(_) => current_ids() == before,
+                // One exit code per outcome so the parent can say *which* one
+                // happened: "the verdict was false" and "the child died" are
+                // different failures, and the old single bit could not tell
+                // them apart (macOS produced one of them intermittently).
+                let code = match drop_privileges(ruid, rgid) {
+                    Ok(()) if current_ids() == (ruid, ruid, rgid, rgid) => 0,
+                    Ok(()) => 3,
+                    Err(_) if current_ids() == before => 2,
+                    Err(_) => 4,
                 };
                 // SAFETY: `_exit` never returns and takes only an int.
-                unsafe { libc::_exit(if verdict { 0 } else { 1 }) };
+                unsafe { libc::_exit(code) };
             }
             pid => {
                 let mut status = 0;
                 // SAFETY: `status` is a live `c_int`; blocking wait on our own child.
                 assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid);
+                let outcome = if libc::WIFSIGNALED(status) {
+                    format!("the child was killed by signal {}", libc::WTERMSIG(status))
+                } else if libc::WIFEXITED(status) {
+                    match libc::WEXITSTATUS(status) {
+                        0 => "ok-and-verified".to_string(),
+                        2 => "err-and-untouched".to_string(),
+                        3 => "ok but the ids are not the ones that were asked for".to_string(),
+                        4 => "err and the ids changed anyway".to_string(),
+                        other => format!("exited with an unexpected code {other}"),
+                    }
+                } else {
+                    format!("an unknown wait status {status}")
+                };
                 assert!(
-                    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-                    "self-drop must succeed-and-verify or fail-untouched"
+                    matches!(libc::WEXITSTATUS(status), 0 | 2) && libc::WIFEXITED(status),
+                    "self-drop must succeed-and-verify or fail-untouched: {outcome} \
+                     (our ids: {ruid}/{rgid})"
                 );
             }
         }

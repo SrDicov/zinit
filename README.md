@@ -1,9 +1,13 @@
 # zinit
 
+[![release](https://img.shields.io/github/v/release/SrDicov/zinit?include_prereleases&label=release)](https://github.com/SrDicov/zinit/releases)
+[![CI](https://github.com/SrDicov/zinit/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/SrDicov/zinit/actions/workflows/ci.yml)
+
 > Un init con **un solo concepto** — *estado deseado* — y un reconciliador que lo cumple.
 > Sin shell para la lógica, sin grafos mutables en runtime, sin acuses que falten.
 
-**Estado**: núcleo, configuración y servicio cerrados. **525 tests, 0 warnings de clippy,
+**Estado**: alpha `v0.2.0-alpha` — usable, con los límites escritos en
+[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md). **573 tests, 0 fallos, clippy 0,
 `cargo doc` limpio.**
 
 | Crate | Qué es | Estado | Tests |

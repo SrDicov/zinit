@@ -181,6 +181,92 @@ pub fn kill_group(pid: i32, sig: Signal) -> io::Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Machine power
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `sync(2)`: flush filesystem buffers before powering off, rebooting, or
+/// sleeping. Cannot fail in any observable way, so there is no `Result` to
+/// check — but the call itself must still happen, which is why it is a
+/// named function and not a comment saying "sync here".
+pub fn sync() {
+    // SAFETY: `sync` takes no arguments and has no preconditions.
+    unsafe {
+        libc::sync();
+    }
+}
+
+/// `reboot(LINUX_REBOOT_CMD_POWER_OFF)`. Only returns on failure.
+///
+/// Linux-only: the BSD `reboot()` shapes differ per OS and macOS lacks the
+/// call, so anywhere else this answers Unsupported honestly instead of
+/// guessing FFI (CI proved guessing wrong). Power verbs parse everywhere;
+/// they act where the kernel interface exists.
+pub fn power_off() -> io::Result<()> {
+    // SAFETY: the constant is the kernel's own power-off command; no
+    // pointers cross the boundary.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        if unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "power off needs Linux",
+        ))
+    }
+}
+
+/// `reboot(LINUX_REBOOT_CMD_RESTART)`. Only returns on failure.
+///
+/// Linux-only, like [`power_off`].
+pub fn reboot() -> io::Result<()> {
+    // SAFETY: as above.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        if unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_RESTART) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "reboot needs Linux",
+        ))
+    }
+}
+
+/// `reboot(LINUX_REBOOT_CMD_HALT)`: stop the CPU, leave the power on.
+/// Only returns on failure.
+///
+/// Linux-only, like [`power_off`].
+pub fn halt() -> io::Result<()> {
+    // SAFETY: as above.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        if unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_HALT) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "halt needs Linux",
+        ))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // File descriptors
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -608,6 +694,193 @@ pub fn unix_accept(listener: RawFd) -> io::Result<RawFd> {
     Ok(fd)
 }
 
+/// The identity of the process on the other end of a unix socket.
+///
+/// `pid` is `0` where the platform does not report one (BSD's `getpeereid`
+/// answers with the credentials only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerCred {
+    /// The peer's process id, or `0` when the platform does not report it.
+    pub pid: i32,
+    /// The peer's effective user id.
+    pub uid: u32,
+    /// The peer's effective group id.
+    pub gid: u32,
+}
+
+/// The peer's credentials on a connected unix socket.
+///
+/// Linux answers with `SO_PEERCRED` (pid, uid, gid in one call); the BSDs
+/// and macOS answer with `getpeereid` (uid, gid, no pid). Where neither
+/// exists the call says so instead of inventing a zeroed identity: a
+/// caller that treats "unknown" as "root" is exactly the bug this
+/// function exists to prevent.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn peercred(fd: RawFd) -> io::Result<PeerCred> {
+    let mut cred: libc::ucred = unsafe { core::mem::zeroed() };
+    let mut len = core::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `cred` is a live `ucred` of exactly the length passed in, and
+    // `len` says how many bytes the kernel may write. The descriptor is a
+    // socket the caller owns.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast::<core::ffi::c_void>(),
+            &raw mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(PeerCred {
+        pid: cred.pid,
+        uid: cred.uid,
+        gid: cred.gid,
+    })
+}
+
+/// The peer's credentials on a connected unix socket, BSD flavour.
+///
+/// `getpeereid(2)` gives the effective uid and gid of the peer and no pid.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+pub fn peercred(fd: RawFd) -> io::Result<PeerCred> {
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    // SAFETY: both pointers are live and of the type the call writes.
+    let rc = unsafe { libc::getpeereid(fd, &raw mut uid, &raw mut gid) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(PeerCred {
+        pid: 0,
+        uid: uid as u32,
+        gid: gid as u32,
+    })
+}
+
+/// The peer's credentials: not available on this platform.
+///
+/// The supervisor treats this as "unknown peer" and refuses the mutating
+/// verbs. A platform that cannot say who is calling gets the strict
+/// answer, not the permissive one.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)))]
+pub fn peercred(_fd: RawFd) -> io::Result<PeerCred> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "peer credentials are not available on this platform",
+    ))
+}
+
+/// `geteuid(2)`: the effective user id of this process.
+///
+/// The control socket compares the peer against it, so it lives here with
+/// the other identity calls instead of being open-coded at the call site.
+pub fn geteuid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments and has no preconditions.
+    unsafe { libc::geteuid() as u32 }
+}
+
+/// `getppid(2)`: the pid of this process's parent.
+///
+/// The supervisor uses it to tell "the machine's supervisor" (a child of
+/// PID 1) from "a supervisor somebody started by hand".
+pub fn getppid() -> i32 {
+    // SAFETY: `getppid` takes no arguments and has no preconditions.
+    unsafe { libc::getppid() }
+}
+
+/// `setrlimit(2)`: raise the soft limit of `resource` to its hard limit.
+///
+/// A supervisor that inherits the default `RLIMIT_NOFILE` (1024 on most
+/// systems) runs out of descriptors at a couple of hundred services: every
+/// service costs an exec pipe, a notify pipe and a log, and the failure
+/// looks like a service that cannot be spawned for no reason. The hard
+/// limit is the ceiling the system allows, so raising the soft limit to it
+/// is the one adjustment an init should make.
+pub fn raise_nofile_limit() -> io::Result<()> {
+    let mut cur: libc::rlimit = unsafe { core::mem::zeroed() };
+    // SAFETY: `cur` is a live, zeroed `rlimit` the kernel fills with the
+    // current limits; it is not retained.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut cur) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if cur.rlim_cur >= cur.rlim_max {
+        return Ok(());
+    }
+    let wanted = libc::rlimit {
+        rlim_cur: cur.rlim_max,
+        rlim_max: cur.rlim_max,
+    };
+    // SAFETY: `wanted` is a live `rlimit` the kernel copies.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const wanted) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `flock(2)`: take an exclusive lock on `fd`, or fail if someone holds it.
+///
+/// Used for the supervisor's single-instance lock: two supervisors over one
+/// control socket is not a configuration, it is a race.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+pub fn flock_exclusive(fd: RawFd) -> io::Result<()> {
+    // SAFETY: `fd` is a descriptor the caller owns; `flock` only needs it to
+    // be open. The lock is released when the descriptor is closed.
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `flock(2)`: not available on this platform.
+///
+/// The supervisor then cannot prove a first instance is gone, so it says so
+/// instead of pretending.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)))]
+pub fn flock_exclusive(_fd: RawFd) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "flock is not available on this platform",
+    ))
+}
+
 /// `prctl(PR_SET_CHILD_SUBREAPER, 1)`: orphaned grandchildren reparent to us.
 ///
 /// A `Forking` daemon's real process is a grandchild that outlives its
@@ -1008,6 +1281,23 @@ pub fn decode_status(raw: i32) -> ExitStatus {
 /// distinction matters because an init calls this in a loop and must be able to
 /// tell "no child died" from "the kernel is broken".
 pub fn waitpid_nohang(pid: i32) -> io::Result<Option<Waited>> {
+    match waitpid_nohang_strict(pid) {
+        // "No such child" is the normal answer for a sweep: there is
+        // nothing to reap. The strict version tells the difference; this
+        // one does not need to.
+        Err(e) if e.raw_os_error() == Some(libc::ECHILD) => Ok(None),
+        other => other,
+    }
+}
+
+/// `waitpid(pid, WNOHANG)` that tells "no such child" apart from "not
+/// exited yet".
+///
+/// The difference matters for an adopted process: the pidfd says it died,
+/// and `waitpid` answers `ECHILD` because it was never our child (the
+/// kernel reparented it to PID 1). The lenient wrapper folds that into
+/// `Ok(None)` — "nothing to report" — and the death is lost.
+pub fn waitpid_nohang_strict(pid: i32) -> io::Result<Option<Waited>> {
     loop {
         let mut status: libc::c_int = 0;
         // SAFETY: `&raw mut status` is a live, aligned `c_int`; `waitpid`
@@ -1024,10 +1314,8 @@ pub fn waitpid_nohang(pid: i32) -> io::Result<Option<Waited>> {
             return Ok(None);
         }
         let err = io::Error::last_os_error();
-        // `ECHILD` means there is no such child: it exited and was already
-        // reaped, or it was never ours. Not an error for a reaper.
         if err.raw_os_error() == Some(libc::ECHILD) {
-            return Ok(None);
+            return Err(err);
         }
         if err.kind() != io::ErrorKind::Interrupted {
             return Err(err);
@@ -1058,6 +1346,27 @@ pub fn waitpid_blocking(pid: i32) -> io::Result<Waited> {
             return Err(err);
         }
     }
+}
+
+/// `waitpid(2)` that lets `EINTR` through.
+///
+/// The one documented exception to this module's rule that interruptions
+/// are handled here: PID 1 needs the interruption, because the signal that
+/// interrupted it is the message. A `SIGTERM` to the init must be able to
+/// wake a `waitpid` that is waiting for a child that has not died yet —
+/// otherwise "shut the machine down" waits for a process to exit first.
+pub fn waitpid_interruptible(pid: i32) -> io::Result<Waited> {
+    let mut status: libc::c_int = 0;
+    // SAFETY: as `waitpid_blocking`, but without WNOHANG and without the
+    // EINTR retry. `status` is a live `c_int` the kernel writes into.
+    let rc = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+    if rc > 0 {
+        return Ok(Waited {
+            pid: rc,
+            status: decode_status(status),
+        });
+    }
+    Err(io::Error::last_os_error())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

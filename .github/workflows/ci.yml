@@ -160,7 +160,14 @@ jobs:
           key: ${{ runner.os }}-macos-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-macos-
       - run: cargo build --workspace --all-targets
-      - run: cargo test --workspace
+      - name: Test
+        # `ZINIT_FLAKE_RUNS` repeats the identity self-drop inside the test,
+        # which failed once on this job and nowhere else. 3000 iterations cost
+        # about a second and turn "it failed once" into a rate measured on
+        # every run here, instead of a hypothesis.
+        env:
+          ZINIT_FLAKE_RUNS: "3000"
+        run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets
       - run: cargo fmt --all --check
 
@@ -623,6 +630,16 @@ jobs:
             exit 1
           fi
           echo "tree is workspace crates + libc only"
+      - name: Build the control client too
+        run: cargo build -p zctl --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zinit-linux-x86_64-glibc
+          path: |
+            target/release/zinit
+            target/release/zctl
+          if-no-files-found: error
+          retention-days: 14
 
   # ══════════════════════════════════════════════════════════════════════════
   # 9. MSRV, docs, and a nightly smoke build.
@@ -711,5 +728,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: zinit-musl-x86_64
-          path: target/x86_64-unknown-linux-musl/release/zinit
+          path: |
+            target/x86_64-unknown-linux-musl/release/zinit
+            target/x86_64-unknown-linux-musl/release/zctl
           retention-days: 30

@@ -29,7 +29,14 @@ use std::time::{Duration, Instant};
 const POLL_MS: u64 = 25;
 const START_DEADLINE_MS: u64 = 10_000;
 const EXIT_DEADLINE_MS: u64 = 10_000;
-const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a control reply may take.
+///
+/// A reply is immediate — the supervisor answers on the pass that reads the
+/// frame — so this exists to fail a hung supervisor instead of hanging the
+/// suite, not to accommodate a slow one. It is generous on purpose: the ARM
+/// runners have been seen to starve a process for several seconds under a
+/// parallel `cargo test`, and a false red costs more than a slow one.
+const IO_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn sleep_ms(ms: u64) {
     std::thread::sleep(Duration::from_millis(ms));
@@ -125,14 +132,22 @@ struct Sup {
 impl Sup {
     fn start(scratch: &Scratch) -> Sup {
         use std::os::unix::process::CommandExt;
+        // The supervisor's own words go to a file, not to `/dev/null`: when a
+        // reply does not arrive, the log is the only thing that can say
+        // whether it was busy, wedged or dead.
+        let log = std::fs::File::create(scratch.dir.join("sup.log")).expect("create sup.log");
         let child = Command::new(env!("CARGO_BIN_EXE_zinit"))
             .arg("--sup")
             .arg(&scratch.dir)
             .env("ZINIT_SOCKET", scratch.sock())
             .env("ZINIT_STATE_DIR", scratch.statedir())
+            // The suite runs from `target/`, which is neither an install
+            // directory nor root-owned: the supervisor's own directory is a
+            // trust root only behind this switch, so the tests turn it on.
+            .env("ZINIT_TRUST_SELF_DIR", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(log))
             .process_group(0)
             .spawn()
             .expect("cannot spawn `zinit --sup`");
@@ -215,6 +230,31 @@ impl Ctl {
         assert!(!line.is_empty(), "control connection closed mid-test");
         line.trim_end().to_string()
     }
+}
+
+/// Ask the control socket, but give up after `deadline` and hand back the
+/// reason instead of panicking inside the shared helper.
+///
+/// The shared `Ctl::ask` panics without context, which is fine for a reply
+/// that is immediate and useless for one that is not: the question here is
+/// *why* the supervisor went quiet, and its own log is the answer.
+fn try_ask(scratch: &Scratch, frame: &str, deadline: Duration) -> std::io::Result<String> {
+    use std::io::{BufRead, BufReader, Write};
+    let stream = UnixStream::connect(scratch.sock())?;
+    stream.set_read_timeout(Some(deadline))?;
+    stream.set_write_timeout(Some(deadline))?;
+    let mut reader = BufReader::new(stream);
+    reader.get_mut().write_all(frame.as_bytes())?;
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    Ok(line.trim_end().to_string())
+}
+
+/// The last lines of a file in the scratch directory.
+fn tail_of(scratch: &Scratch, name: &str) -> String {
+    let text = std::fs::read_to_string(scratch.dir.join(name)).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().rev().take(12).collect();
+    lines.into_iter().rev().collect::<Vec<&str>>().join("\n")
 }
 
 /// The `pid=` field of a `status` payload, when it names a live process.
@@ -359,17 +399,68 @@ fn reload_all_preserves_live_pids() {
     assert!(pid_alive(before), "reload took the survivor with it");
 }
 
+/// A reload newcomer with `enabled = no` stays down: the boot rule (only
+/// `enabled` services want up) applies to arrivals, not just to the first
+/// load — otherwise a convert+reload on a live system would start services
+/// (sshd and friends) that dinit never pulled.
+#[test]
+fn reload_newcomer_honors_enabled() {
+    let scratch = Scratch::new("reload-enabled");
+    let pid_a = scratch.dir.join("a.pid");
+    scratch.conf("a.conf", &sleeper(&pid_a.display().to_string(), 30));
+    let mut sup = Sup::start(&scratch);
+    assert!(
+        wait_until(START_DEADLINE_MS, || pidfile_pid(&pid_a).is_some()),
+        "service a never started"
+    );
+    sup.services
+        .push(pidfile_pid(&pid_a).expect("pidfile has a pid"));
+
+    // b arrives disabled, c arrives enabled: same reload, opposite fates.
+    let pid_b = scratch.dir.join("b.pid");
+    let pid_c = scratch.dir.join("c.pid");
+    scratch.conf(
+        "b.conf",
+        &(sleeper(&pid_b.display().to_string(), 30) + "enabled = no\n"),
+    );
+    scratch.conf("c.conf", &sleeper(&pid_c.display().to_string(), 30));
+    let mut ctl = Ctl::connect(&scratch.sock());
+    let reply = ctl.ask("C 1 reload-all\n");
+    assert_eq!(reply, "R 1 0 3 services", "reload reply: {reply}");
+
+    assert!(
+        wait_until(START_DEADLINE_MS, || pidfile_pid(&pid_c).is_some()),
+        "enabled newcomer c never started"
+    );
+    sup.services
+        .push(pidfile_pid(&pid_c).expect("pidfile has a pid"));
+
+    // Down means down: half a second is an eternity for a service that
+    // wants up, and b must not even have a pid.
+    sleep_ms(500);
+    assert!(
+        pidfile_pid(&pid_b).is_none(),
+        "disabled newcomer b started anyway"
+    );
+    let reply = ctl.ask("C 2 status b\n");
+    assert!(
+        reply.contains("stopped") && reply.contains("desired=down"),
+        "disabled newcomer status: {reply}"
+    );
+}
+
 #[test]
 fn demand_start_wakes_on_connection() {
     use std::net::TcpStream;
 
-    // A high port the neighbours are unlikely to want; probed free before
-    // the supervisor ever hears about it, so a squatted port fails loudly
-    // here instead of wedging the supervisor later.
-    let port = [48121u16, 48122, 48123]
-        .into_iter()
-        .find(|p| std::net::TcpListener::bind(format!("127.0.0.1:{p}")).is_ok())
-        .expect("a free probe port");
+    // A port nobody else has: the kernel picks it, and the probe listener is
+    // dropped before the supervisor ever hears about it. A hardcoded list
+    // fails the whole suite the moment a neighbour — or a leftover from a
+    // killed run — squats one of them.
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        probe.local_addr().expect("the probe has an address").port()
+    };
     let scratch = Scratch::new("demand");
     scratch.conf(
         "lazy.conf",
@@ -416,5 +507,65 @@ fn demand_start_wakes_on_connection() {
     assert!(
         wait_until(START_DEADLINE_MS, running),
         "traffic never woke the service"
+    );
+}
+
+/// A `reload-all` does not disturb a service that already said it was ready.
+///
+/// A `ready = notify` service is `Running` only because the handshake
+/// completed; the supervisor's evidence is a line on the notify fd, and the
+/// fact lives in the runtime, not in the description. A reload that rebuilds
+/// the plan must keep that fact. If it does not, the readiness deadline fires
+/// for a service that is perfectly healthy and the supervisor restarts it
+/// under the reload — and again after the next one, which is a restart loop
+/// nobody asked for. That is the shape of a loop seen on real hardware.
+#[test]
+fn reload_all_keeps_a_notified_service_ready() {
+    let scratch = Scratch::new("reload-notify");
+    let pidfile = scratch.dir.join("n.pid");
+    scratch.conf(
+        "n.conf",
+        &format!(
+            "type = script\ncommand = echo $$ > {}; echo READY=1 >&$ZINIT_NOTIFY_FD; \
+             exec /bin/sleep 30\nready = notify\nstart-timeout = 1s\nlog = none\n",
+            pidfile.display()
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    assert!(
+        wait_until(START_DEADLINE_MS, || {
+            scratch
+                .state_of("n")
+                .is_some_and(|s| s.contains("state=Running"))
+        }),
+        "the notified service never reached Running: {:?}",
+        scratch.state_of("n")
+    );
+    let before = pidfile_pid(&pidfile).expect("pidfile has a pid");
+    sup.services.push(before);
+
+    let reply = try_ask(&scratch, "C 1 reload-all\n", IO_TIMEOUT).unwrap_or_else(|e| {
+        panic!(
+            "the reload never answered ({e}); the supervisor said:\n{}",
+            tail_of(&scratch, "sup.log")
+        )
+    });
+    assert_eq!(reply, "R 1 0 1 services", "reload reply: {reply}");
+
+    // Longer than `start-timeout`: a reload that forgot the handshake has
+    // had every chance to time out and restart the service by now.
+    sleep_ms(1_500);
+    assert!(pid_alive(before), "the reload killed the notified service");
+    assert_eq!(
+        pidfile_pid(&pidfile),
+        Some(before),
+        "the service was restarted after the reload: the handshake was lost"
+    );
+    assert!(
+        scratch
+            .state_of("n")
+            .is_some_and(|s| s.contains("state=Running")),
+        "the service is no longer Running after the reload: {:?}",
+        scratch.state_of("n")
     );
 }

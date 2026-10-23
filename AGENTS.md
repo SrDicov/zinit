@@ -127,4 +127,25 @@ Miri is lib-only by design: `cargo +nightly miri test -p zcore --lib` (never the
   start fresh; deleted-with-live-pid retire (one TERM, reaped, dropped). Any load
   failure keeps the old plan.
 - `SIGTERM/SIGINT/SIGHUP` to `--sup` still means "stop every service, stay up idle".
-  There is no poweroff/reboot path — don't add one beside the socket.
+  Power is explicit verbs, never signals: `zctl poweroff|reboot|halt|suspend`
+  (C4, orderly stop-all + deadline + breadcrumb; `hibernate` refused, no
+  resume target). The old no-power-path rule was reversed by operator order
+  on real hardware: a sole init that cannot power the machine is the bigger
+  evil. compatd maps dinit SHUTDOWN/reboot/poweroff/halt onto the same verbs.
+
+## Modo dispatcher (sesiones de cierre)
+
+El agente principal planifica, no ejecuta. Ciclo: leer STATE → escribir
+`SPEC_<fase>_<tarea>.md` → despachar subagente → leer `REPORT_<fase>_<tarea>.md`
+(`head -30`) → actualizar STATE → repetir.
+
+- No leer logs de mutantes, CI ni `cargo test` completos. Sólo el resumen del REPORT.
+- No escribir tests ni código que un subagente pueda escribir desde un SPEC.
+- Cada SPEC lleva: objetivo, comandos exactos, criterio de éxito, qué hacer si
+  falla, presupuesto de tiempo (≤2 h) y líneas máximas del REPORT.
+- Tipos disponibles aquí: `explore`, `general` (implementer/tester/documenter/
+  releaser), `reviewer`. No inventar tipos: el rol va dentro del prompt del SPEC.
+- El único STATE es `STATE_release.md` (+ `STATE_alpha.md`, `STATE_mutants.md`).
+  No crear `STATE_current/backlog/evidence`: duplican lo que ya existe.
+- Respuestas: ≤15 líneas. Estado, último REPORT, próximo SPEC, bloqueos.
+- Sigue vigente: un tag sin release de GitHub no se crea.

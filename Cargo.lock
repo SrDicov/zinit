@@ -10,22 +10,22 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "zconfig"
-version = "0.1.0"
+version = "0.2.0-alpha"
 dependencies = [
  "zcore",
 ]
 
 [[package]]
 name = "zcore"
-version = "0.1.0"
+version = "0.2.0-alpha"
 
 [[package]]
 name = "zctl"
-version = "0.1.0"
+version = "0.2.0-alpha"
 
 [[package]]
 name = "zinit"
-version = "0.1.0"
+version = "0.2.0-alpha"
 dependencies = [
  "libc",
  "zconfig",
@@ -36,14 +36,14 @@ dependencies = [
 
 [[package]]
 name = "zrt"
-version = "0.1.0"
+version = "0.2.0-alpha"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "zservice"
-version = "0.1.0"
+version = "0.2.0-alpha"
 dependencies = [
  "libc",
  "zconfig",

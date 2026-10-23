@@ -1,6 +1,44 @@
 # Changelog
 
 ## [Unreleased]
+
+## [v0.2.0-alpha] - 2026-10-23
+### Cierre de alpha
+- `573 tests` en el workspace, 0 fallos; `clippy` y `fmt` limpios;
+  `check` y `tests` compilan para musl (`x86_64`).
+- Mutantes medidos, no estimados: `zcore` 15,2 % (31/204), `zconfig` 14,9 %
+  (116/776). En `zservice` los baratos quedan a cero (`ready.rs` y `log.rs`
+  sin supervivientes libres, con los equivalentes razonados en el código) y
+  los caros (268) documentados por archivo y con coste en `docs/audit/`.
+- Dos fallos reales de portabilidad que el CI destapó y se arreglaron:
+  `libc::tgkill` no está en los bindings musl del crate `libc` (se usa
+  `syscall(SYS_tgkill, ...)`) y un `mut` innecesario que `-D warnings`
+  convertía en error en toda la matriz.
+- Acta con los 9 criterios: [`docs/ACTA_ALPHA.md`](docs/ACTA_ALPHA.md).
+
+### Demand-start (2026-10-16)
+- A boot-disabled (`enabled = no`) dependency now becomes `Wanted::Up` the moment a
+  service that declares it `required` is actually running: dinit's `depends-on`
+  activation, inside the reconciler, one pass (`Reconcile::demand_start_single_pass`).
+  Operator stops are preserved (only boot-disabled services participate).
+- Release candidate `v0.2.0-rc1`: full matrix booted with PID1=zinit; live
+  dinit→zinit handoff on Artix verified (30 min coexistence + 1h window,
+  0 failed, 0 zombies). Soak 24h underway (baseline PSS 948 kB,
+  so far 1297/1309/1209 kB/h, all <100 kB/h influctuation; verdict pending).
+### Fatal policy (`on-fatal`, tolerate by default)
+- New `depends = after:`-style knob `on-fatal = ignore|warn|halt|reboot`
+  (default `warn`): terminal failures hold one service, never the boot.
+- Unknown required deps hold their service with a loud `W103` warning
+  instead of failing the whole load (the agetty ghost that bricked a
+  boot). `GraphError::UnknownDependency` removed.
+- `on-fatal = reboot` currently lands stop-all-idle with an explicit
+  announcement: no reboot path exists yet (see `docs/fatal-policy.md`).
+### Aristas solo-orden `after:`
+- `depends = after:x` ordena sin bloquear: el servicio espera el primer
+  intento de `x`, nunca su éxito (completado, fallido, suprimido o
+  deshabilitado liberan). Es la semántica de `after`/`waits-for`/`before`
+  de dinit; `opt:` sigue siendo la arista que ni ordena ni bloquea.
+  Ciclos `after` son fatales al cargar, como los requeridos.
 ### Cierre v0.0.1: contratos congelados + BSD preparado
 - `CONTRACTS.md`: C1–C7 congelados (sintaxis y capas, generadores,
   `wants/`, socket de control, entorno del hijo, estado visible,

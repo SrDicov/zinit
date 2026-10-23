@@ -307,12 +307,105 @@ pub fn block(set: SignalSet) -> io::Result<()> {
     Ok(())
 }
 
+/// Unblock the given signals in the calling thread.
+///
+/// The mirror of [`block`]: a signal that is blocked is never delivered, and
+/// a signal that is unblocked is delivered even if it was blocked before.
+pub fn unblock(set: SignalSet) -> io::Result<()> {
+    let raw = set.to_sigset()?;
+    // SAFETY: `raw` is a live, fully built `sigset_t`; `pthread_sigmask`
+    // reads it and retains nothing. `SIG_UNBLOCK` is a valid `how`.
+    if unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw, std::ptr::null_mut()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Block every catchable signal in the calling thread.
 ///
 /// The idempotent, one-line way to guarantee the invariant above. Cheap enough
 /// to be called defensively at the top of every entry point that spawns.
 pub fn block_all() -> io::Result<()> {
     block(SignalSet::all())
+}
+
+/// Set when a power signal (`SIGTERM` or `SIGINT`) reached PID 1.
+///
+/// The handler does nothing but set this flag: it runs in signal context,
+/// where nothing but an atomic store is allowed. The init's loop reads the
+/// flag and does the actual work.
+static POWER_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// The handler for the power signals.
+///
+/// Async-signal-safe by construction: one relaxed atomic compare-and-store
+/// and nothing else. No allocation, no locks, no syscalls.
+///
+/// The **first** signal wins: the machine is already going down, and a second
+/// one arriving mid-stop must not turn a poweroff into a reboot halfway
+/// through the sequence.
+extern "C" fn note_power_signal(signo: libc::c_int) {
+    let _ = POWER_SIGNAL.compare_exchange(
+        0,
+        signo,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Install the handler for the power signals and unblock them.
+///
+/// Both are power signals, with different meanings: `SIGINT` is what the
+/// kernel raises for `Ctrl-Alt-Del` and asks for a **reboot**, while
+/// `SIGTERM` — `kill -TERM 1` from an operator at the console — means the
+/// machine should go down instead of staying up with every service stopped.
+/// [`power_signalled`] reports which one, so the init can ask for the right
+/// verb.
+///
+/// The handler is installed *before* the signals are unblocked: a signal
+/// delivered between the unblock and the handler would kill PID 1, and the
+/// kernel's answer to a dead init is a panic.
+pub fn install_power_handler() -> io::Result<()> {
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        // The struct is zeroed and then filled: `sigaction` has different
+        // fields per platform (`sa_restorer` exists on Linux and nowhere
+        // else), and naming a field that does not exist does not compile
+        // on the other half of the matrix.
+        // SAFETY: `sigaction` is a plain C struct of integers and a
+        // pointer; zeroing it is the documented way to build one, and the
+        // handler and the empty mask are set right after.
+        let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+        action.sa_sigaction = note_power_signal as *const () as usize;
+        // No `SA_RESTART`: a blocking `waitpid` in the init must return
+        // `EINTR` so the loop notices the signal.
+        action.sa_flags = 0;
+        // SAFETY: `action` is a live, fully built `sigaction`; `sigaction`
+        // copies it and retains nothing.
+        if unsafe { libc::sigaction(sig, &action, std::ptr::null_mut()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // Unblock just those two; everything else stays blocked (the fork
+    // safety argument in `crate::childproc` depends on it).
+    let mut set = SignalSet::all();
+    set.remove(Signal::Term);
+    set.remove(Signal::Int);
+    unblock(set)
+}
+
+/// Which power signal arrived, if any. Consumes the flag.
+///
+/// One-shot on purpose: the init acts on the signal once, and a second
+/// signal while the machine is already going down must not start a second
+/// power action. The signal itself matters: `SIGINT` is what the kernel
+/// raises for `Ctrl-Alt-Del`, whose contract is a reboot, while `SIGTERM`
+/// is an operator asking for the machine to go down.
+pub fn power_signalled() -> Option<Signal> {
+    match POWER_SIGNAL.swap(0, std::sync::atomic::Ordering::Relaxed) {
+        libc::SIGTERM => Some(Signal::Term),
+        libc::SIGINT => Some(Signal::Int),
+        _ => None,
+    }
 }
 
 /// The signals currently blocked in the calling thread.
@@ -710,9 +803,18 @@ impl SignalSource for KqueueSignalSource {
         }
         let mut out = Vec::with_capacity(n as usize);
         for ev in buf.iter().take(n as usize) {
-            // `fflags` holds the signal number for a triggered EVFILT_SIGNAL
-            // (and NOTE_TRIGGERED is set alongside it).
-            if let Some(sig) = Signal::from_raw(Into::<u64>::into(ev.fflags) as u32 as i32) {
+            // For `EVFILT_SIGNAL` the signal number is the event's **`ident`**
+            // — the same field `kevent` was given when the filter was
+            // registered — while `data` carries how many times it arrived and
+            // `fflags` is not used. Reading `fflags` here meant no signal was
+            // ever reported on the BSDs: `SIGTERM` was ignored in silence, the
+            // worst possible failure for the one signal an operator uses to
+            // stop a machine. Linux passed either way, because `signalfd`
+            // never goes through this code.
+            if ev.filter as i32 != libc::EVFILT_SIGNAL as i32 {
+                continue;
+            }
+            if let Some(sig) = Signal::from_raw(ev.ident as i32) {
                 out.push(sig);
             }
         }
@@ -1098,5 +1200,42 @@ mod tests {
         assert_eq!(Signal::from_raw(libc::SIGSTOP), None);
         assert_eq!(Signal::from_raw(0), None);
         assert_eq!(Signal::from_raw(9999), None);
+    }
+
+    /// The power handler records *which* signal arrived, and nothing else.
+    ///
+    /// A handler that did anything more (a syscall, an allocation) would be
+    /// unsafe in signal context, so the whole design rests on this being one
+    /// atomic exchange and the flag being read by the loop. The signal
+    /// matters because `SIGINT` (`Ctrl-Alt-Del`) asks for a reboot and
+    /// `SIGTERM` asks for the machine to go down.
+    #[test]
+    fn the_power_handler_says_which_signal_arrived() {
+        install_power_handler().expect("install the handler");
+        assert_eq!(
+            power_signalled(),
+            None,
+            "something was set before any signal arrived"
+        );
+        raise_to_self(Signal::Term).expect("raise SIGTERM");
+        // The signal is delivered on the next return to userspace; the
+        // raise itself is a syscall, so by the time it returns the handler
+        // has run.
+        assert_eq!(
+            power_signalled(),
+            Some(Signal::Term),
+            "SIGTERM did not reach the power handler"
+        );
+        assert_eq!(
+            power_signalled(),
+            None,
+            "the flag must be consumed once, so a second power action cannot start"
+        );
+        raise_to_self(Signal::Int).expect("raise SIGINT");
+        assert_eq!(
+            power_signalled(),
+            Some(Signal::Int),
+            "SIGINT did not reach the power handler"
+        );
     }
 }

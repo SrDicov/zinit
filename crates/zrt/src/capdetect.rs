@@ -621,6 +621,14 @@ mod tests {
         assert!(missing.contains(&"kernel-delivered-signals"));
         assert!(missing.contains(&"setresuid"));
         assert!(!missing.contains(&"procfs"), "nothing here uses /proc");
-        assert!(bare.degradation_line().is_some());
+        // The line is what an operator reads at boot; `is_some()` accepts an
+        // empty string and a line that names nothing.
+        let line = bare
+            .degradation_line()
+            .expect("a bare machine must say what it lacks");
+        assert!(
+            line.contains("kernel-delivered-signals"),
+            "the degradation line must name what is missing: {line:?}"
+        );
     }
 }

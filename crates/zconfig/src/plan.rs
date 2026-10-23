@@ -166,6 +166,12 @@ fn freeze(graph: &Graph, findings: &mut Vec<Diagnostic>) -> core::result::Result
     // `ServicePlan`s to throw them away would be the most expensive way to say
     // "a -> b -> a".
     let order_up = topological_order(graph)?;
+    // Order-only cycles hang the boot worse than required cycles do (two
+    // services waiting on each other's first attempt, forever, with no error
+    // to report), so they are fatal here too, with the same path report.
+    if let Some(err) = check_order_acyclic(graph) {
+        return Err(err);
+    }
     let mut order_down = order_up.clone();
     order_down.reverse();
 
@@ -422,6 +428,64 @@ fn find_cycle(graph: &Graph, placed: &[bool]) -> Vec<Idx> {
     vec![start]
 }
 
+/// `Some(GraphError::Cycle { path })` if `graph` has an order deadlock:
+/// a cycle in required ∪ after edges, with the actual cycle in it.
+///
+/// Required-only cycles break the topological order, so Kahn finds them
+/// first; `after`-only mutual waits (`a` after `b`, `b` after `a`) would
+/// pass ordering and then hang the boot, and so would a mixed loop (a
+/// required edge one way, an order-only edge back: each side waits on the
+/// other and neither ever attempts). Fatal here, with the same path
+/// report, for the same reason. Iterative DFS over both CSRs, required
+/// rows before after rows; a self-edge is already rejected at parse
+/// (E016), so any loop found here has length ≥ 2.
+fn check_order_acyclic(graph: &Graph) -> Option<GraphError> {
+    let n = graph.len();
+    // 0 = unvisited, 1 = on stack, 2 = done. `step` resumes each node's
+    // adjacency scan after a descent, so the walk is iterative.
+    let mut mark: Vec<u8> = vec![0; n];
+    let mut step: Vec<usize> = vec![0; n];
+    let mut stack: Vec<Idx> = Vec::new();
+    for start in 0..n {
+        if mark[start] != 0 {
+            continue;
+        }
+        stack.push(start);
+        mark[start] = 1;
+        while let Some(&i) = stack.last() {
+            let req = graph.required_of(i);
+            let aft = graph.after_of(i);
+            let total = req.len() + aft.len();
+            if step[i] < total {
+                let d = if step[i] < req.len() {
+                    req[step[i]]
+                } else {
+                    aft[step[i] - req.len()]
+                };
+                step[i] += 1;
+                if mark[d] == 1 {
+                    let at = stack.iter().position(|&p| p == d).unwrap_or(0);
+                    let mut cyc: Vec<Idx> = stack[at..].to_vec();
+                    cyc.push(d);
+                    let path = cyc
+                        .into_iter()
+                        .map(|x| graph.desc(x).name.clone())
+                        .collect();
+                    return Some(GraphError::Cycle { path });
+                }
+                if mark[d] == 0 {
+                    mark[d] = 1;
+                    stack.push(d);
+                }
+            } else {
+                mark[i] = 2;
+                stack.pop();
+            }
+        }
+    }
+    None
+}
+
 /// Freeze one service: description + resolved indices + resolved policy.
 fn service_plan(graph: &Graph, i: Idx, findings: &mut Vec<Diagnostic>) -> ServicePlan {
     let d = graph.desc(i);
@@ -429,10 +493,15 @@ fn service_plan(graph: &Graph, i: Idx, findings: &mut Vec<Diagnostic>) -> Servic
     // Copy the edge lists out first, so the borrow of `graph` ends before the
     // owned `ServicePlan` is built.
     let required: Vec<Idx> = graph.required_of(i).to_vec();
+    let after: Vec<Idx> = graph.after_of(i).to_vec();
+    let missing: Vec<String> = graph.missing_of(i).to_vec();
 
     let mut sp = ServicePlan::new(d.name.clone());
     sp.kind = d.kind;
     sp.required = required;
+    sp.after = after;
+    sp.missing_required = missing;
+    sp.on_fatal = d.on_fatal;
     sp.restart = d.restart.policy;
     sp.ready = d.ready.into_ready();
     sp.start_timeout_ms = timeout_or(d.start_timeout_ms, DEFAULT_START_TIMEOUT_MS);
@@ -1191,6 +1260,54 @@ mod tests {
         desc_with(name, ServiceKind::Process, deps, &[])
     }
 
+    fn after_desc(name: &str, afters: &[&str]) -> ServiceDesc {
+        let mut d = desc_with(name, ServiceKind::Process, &[], &[]);
+        d.depends_after = afters.iter().map(|s| String::from(*s)).collect();
+        d
+    }
+
+    #[test]
+    fn after_edges_land_in_the_plan_without_constraining_order() {
+        // b waits for a's attempt, but a need not precede b topologically:
+        // order-only is a runtime gate, not a plan edge.
+        let p = plan_of(vec![after_desc("b", &["a"]), desc("a")]);
+        let (a, b) = (p.index_of("a").unwrap(), p.index_of("b").unwrap());
+        assert_eq!(p.services[b].after, vec![a]);
+        assert!(p.services[a].after.is_empty());
+    }
+
+    #[test]
+    fn an_after_cycle_is_fatal_with_the_path() {
+        // A mutual wait hangs the boot with no error to report, so like a
+        // required cycle it fails at load, naming the loop.
+        let err = build_plan(&[after_desc("a", &["b"]), after_desc("b", &["a"])])
+            .expect_err("mutual after must not freeze");
+        match err {
+            GraphError::Cycle { path } => {
+                assert_eq!(path.first(), path.last(), "a cycle must close: {path:?}");
+                assert!(path.contains(&String::from("a")) && path.contains(&String::from("b")));
+            }
+            other => panic!("expected Cycle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_mixed_required_after_loop_is_fatal() {
+        // Required one way, order-only back: each side waits on the other
+        // (one for Running, one for the first attempt) and neither ever
+        // attempts. Same hang as a pure cycle, same fatal report.
+        let a = desc_with("a", ServiceKind::Process, &["b"], &[]);
+        let mut b = desc_with("b", ServiceKind::Process, &[], &[]);
+        b.depends_after = vec![String::from("a")];
+        let err = build_plan(&[a, b]).expect_err("mixed loop must not freeze");
+        match err {
+            GraphError::Cycle { path } => {
+                assert_eq!(path.first(), path.last(), "a cycle must close: {path:?}");
+            }
+            other => panic!("expected Cycle, got {other:?}"),
+        }
+    }
+
     /// `a -> a` is a typo, not a design, and gets its own variant with its own
     /// message. It must never surface as "dependency cycle: a -> a".
     #[test]
@@ -1291,7 +1408,14 @@ mod tests {
         .expect("valid graph");
         assert_eq!(check_acyclic(&g), None);
         assert!(!has_cycle(&g));
-        assert!(topological_order(&g).is_ok());
+        // `is_ok()` alone proves nothing about the answer: a function that
+        // returned the reverse order also returns `Ok`, and the whole point of
+        // this pass is that `b` starts after `a`.
+        assert_eq!(
+            topological_order(&g).expect("an acyclic graph orders"),
+            vec![0, 1],
+            "the dependency must come first"
+        );
     }
 
     /// A cycle is an `Err`, never a panic. This crate is built
@@ -1449,13 +1573,15 @@ mod tests {
     }
 
     #[test]
-    fn a_build_error_never_yields_a_plan() {
+    fn a_dangling_required_edge_holds_instead_of_failing() {
+        // The plan builds; the service holds at runtime with its ghost
+        // recorded. Findings carry the loud warning.
         let descs = vec![desc_with("a", ServiceKind::Process, &["ghost"], &[])];
-        assert!(matches!(
-            build_plan(&descs),
-            Err(GraphError::UnknownDependency { .. })
-        ));
-        assert!(build_plan_with_findings(&descs).is_err());
+        let (plan, findings) = build_plan_with_findings(&descs).expect("tolerate");
+        let a = plan.index_of("a").unwrap();
+        assert!(plan.services[a].required.is_empty());
+        assert_eq!(plan.services[a].missing_required, [String::from("ghost")]);
+        assert!(findings.iter().any(|f| f.code == "W103"));
     }
 
     /// Rule 6: at the cap it works, one over it is an error naming the count -

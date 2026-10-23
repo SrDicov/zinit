@@ -1316,10 +1316,16 @@ fn listen_name<'a>(
 /// prefix in any case (`CAP_SYS_ADMIN`). The numbers are stable across
 /// architectures (linux/capability.h), which is what makes parse-time
 /// validation sound — unlike syscall numbers, these do not move per arch.
+/// The highest capability number this table knows (`checkpoint_restore`).
+///
+/// Kept next to the table so `drop-capabilities = all` and the name lookup
+/// cannot drift apart.
+pub const MAX_CAPABILITY: u32 = 40;
+
 pub fn parse_capability(input: &str) -> Option<u32> {
     let lower = input.to_ascii_lowercase();
     let name = lower.strip_prefix("cap_").unwrap_or(&lower);
-    // The full set through CAP_CHECKPOINT_RESTORE (39). A name outside it is
+    // The full set through CAP_CHECKPOINT_RESTORE (40). A name outside it is
     // either a typo or a kernel newer than this table, and both are refusals
     // upstream — never a silently skipped drop.
     Some(match name {

@@ -1,0 +1,362 @@
+# KNOWN ISSUES (honest list)
+
+Everything here was observed in a VM, not reasoned about. Each entry
+says what breaks, what does not, and what replaces the missing piece.
+
+## Demand-start (implemented)
+
+A required edge to a `desired=down` service now fires pull-on-demand:
+when a service that declares such an edge is actually running on a
+pass, every **disabled** (`enabled = false` at load) dependency that
+edge points at becomes `Wanted::Up` and joins the same pass. Mirrors
+dinit\'s `depends-on` activation. Operator-stopped services (desired=Down
+on an `enabled=true` one) are never re-armed, so `zctl stop` still wins.
+
+Observed cause (Artix): live `dep_add` edges `agetty → getty@tty1..6`
+held `agetty`, `system` (`after:agetty`) and `boot`. With the
+reconciler\'s pool rule in place (see `Test in
+`crates/zcore/src/reconcile.rs::demand_start_single_pass`), the same
+chain now converges without any manual `zctl start`: live proof on P1
+(binary c11f5fee) where `getty@tty6.conf` carries `enabled = no` on disk
+yet runs from boot, pulled by `agetty`'s live required edge. `enabled = no`
+off the closure remains the convert policy (it decides the model, not
+the run-time rule).
+
+## `on-fatal = reboot` reboots for real now
+
+Power verbs landed (`zctl poweroff|reboot|halt|suspend`, C4, orderly
+stop-all + deadline + breadcrumb in `/var/log/zinit-power.log`), so a
+`reboot`-marked terminal failure stops every service and reboots through
+the same epilogue. `hibernate` stays refused (no resume target).
+See `docs/fatal-policy.md`.
+
+## compatd answers NAK where dinit acts
+
+`unload`, `SOFTREBOOT`, `KEXEC` are refused honestly (`hibernate` joins
+them: no resume target). Shutdown verbs now act: HALT/POWEROFF/REBOOT go
+through the supervisor (orderly stop-all + deadline + breadcrumb), and
+`reboot`/`poweroff`/`halt` binaries work again via the socket. TERM to
+PID 1 stays stop-all-stay-idle by design (a Ctrl-C storm must never
+power the machine off); power is an explicit verb, never a signal.
+
+## Probe-style scripts read "held", not "completed"
+
+`type = script` + `restart = never` exiting 0 is held as suppressed
+(the `completed` marker is oneshot-only), so self-test services like
+`probe` show `stopped desired=up` after doing their job (`PROBE_DONE`
+written, exit 0). Benign test artifact, not a failure. Audit rule:
+`restart = never` + `restarts=0` + suppressed + no failure = done.
+
+## Platform recipes, not bugs
+
+- Void (dracut): the guest has no net service of its own, so boot
+  with `ip=dhcp rd.neednet=1` — dracut leaves the interface up and
+  ssh works. Without it the machine boots fine with no address.
+- Chimera: serial-console login never worked (root password unknown,
+  ssh-key only). Use ssh. Seasoning note: `sshd.conf` must not carry
+  convert-stamped `enabled = no` — strip it at seasoning or ssh dies
+  on the next reboot (observed 2026-10-16, fixed by stripping).
+- Alpine: OpenRC → zinit conversion is future work. Supported claim
+  is "zinit boots as PID 1" (5 services, serial+sshd), nothing more.
+- Slirp: hostfwd delivers to the guest's `.15`. Static configs must
+  target `10.0.2.15/24` via `10.0.2.2`.
+
+## Live-Chimera findings (2026-10-16, coexistence, sup alongside dinit)
+
+- Fast-dying child goes stale (single occurrence, NOT reproduced):
+  synthesized `agetty-service@tty1` (pid 3899/4287/4379) was reported
+  `Running` with dead pids, `restarts = 0/3`, no log. Since then:
+  demand-pull + instant-death + instance + C4-wake + direct-exec were all
+  reproduced live and in CI (`demand_pulled_instant_death_keeps_flapping`,
+  green) and all flap correctly; getty instances synthesized later run
+  healthy for 15+ min. A reap-path audit (Oct 2026) showed reap-before-
+  track is mechanically impossible (SIGCHLD blocked, nothing reaps between
+  fork and track) and pointed at the forking hold-window
+  (`on_waitpid(forking, unadopted)` holds the death while `cleanup()` wipes
+  state) or a lookup-miss discard. Needs the directed root-cause session,
+  not more documentation.
+- compatd v7 vs dinit 0.22.0 clients: CLOSED. The RC=124 hangs were
+  head-of-line blocking (single-threaded accept + one silent holder),
+  fixed by one-thread-per-connection with shared handles (generator
+  d9a5c2a). Proven live twice: real `dinitctl is-started/status` answer
+  instantly. Open minor: after the unexplained 12:44 reboot compatd was
+  found stopped (desired=down, restarts=0) with the socket file present
+  but unserved; manual `zctl start` restored it. Why it was down is
+  unknown (operator action during the poweroff tests, or boot ordering).
+- Runtime-activated services: HALF CLOSED by evidence. rtkit and
+  power-profiles-daemon run healthy under zinit PID1 (restarts 0),
+  pulled at runtime — the dbus-Exec + compatd path works. Only
+  bluetoothd stays stopped until something requests org.bluez (same
+  path, not yet observed firing). No provider to build; the remaining
+  work is observing one activation, not implementing one.
+
+## Soak scope
+
+PSS/FD/zombie numbers are the `zinit --sup` process alone (PID 1 is
+a separate process, children excluded). The 2026-10-16 soak runs a
+pre-P0 binary (PSS baseline 948 kB fresh); P0 touched only
+transition arms, but the number belongs to the old build until the
+soak restarts on the release binary.
+
+## 2026-10-16 ~20:00Z — REMOVAL ATTEMPT SELF-LOCKOUT (open)
+- The PID1-aware power shim was deployed to /sbin/poweroff (and friends),
+  but the machine is OFFLINE and unresponsive 10+ min after `doas /sbin/reboot`.
+  Root cause suspected: the shim's zinit branch calls `/sbin/zctl reboot`,
+  which needs the control socket; under dinit PID 1 (the default boot)
+  /sbin/zctl has no supervisor to talk to, so it exits 1 and the shim did
+  nothing. The fallback to the original dinit applet was added too late
+  (only after the reboot had already been issued).
+- Status: box unreachable via SSH/tailscale/LAN; needs physical power cycle.
+- Recovery on next boot (dinit default): SSH in, restore the original
+  applets from /root/dinit-orig/sbin/shutdown.real, remove the
+  compat-service pins, and only retry removal with a cold-boot-into-zinit
+  verification before any power action.
+- Lesson recorded: never replace the power path while the machine may still
+  boot into dinit; test the shim under BOTH inits before relying on it.
+
+## 2026-10-16/17 — Cerrado en esta noche
+
+- **Un supervisor por socket (cerrado)**: dos supervisores sobre el mismo
+  socket era una carrera, no una configuración; el segundo robaba el path y
+  los clientes del primero acababan hablando con otro. Ahora hay un
+  `flock` exclusivo sobre `<socket>.lock` y el segundo se aparta con el
+  código de salida 11, que PID 1 lee para no relanzar (la máquina ya está
+  gobernada por el otro). Un supervisor muerto libera el cerrojo: lo
+  libera el kernel, no el código.
+- **Un supervisor que vuelve arranca copias de todo (cerrado)**: al
+  morir, sus hijos quedaban reparentados a PID 1, que no sabe nada de
+  ellos, y el supervisor nuevo arrancaba un segundo copy de cada servicio
+  (pasó en vivo el 2026-10-16: dos daemons de cada cosa peleándose por
+  los puertos). Ahora el supervisor adopta los que siguen vivos: el estado
+  visible dice qué pid tenía cada servicio, y un pid vivo de un servicio
+  que el plan todavía nombra se adopta (vigilado con pidfd, señalado por
+  pid, sin arrancar una copia).
+- **`kill -TERM 1` no apagaba la máquina (cerrado)**: la señal se
+  encolaba y se ignoraba. Ahora el handler sólo pone una bandera (en
+  contexto de señal no se puede hacer nada más) y el bucle de PID 1 la
+  convierte en un verbo `poweroff` por el socket de control: el poder
+  sigue teniendo un solo dueño, el supervisor.
+- **Configuración rota = máquina girando (cerrado)**: el supervisor
+  moría, PID 1 lo relanzaba, moría otra vez, y la máquina se quedaba sin
+  socket, sin servicios y sin manera de entrar. Ahora hay modo
+  emergencia: una shell en `/dev/console` (escrita como una descripción
+  normal y cargada por el mismo parser) y el socket de control en pie,
+  para que `zctl reload-all` recoja el plan real cuando el fichero esté
+  arreglado. `zctl emergency` la pone a demanda.
+- **El estado visible mentía (cerrado)**: los ficheros de servicios
+  borrados seguían ahí diciendo que estaban corriendo, y se escribían
+  en sitio (un lector podía ver medio fichero nuevo y medio viejo). Ahora
+  se escriben con rename (atómico) y los de servicios que ya no están en
+  el plan se borran.
+- **`suspend` respondía después de despertarse (cerrado)**: la escritura
+  a `/sys/power/state` no vuelve hasta que la máquina despierta, así que
+  el cliente esperaba dormido. Ahora la respuesta ("suspending") sale
+  antes, y el error (si el kernel lo rechazó) llega después.
+- **Doble superficie de autenticación (cerrado)**: el socket de control
+  es 0600, pero cualquier proceso de ese usuario podía mandar `poweroff`.
+  Ahora se capturan las credenciales del peer al aceptar (`SO_PEERCRED`):
+  leer es para cualquiera, gestionar servicios es del dueño, y apagar la
+  máquina es del dueño usando `zctl` (o de root). Código de error nuevo:
+  `6`.
+
+## Abierto (espera la máquina)
+
+- **Soak de 24 h**: la caja está apagada; no se puede relanzar el
+  muestreo ni medir la pendiente hasta que vuelva.
+- **Verificación en vivo del apagado por señal** (`kill -TERM 1`): el
+  camino está implementado y con test de regresión, pero el syscall
+  final sólo se prueba en la máquina.
+- **Timers**: resuelto por la vía de no hacerlos. La máquina trae
+  `cronie`/`crond` (evidencia en el repo del generador, `z-dinit-generator/evidence/`), así que un
+  planificador dentro de zinit sería la misma función dos veces. 
+
+## El filtro de syscalls no filtraba: era `SECCOMP_MODE_STRICT` (2026-10-22)
+
+Lo que se creía una ventaja del proyecto — `syscall-filter = enforce|errno` —
+no funcionaba, y no podía funcionar:
+
+- `SECCOMP_MODE_FILTER` estaba escrito como `1`. El valor 1 es
+  `SECCOMP_MODE_STRICT`: el kernel instala **su propio** filtro de cuatro
+  syscalls y mata el proceso con `SIGKILL` en cuanto intenta `execve`. Todo
+  servicio con filtro moría al arrancar; `strace` lo enseñaba como
+  `prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT)` y `killed by SIGKILL` una
+  línea después. El valor correcto es `2`.
+- Instalar un filtro sin `CAP_SYS_ADMIN` exige `no_new_privs`, y NNP sólo se
+  ponía cuando el servicio cambiaba de identidad, así que el `prctl` fallaba
+  con `EPERM` en todos los demás. Ahora NNP se pone siempre que hay filtro:
+  un servicio filtrado que aún puede ganar privilegios por un binario setuid
+  tiene una puerta que el filtro no ve.
+- Faltaban en la tabla y en la base implícita `getpgrp` (111, syscall propia
+  en x86_64, no un alias de `getpgid`), `getresuid` (118), `getresgid` (120),
+  `wait4`, `waitid` y `vfork` (58). Sin ellas un shell no arranca, no puede
+  esperar a un hijo y no puede hacer fork+exec: `dash` respondía
+  `Cannot fork` y ningún `type = script` filtrado ejecutaba su comando.
+
+Por qué nadie lo vio: el único test que lo cubría exigía root y se saltaba
+en CI (que corre sin privilegios), y además **escribía las tres respuestas en
+el mismo fichero** mientras las aserciones leían tres ficheros distintos: no
+podía pasar ni como root. Los tres fallos están arreglados y con test que
+corre en CI (`a_filtered_service_starts_and_does_its_work`) más el de sandbox
+como root (`the_sandbox_really_confines`, verificado en contenedor
+privilegiado). Evidencia del arreglo: servicio filtrado en `errno` y en
+`enforce` que arranca, escribe su fichero y sale con 0; shell filtrado que
+hace `unshare` (EPERM, como debe) y luego escribe su código de salida.
+
+**Límite honesto**: la tabla de números está verificada sólo para
+**x86_64 Linux**. En cualquier otra arquitectura un `syscall-filter`
+configurado es rechazo de spawn (fail-closed), no un filtro aproximado.
+Añadir la tabla de aarch64 es trabajo mecánico con riesgo real (un número
+equivocado es un agujero, no una errata): se hará con la misma disciplina,
+una tabla y sus números críticos verificados contra el kernel.
+
+## En BSD/macOS el supervisor no oía ninguna señal (2026-10-23)
+
+Encontrado por el job `macos-aarch64` de CI, no por la máquina:
+
+- El backend `EVFILT_SIGNAL` descodificaba el número de señal de `fflags`.
+  En kqueue el número va en **`ident`** (el mismo campo con el que se
+  registró el filtro); `data` es la cuenta y `fflags` no se usa. Resultado:
+  `drain()` devolvía una lista vacía **siempre**, y `SIGTERM`/`SIGINT`/`SIGHUP`
+  al supervisor se ignoraban en silencio. La evidencia fue el propio log del
+  test que para la máquina: ni una línea de "SIGTERM received" y el servicio
+  seguía `Running` diez segundos después.
+- Linux nunca lo vio porque su camino es `signalfd`, que no pasa por ese
+  código. Arreglado leyendo `ident` y filtrando por `EVFILT_SIGNAL`.
+- **No se puede cubrir con un test unitario propio**: un `SIGUSR2`
+  process-directed en un binario de tests multihilo mata el proceso (signal
+  12) porque `block()` sólo enmascara el hilo que llama; lo vi en CI. La
+  cobertura es el test de integración que manda un `SIGTERM` real a un
+  supervisor real (`a_stop_in_progress_does_not_resurrect_a_pending_restart`):
+  en BSD sólo converge a `Stopped`/`Down` si la señal llega.
+
+**Límite honesto**: la verificación es la de CI (macOS aarch64) y la
+deducción del campo documentado por kqueue; no hay una máquina BSD a mano
+para un soak de señales.
+
+## El verbo de potencia en plataformas sin `/proc`
+
+El chequeo "sólo `zctl`/`zinit` apagan la máquina" se apoya en
+`/proc/<pid>/exe`. Donde no hay `/proc` (BSDs) no se puede nombrar el
+ejecutable del cliente, así que queda la frontera del socket (`0600`): puede
+pedirlo cualquier proceso del usuario dueño. Es el modelo de amenaza
+documentado (guarda contra un accidente, no contra el código del dueño), pero
+es un chequeo **más débil**: ahora el supervisor lo anuncia al arrancar en
+vez de que lo descubra un informe de bug. Rechazarlo (fail-closed) se probó y
+se descartó porque rompía `zctl hibernate`/`poweroff` legítimos en macOS: un
+`zctl` que deja de funcionar es peor que una guarda floja y anunciada.
+
+## Inestabilidad observada en macOS: drop de identidad en un hijo forkeado (abierto)
+
+`identity::dropping_to_our_own_ids_is_either_clean_or_untouched` falló **una
+vez** en el job `macos-aarch64` (run `39890730246`) y pasó en los demás,
+incluida la repetición del mismo commit (`a5c8508`, dos pasadas verdes).
+
+**Medido, no supuesto**: el job de macOS repite el test `ZINIT_FLAKE_RUNS=3000`
+veces desde `9e81b0f` (cuesta ~1 s), y la primera medida es **0 fallos en
+3000**. También 600 iteraciones locales en Linux (debug y release), 0 fallos.
+Sigue abierto sólo si aparece en uso real; no bloquea beta. Lo que el bucle
+no reproduce es una causa *ambiental* distinta de la carga del propio job
+(el resto de tests no corre a la vez dentro de una iteración).
+
+- Qué hace el test: `fork`, en el hijo ejecuta el `drop_privileges` real
+  contra nuestros propios ids, y el padre exige "o baja y verifica, o falla
+  sin tocar nada".
+- Por qué no está cerrado: el mensaje original no distinguía "veredicto
+  falso" de "el hijo murió por una señal", así que la primera vez no quedó
+  evidencia. Ya devuelve un código por desenlace (verificado / intacto / ok
+  pero ids equivocados / err y cambió) y, si hubo señal, su número.
+- Hipótesis principal, sin confirmar: `fork()` desde un proceso de tests
+  multihilo en macOS (el hijo hereda sólo el hilo que llamó y el estado del
+  arnés), que es justo el motivo por el que el test `_exit`a en vez de volver.
+- Siguiente paso si vuelve: el mensaje nuevo dice el desenlace exacto; con
+  eso se decide entre endurecer el hijo (preparar todo antes del `fork`) o
+  gatear el test a Linux, donde vive el camino de producción (`setresuid`).
+  La tasa queda medida en cada run de macOS, así que "volvió" ya viene con
+  contexto.
+
+## Lo que la auditoría independiente encontró (2026-10-23)
+
+Cuatro afirmaciones del reporte anterior no resistían el código. Dos se
+arreglaron, dos se documentan como límite real.
+
+**Arreglado — el verbo de potencia se autorizaba por nombre de fichero.**
+`authorize()` aceptaba `poweroff` de cualquier proceso del mismo uid cuyo
+binario se llamara `zctl`/`zinit`, estuviera donde estuviera. Ahora el
+ejecutable tiene que estar en un directorio de instalación (`/usr/bin`,
+`/usr/sbin`, `/bin`, `/sbin`, `/usr/local/{bin,sbin}`) o en el mismo
+directorio que el supervisor (árbol de build, prefijo propio). Un
+`/tmp/zctl` ya no pasa. Sigue sin ser una frontera contra el dueño de la
+cuenta —un proceso suyo puede escribir en su propio `$HOME`— y eso está
+dicho en el docstring desde el principio.
+
+**Arreglado — fail-open en Linux cuando fallaba el `readlink`.**
+`/proc/<pid>/exe` se lee al aceptar la conexión; si el peer muere en esa
+ventana o `/proc` no es legible, `peer_exe` era `None` y `None` concedía
+potencia. Ahora `None` en Linux es **rechazo** (un `zctl` legítimo está vivo:
+escribe la trama y espera la respuesta), y en plataformas sin `/proc` se
+mantiene el uid y se anuncia al arrancar. El anuncio estaba bajo
+`cfg(not(linux))`, así que la degradación de Linux era invisible: por eso
+pasaba desapercibida.
+
+**Arreglado — off-by-one entre `build` e `install` del filtro seccomp.**
+`build` aceptaba 200 números y producía 206 instrucciones; `install`
+rechazaba más de 205. Una política en el límite se construía y luego no se
+podía instalar. Ambos límites salen ahora de `MAX_PROGRAM`, con un test que
+pina la relación (sin instalar un filtro real, que sería irreversible).
+
+**Límite real, documentado — el filtro mira números, no argumentos.**
+Un servicio filtrado puede seguir pidiendo `clone(CLONE_NEWUSER)` y usar
+`ioctl` (`TIOCSTI` incluido): el cBpf clásico no inspecciona argumentos.
+Filtrar argumentos exige revisar la ABI por arquitectura; no se hace aquí.
+
+**Límite real, documentado — `private-tmp` aísla `/tmp`, y nada más.**
+`/var/tmp` y `/dev/shm` siguen siendo del host y compartidos entre
+servicios. Además `MS_PRIVATE` es best-effort (`let _ =`), que en un
+contenedor anidado puede no aplicarse.
+
+**Hallazgo en el repo del generador (fuera de este árbol, y bloquea quitar
+dinit).** La conversión pierde semántica en al menos: `capabilities` /
+`securebits` (se avisa y el servicio convertido corre con **todas** las
+capacidades, cuando dinit las restringía), `starts-on-console` (no está en
+el match, cae al aviso genérico), `kill-all-on-stop` (ignorada), `waits-for`
+(se convierte además en `pulls`, que activa de más), `restart` (default
+`always` cableado, dinit lo decide en build-time), `socket-permissions`
+(dinit 666, zinit 0600), `start-timeout` (dinit manda SIGINT al grupo;
+zinit sólo aplica el plazo con `ready = notify`) e `inittab-*` (sin utmp).
+Doce claves mapeadas no tienen test. Nada de esto es de este repo: se
+arregla allí, y es la razón por la que quitar dinit no es sólo desinstalar
+un paquete.
+
+## devmon sigue siendo de dinit (decisión, no bug)
+
+`dinit-base` se queda instalado. zinit reemplaza a **dinit como init**; el
+paquete de dinit se mantiene por `devmon`, su demonio de monitorización de
+dispositivos, que arranca servicios cuando aparece hardware (USB, drm, etc.).
+
+- zinit **no** tiene disparo por dispositivo: tiene activación por socket
+  (`listen =`) y `wants/` estáticos. Un servicio que dinit arrancaba al
+  enchufar un dispositivo no arranca solo bajo zinit.
+- El generador **no** intenta convertir devmon y no lo menciona: si alguien
+  desinstala `dinit-base`, pierde esa notificación en silencio. Riesgo real
+  y por eso la decisión es mantenerlo.
+- v0.3: `listen = device:` en zinit (issue abierto en el repo). Hasta
+  entonces la migración es "zinit es PID 1, dinit-base sigue instalado por
+  su demonio", y eso hay que decirlo así en cualquier README de la máquina.
+
+## Dos límites del verbo de potencia (encontrados por cross-auditoría)
+
+- **Instalaciones fuera de los seis directorios**: `zctl` en `/opt/...` o en
+  `~/.cargo/bin` puede gestionar servicios (clase Mutate) pero **no** apagar
+  la máquina: sólo cuentan `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`,
+  `/usr/local/{bin,sbin}`, y el directorio del propio supervisor **si** el
+  operador pone `ZINIT_TRUST_SELF_DIR=1`. Es deliberado: ese último
+  directorio es escribible por el mismo usuario al que el chequeo quiere
+  limitar. Un instalador propio debe poner el binario en `/usr/local/bin` o
+  exportar la variable en la unidad del supervisor.
+- **Reutilización de pid**: el pid del peer llega por `SO_PEERCRED` y el
+  `/proc/<pid>/exe` se lee en el mismo pase del bucle, pero el kernel no
+  congela la identidad del proceso. Un peer que muere y cuyo pid se reusa por
+  un `zctl` legítimo antes de esa lectura sería aceptado. La ventana es de
+  microsegundos y exige control del reciclado de pids; se documenta en vez de
+  fingir que no existe. Cerrarla del todo pide comparar la identidad del
+  proceso (starttime) en el mismo `open`/`readlink`, no un chequeo posterior.

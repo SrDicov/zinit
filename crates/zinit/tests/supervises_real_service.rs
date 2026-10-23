@@ -53,8 +53,6 @@ use std::time::{Duration, Instant};
 const POLL_MS: u64 = 25;
 /// How long a supervisor may take to start a service.
 const START_DEADLINE_MS: u64 = 10_000;
-/// How long a supervisor that must *refuse* may take to say so.
-const EXIT_DEADLINE_MS: u64 = 10_000;
 /// How long a terminated process may take to become a name nobody can find.
 const REAP_DEADLINE_MS: u64 = 5_000;
 
@@ -199,6 +197,15 @@ impl Scratch {
             .unwrap_or_else(|e| panic!("cannot write {}: {e}", path.display()));
     }
 
+    /// The last lines of a file, for a failure message.
+    fn tail(&self, name: &str) -> String {
+        let text = std::fs::read_to_string(self.path().join(name)).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().rev().take(12).collect();
+        let mut out: Vec<&str> = lines.into_iter().rev().collect();
+        out.push("");
+        out.join("\n")
+    }
+
     fn read(&self, name: &str) -> Option<String> {
         std::fs::read_to_string(self.dir.join(name)).ok()
     }
@@ -228,6 +235,91 @@ impl Drop for Scratch {
 }
 
 // ── the service descriptions ─────────────────────────────────────────────────
+
+/// The `zctl` binary, if this build produced one.
+///
+/// `zctl` is another workspace package, so `CARGO_BIN_EXE_zctl` does not
+/// exist here; the binary sits next to the test executable in the target
+/// directory. A run that only built this package has no `zctl`, and the
+/// tests that need it say so instead of failing for the wrong reason.
+fn zctl_path() -> Option<PathBuf> {
+    let mut dir = std::env::current_exe().ok()?;
+    dir.pop();
+    if dir.ends_with("deps") {
+        dir.pop();
+    }
+    let bin = dir.join("zctl");
+    if bin.is_file() { Some(bin) } else { None }
+}
+
+/// Send one frame to the control socket as somebody who is not root.
+///
+/// The reply comes back through a pipe: the peer is a forked child that
+/// dropped its privileges, and a pipe is how its answer gets out.
+fn ask_as_nobody(socket: &str, frame: &str) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    // `nobody` is the conventional unprivileged account; when the test is
+    // not root there is nothing to drop and the peer is already
+    // unprivileged.
+    const NOBODY: u32 = 65534;
+
+    // A socket pair is the channel: the child writes its answer on one end,
+    // the parent reads it on the other. (`std::io::pipe` would be shorter
+    // but it is newer than this workspace's MSRV.)
+    let (mut parent_end, mut child_end) = UnixStream::pair().expect("socket pair");
+    // SAFETY: a fork whose child does nothing but async-signal-safe work:
+    // it drops its privileges, connects, writes, reads and exits. The
+    // parent only reads the pipe.
+    let pid = unsafe { libc::fork() };
+    match pid {
+        0 => {
+            // Child: become somebody else, then ask.
+            // SAFETY: the ids are valid, and these are the only calls
+            // between the fork and the exit.
+            unsafe {
+                libc::setgid(NOBODY);
+                libc::setuid(NOBODY);
+            }
+            let mut stream = match UnixStream::connect(socket) {
+                Ok(s) => s,
+                Err(_) => std::process::exit(1),
+            };
+            let _ = stream.write_all(frame.as_bytes());
+            let mut line = String::new();
+            let _ = BufReader::new(&stream).read_line(&mut line);
+            let _ = child_end.write_all(line.as_bytes());
+            std::process::exit(0);
+        }
+        -1 => panic!("cannot fork the peer"),
+        _ => {}
+    }
+    let mut answer = String::new();
+    let _ = BufReader::new(&mut parent_end).read_line(&mut answer);
+    // Reap the child: a test that leaves a corpse is a test that makes the
+    // next one flakier.
+    // SAFETY: the pid is this test's own child.
+    unsafe {
+        let mut status = 0;
+        libc::waitpid(pid, &raw mut status, 0);
+    }
+    answer
+}
+
+/// Run the real `zctl` against this test's supervisor.
+///
+/// The control socket refuses a mutation from a peer that is not the known
+/// client, so a test that wants to change something has to go through the
+/// same binary an operator uses.
+fn zctl(scratch: &Scratch, args: &[&str]) -> std::process::Output {
+    let bin = zctl_path().expect("the zctl binary was not built");
+    Command::new(bin)
+        .args(args)
+        .env("ZINIT_SOCKET", scratch.at("ctl"))
+        .output()
+        .expect("cannot run zctl")
+}
 
 /// A service description with the boilerplate every test here needs.
 ///
@@ -272,6 +364,16 @@ fn sup_command(scratch: &Scratch) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_zinit"));
     cmd.arg("--sup").arg(scratch.path());
     cmd.stdin(Stdio::null()).process_group(0);
+    // The control socket and the state directory live in the scratch
+    // directory: the default paths are under `/run`, which a test that does
+    // not run as root cannot write, and a socket shared by every test on
+    // the machine is a race nobody wants to debug.
+    cmd.env("ZINIT_SOCKET", scratch.at("ctl"));
+    cmd.env("ZINIT_STATE_DIR", scratch.at("state"));
+    // The suite runs from `target/`, which is neither an install directory
+    // nor root-owned: the supervisor's own directory is a trust root only
+    // behind this switch, so the tests turn it on.
+    cmd.env("ZINIT_TRUST_SELF_DIR", "1");
     cmd
 }
 
@@ -283,9 +385,15 @@ impl<'a> Sup<'a> {
         // seconds could fill a 64 KiB pipe and then block on its own stderr,
         // which would look exactly like a hang. The refusal tests pipe it
         // instead, because there the process is expected to exit at once.
+        // The supervisor's stderr goes to a file, not a pipe: a pipe could
+        // fill up and block the supervisor on its own output, which looks
+        // exactly like a hang. A file can be read after a failure, which is
+        // the only reason it exists.
+        let log = std::fs::File::create(scratch.at("sup.log")).expect("create the log file");
+        let err = log.try_clone().expect("clone the log");
         let child = sup_command(scratch)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(err))
             .spawn()
             .expect("cannot spawn `zinit --sup`");
         Sup {
@@ -370,64 +478,6 @@ impl Drop for Sup<'_> {
             // SAFETY: as above — a pid this test's own service reported.
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
-    }
-}
-
-/// Run `zinit --sup <scratch>` to completion and return its status and stderr.
-///
-/// For the refusal tests only: they expect the supervisor to die quickly, so a
-/// pipe cannot fill up and its stderr is the interesting part of the failure.
-fn run_to_exit(scratch: &Scratch) -> (ExitStatus, String) {
-    let mut child = sup_command(scratch)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("cannot spawn `zinit --sup`");
-
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait().expect("waiting on the supervisor failed") {
-            Some(status) => break status,
-            None if start.elapsed() >= Duration::from_millis(EXIT_DEADLINE_MS) => {
-                // Clean up before failing: this is the one path where the
-                // supervisor may have started services nobody recorded.
-                let group = child.id() as i32;
-                // SAFETY: signal 9 to a process group this test created.
-                unsafe { libc::kill(-group, libc::SIGKILL) };
-                let _ = child.wait();
-                panic!(
-                    "the supervisor is still running after {EXIT_DEADLINE_MS}ms with {dir} \
-                     loaded: a configuration it must refuse left it supervising anyway, and \
-                     whatever it started is still running",
-                    dir = scratch.path().display()
-                );
-            }
-            None => sleep_ms(POLL_MS),
-        }
-    };
-    // Safe to read to the end: the process has exited, so the pipe is at EOF.
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        use std::io::Read;
-        let _ = pipe.read_to_string(&mut stderr);
-    }
-    (status, stderr)
-}
-
-/// The refusal contract: a supervisor that cannot build a plan says so and
-/// exits non-zero (`DESIGN.md` §2.4 — never exit 0 on an error). Anything else
-/// means the machine booted half-configured.
-fn assert_refused(status: &ExitStatus, stderr: &str, what: &str) {
-    match status.code() {
-        Some(0) => panic!(
-            "the supervisor exited 0 with {what} configured (stderr: {stderr}): booting half a \
-             system is the one outcome this must never produce"
-        ),
-        Some(_) => {}
-        None => panic!(
-            "the supervisor died from a signal ({status}) with {what} configured instead of \
-             exiting non-zero (stderr: {stderr})"
-        ),
     }
 }
 
@@ -527,6 +577,47 @@ fn supervisor_reaps_the_service_on_stop() {
     );
 }
 
+/// A demand-pulled service that exits immediately keeps flapping.
+///
+/// Live 2026-10-16: `agetty-service@tty1` (disabled at boot, pulled by the
+/// running `agetty` oneshot) spawned once and stayed `Running` with a dead
+/// pid forever — exactly one attempt, `restarts = 0`, no respawn. This test
+/// is that shape (requirer up, disabled instance dep, instant death) and
+/// asserts the only honest outcomes: repeated attempts. One attempt ever
+/// means the death vanished between spawn and account.
+#[test]
+fn a_demand_pulled_instant_death_keeps_flapping() {
+    let _one = serial();
+    let scratch = Scratch::new("demandflap");
+    let puller = format!(
+        "{}\ndepends = flapper@tty1\n",
+        desc(&announce_then_sleep(&scratch.at("a.pid"), 30), "")
+    );
+    scratch.conf("a.conf", &puller);
+    let command = format!(
+        "echo $$ > {}; echo x >> {}; exit 1",
+        scratch.at("b.pid"),
+        scratch.at("attempts")
+    );
+    let body = format!(
+        "type = script\ncommand = {command}\nready = none\nlog = none\nenabled = no\nrestart = always\nrestart-delay = 100ms\n"
+    );
+    scratch.conf("flapper@tty1.conf", &body);
+
+    let mut sup = Sup::start(&scratch);
+    assert!(
+        wait_until(5_000, || scratch.lines("attempts") >= 4),
+        "demand-pulled flapper died instantly and `restart = always` should have \
+         started it again, but there were only {} attempts in 5s: the death went \
+         stale (live: Running with a dead pid, restarts 0)",
+        scratch.lines("attempts")
+    );
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor itself died while a demand-pulled service flapped"
+    );
+}
+
 /// A service that exits immediately is restarted — several times, and at a rate
 /// a human can still read the log for.
 ///
@@ -577,11 +668,47 @@ fn a_crash_is_restarted_within_budget() {
     );
 }
 
+/// A service that stays root must not carry NoNewPrivs.
+///
+/// NNP was once set unconditionally in the child path; every descendant —
+/// including ssh sessions — then silently lost all setuid elevation
+/// (`doas: not installed setuid`), with no way back but a power cycle.
+/// NNP is defence in depth *after a uid drop*; without one it only breaks
+/// setuid children. Fails on the old code (status reads 1), passes fixed.
+/// Linux-only: it reads the child's `NoNewPrivs` from `/proc`, which the
+/// rest of this suite (and BSD/macOS runners) must never assume.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_root_service_keeps_setuid_working() {
+    let _one = serial();
+    let scratch = Scratch::new("nnp");
+    let command = format!(
+        "grep ^NoNewPrivs /proc/self/status > {}; exec /bin/sleep 30",
+        scratch.at("nnp.status")
+    );
+    scratch.conf("plain.conf", &desc(&command, ""));
+    let mut sup = Sup::start(&scratch);
+    assert!(
+        wait_until(10_000, || scratch.read("nnp.status").is_some()),
+        "the service never reported its NoNewPrivs status in 10s"
+    );
+    let status = scratch.read("nnp.status").unwrap_or_default();
+    assert!(
+        status.contains("NoNewPrivs:\t0"),
+        "a service with no `user =` runs with NoNewPrivs set ({status:?}): \
+         its whole subtree lost setuid elevation"
+    );
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor itself died while supervising a plain service"
+    );
+}
+
 /// A cycle in the graph has no topological order, so there is no plan. The
 /// supervisor must refuse the whole directory rather than start the half of it
 /// it happens to understand.
 #[test]
-fn a_dependency_cycle_refuses_to_start() {
+fn a_dependency_cycle_starts_in_emergency_mode() {
     let _one = serial();
     let scratch = Scratch::new("cycle");
     // Both services are perfectly runnable. It is the *plan* that cannot exist,
@@ -592,16 +719,25 @@ fn a_dependency_cycle_refuses_to_start() {
         scratch.conf(file, &body);
     }
 
-    let (status, stderr) = run_to_exit(&scratch);
-    assert_refused(&status, &stderr, "a dependency cycle");
+    // A plan that cannot exist must not be half-loaded: the machine comes
+    // up in emergency mode (a shell on the console, no services of its own)
+    // instead of supervising a configuration nobody wrote.
+    let mut sup = Sup::start(&scratch);
+    sleep_ms(500);
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor exited on a cyclic plan: the machine would spin"
+    );
     assert_nothing_left_running(&scratch, &["a.pid", "b.pid"]);
 }
 
-/// One unparseable file stops the boot. A supervisor that skips the broken file
-/// and starts the rest is a machine that comes up in a configuration nobody
-/// wrote, which is worse than one that stays down and says why.
+/// One unparseable file stops the plan. A supervisor that skips the broken
+/// file and starts the rest is a machine that comes up in a configuration
+/// nobody wrote, which is worse than one that says why and waits. It waits
+/// in emergency mode: a shell on the console, and no service of the broken
+/// plan running.
 #[test]
-fn an_unparseable_config_refuses_to_start() {
+fn an_unparseable_config_starts_in_emergency_mode() {
     let _one = serial();
     let scratch = Scratch::new("unparseable");
     // A valid service next to the broken one: the point is that one bad file
@@ -612,7 +748,1374 @@ fn an_unparseable_config_refuses_to_start() {
     let broken = format!("{}\nrestart = sometimes\n", desc("exec /bin/sleep 30", ""));
     scratch.conf("broken.conf", &broken);
 
-    let (status, stderr) = run_to_exit(&scratch);
-    assert_refused(&status, &stderr, "an unparseable service description");
+    let mut sup = Sup::start(&scratch);
+    sleep_ms(500);
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor exited on an unparseable file: the machine would spin"
+    );
+    // The good service next to the broken one must not have run: the plan
+    // as a whole is what failed.
     assert_nothing_left_running(&scratch, &["good.pid"]);
+}
+
+/// An orphaned grandchild must be reaped, not left a zombie.
+///
+/// The supervisor is the child subreaper, so a service that forks and exits
+/// leaves its child to us. The pidfd backend only watches pids it started;
+/// the reap loop must additionally sweep `waitpid(-1)` or the orphan answers
+/// `kill(pid, 0)` forever. `pid_gone` (ESRCH) is the whole assertion: a
+/// zombie still answers liveness probes, so "alive" would pass on a corpse.
+#[test]
+fn a_reparented_orphan_is_reaped_not_left_a_zombie() {
+    let _one = serial();
+    let scratch = Scratch::new("orphan");
+    scratch.conf(
+        "forker.conf",
+        &desc(
+            &format!("sleep 30 & echo $! > {}", scratch.at("gc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    let gc = sup.await_live_pid("gc.pid", START_DEADLINE_MS);
+    // The service exited at once; the grandchild belongs to the supervisor
+    // now. Kill it and require collection, not a corpse.
+    signal(gc, libc::SIGKILL);
+    assert!(
+        wait_until(REAP_DEADLINE_MS, || pid_gone(gc)),
+        "orphan {gc} was never reaped: it still answers kill(0), \
+         so a zombie is sitting under the supervisor"
+    );
+}
+
+/// A machine that is going down must not resurrect a service.
+///
+/// The bug: `zctl restart` leaves a *pending restart* behind, and when the
+/// service finally dies the supervisor brings it back up. If the machine is
+/// stopping at that moment — a power verb, an `on-fatal`, or a signal — the
+/// service comes back up in the middle of the power epilogue, which is
+/// waiting for exactly that service to stay down. The stop deadline then
+/// expires and the machine powers off "loudly anyway".
+///
+/// The test: a service that ignores SIGTERM (so the stop escalates to
+/// SIGKILL and takes a moment), a restart requested, then a stop. The
+/// service must stay dead.
+#[test]
+fn a_stop_in_progress_does_not_resurrect_a_pending_restart() {
+    let _one = serial();
+    let scratch = Scratch::new("stopping-restart");
+    if zctl_path().is_none() {
+        // No print macros outside `zrt::report` (the purity job): the
+        // reason goes to the scratch directory instead.
+        let _ = std::fs::write(scratch.at("skipped"), "no zctl binary\n");
+        return;
+    }
+    // The service ignores SIGTERM *in its own process*, which for a
+    // `script` service is the shell the supervisor forks: the trap has to be
+    // in that shell's body, not in a nested `/bin/sh -c`, or the direct child
+    // dies on the first signal and the restart is legitimate instead of
+    // racing the stop. The supervisor then has to escalate to SIGKILL after
+    // `stop-timeout`, which is the window in which the stop and the pending
+    // restart overlap.
+    let command = format!(
+        "trap \"\" TERM; echo $$ > {}; sleep 300",
+        scratch.at("svc.pid")
+    );
+    scratch.conf(
+        "probe.conf",
+        &desc(&command, "restart = always\nstop-timeout = 1s\n"),
+    );
+
+    let mut sup = Sup::start(&scratch);
+    let first = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
+
+    // Ask for the restart, through the real client: the control socket only
+    // takes the command, `Desired` is what carries it.
+    let out = zctl(&scratch, &["restart", "probe"]);
+    assert!(
+        out.status.success(),
+        "restart refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // ... and then tell the supervisor the machine is going down.
+    signal(sup.pid(), libc::SIGTERM);
+
+    // The invariant is convergence, and it is asserted that way on purpose:
+    // the service may legitimately be restarted if it dies *before* the stop
+    // is seen (the restart it was promised was requested while the machine
+    // was still up, and on a platform where the shell dies on the first
+    // `SIGTERM` that is a race the test cannot win). What must never happen
+    // is a restart owed to a machine that is stopping resurrecting the
+    // service *after* the stop was seen: then the state never converges to
+    // down, which is exactly what this waits for and what the missing guard
+    // produced.
+    let converged = |scratch: &Scratch| {
+        let state = scratch.read("state/probe").unwrap_or_default();
+        state.contains("state=Stopped") && state.contains("desired=Down")
+    };
+    assert!(
+        wait_until(REAP_DEADLINE_MS, || converged(&scratch)),
+        "the machine never converged to a stopped service: {:?}\n{}",
+        scratch.read("state/probe"),
+        scratch.tail("sup.log")
+    );
+    assert!(
+        wait_until(REAP_DEADLINE_MS, || pid_gone(first)),
+        "the first instance never died"
+    );
+
+    // And it stays down: a pending restart that fires now would write a new
+    // pid and turn the state back to running.
+    let settled = scratch.pid("svc.pid");
+    sleep_ms(1_500);
+    assert_eq!(
+        scratch.pid("svc.pid"),
+        settled,
+        "the service was restarted while the machine was stopping: the power \
+         epilogue waits for services to stay down, and this one came back\n{}",
+        scratch.tail("sup.log")
+    );
+    assert!(
+        converged(&scratch),
+        "the service came back after the stop converged: {:?}",
+        scratch.read("state/probe")
+    );
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor exited while stopping"
+    );
+}
+
+/// The control socket knows who is calling.
+///
+/// The socket is `0600`, so only its owner can connect at all — but "the
+/// owner" is every process of that user, and one of them writing
+/// `C 1 poweroff` into the socket is enough to take the machine down.
+/// The server therefore checks the peer's credentials, and a peer that is
+/// not the known client (`zctl`) may look but not touch.
+///
+/// The test peer is this test binary: same user as the supervisor, and not
+/// a client. Reading must work; mutating must be refused with code `6`.
+#[test]
+fn the_control_socket_refuses_a_mutation_from_an_unknown_peer() {
+    let _one = serial();
+    let scratch = Scratch::new("peercred");
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 30", scratch.at("svc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    let _pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
+
+    // The peer must not be root: root may do everything, by design, so a
+    // root peer would prove nothing. Where the test runs as root (the CI
+    // containers do) the peer is a child that drops to `nobody` first;
+    // where it does not, the peer is already unprivileged.
+    let ask = |frame: &str| -> String { ask_as_nobody(&scratch.at("ctl"), frame) };
+
+    // Reading works for anybody who got this far.
+    let listed = ask("C 1 list\n");
+    assert!(
+        listed.starts_with("R 1 0"),
+        "a read-only verb must be answered for any peer: {listed:?}"
+    );
+
+    // Powering the machine off does not: that verb takes the known client
+    // or root. (Managing services is the socket's own job and stays open
+    // to its owner, or the C4 contract would mean nothing.)
+    // Only where the supervisor can name the peer's executable: without
+    // `/proc` the check cannot tell the client from any other process of the
+    // same user, and the supervisor announces that weaker check at startup
+    // instead of pretending. The refusal is asserted where the evidence is.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let refused = ask("C 1 poweroff\n");
+        assert!(
+            refused.starts_with("E 1 6"),
+            "a power verb from an unknown peer must be refused with code 6: {refused:?}"
+        );
+    }
+
+    // And the service is still running: the refusal happened before the
+    // command became an action.
+    assert!(
+        scratch.pid("svc.pid").is_some(),
+        "the service vanished although the power verb was refused"
+    );
+    assert!(sup.exited().is_none(), "the supervisor exited");
+}
+
+/// One supervisor per control socket.
+///
+/// Two supervisors over one socket is not a configuration, it is a race: the
+/// second one unlinks the path and binds its own, and the first one's
+/// clients end up talking to somebody else. The machine then looks like it
+/// has two of every daemon, fighting over the ports — which is exactly what
+/// a hand-started second supervisor used to cause.
+///
+/// The second supervisor must step aside (exit code 11) and the first must
+/// keep the socket.
+#[test]
+fn a_second_supervisor_steps_aside() {
+    let _one = serial();
+    let scratch = Scratch::new("instance");
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 30", scratch.at("svc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let mut first = Sup::start(&scratch);
+    let _pid = first.await_live_pid("svc.pid", START_DEADLINE_MS);
+
+    // The second one gets the same socket path, so it finds the lock.
+    let mut second = sup_command(&scratch)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("cannot spawn the second supervisor");
+    let status = second.wait().expect("the second supervisor must exit");
+    assert_eq!(
+        status.code(),
+        Some(11),
+        "the second supervisor did not step aside: {status:?}"
+    );
+
+    // The first one still owns the socket: its service is still running and
+    // the socket still answers.
+    assert!(
+        scratch.pid("svc.pid").is_some(),
+        "the first supervisor lost its service"
+    );
+    let out = zctl(&scratch, &["list"]);
+    assert!(
+        out.status.success(),
+        "the first supervisor lost the control socket: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        first.exited().is_none(),
+        "the first supervisor exited when the second one appeared"
+    );
+}
+
+/// A configuration that does not load must not take the machine with it.
+///
+/// The old behaviour: the supervisor exited, PID 1 relaunched it, it
+/// exited again, and the machine spun in front of the operator with no
+/// control socket, no services and no way in. The emergency mode puts a
+/// shell on the console and keeps the control socket up, so `zctl
+/// reload-all` can pick the real plan up once the file is fixed.
+#[test]
+fn a_broken_configuration_starts_in_emergency_mode() {
+    let _one = serial();
+    let scratch = Scratch::new("emergency");
+    if zctl_path().is_none() {
+        // No print macros outside `zrt::report` (the purity job): the
+        // reason goes to the scratch directory instead.
+        let _ = std::fs::write(scratch.at("skipped"), "no zctl binary\n");
+        return;
+    }
+    // A file the parser cannot read: the plan will not load.
+    scratch.conf("broken.conf", "not-a-directive\n");
+
+    let mut sup = Sup::start(&scratch);
+
+    // The supervisor is alive: it did not exit and let PID 1 relaunch it
+    // in a loop.
+    sleep_ms(500);
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor exited on a broken configuration: the machine would spin"
+    );
+
+    // The control socket answers, and the only service is the emergency
+    // shell.
+    let out = zctl(&scratch, &["list"]);
+    assert!(
+        out.status.success(),
+        "no control socket in emergency mode: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let listed = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        listed.contains("emergency"),
+        "the emergency plan is not the one being supervised: {listed}"
+    );
+
+    // Fix the file and reload: the real plan takes over.
+    std::fs::remove_file(scratch.path().join("broken.conf")).expect("remove the broken file");
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 30", scratch.at("svc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let out = zctl(&scratch, &["reload-all"]);
+    assert!(
+        out.status.success(),
+        "the reload was refused: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let _pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
+    let after = zctl(&scratch, &["list"]);
+    let listed = String::from_utf8_lossy(&after.stdout);
+    assert!(
+        listed.contains("probe"),
+        "the real plan did not take over: {listed}"
+    );
+}
+
+/// The control socket must not grow without bound.
+///
+/// A local process that opens connections in a loop would otherwise make
+/// the supervisor grow: every client costs a descriptor and a buffer, and
+/// the supervisor is the one process that must not run out of memory. Past
+/// the cap the connection is closed before it is registered.
+#[test]
+fn the_control_socket_refuses_more_clients_than_it_can_hold() {
+    use std::os::unix::net::UnixStream;
+
+    let _one = serial();
+    let scratch = Scratch::new("clientcap");
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 30", scratch.at("svc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    let _pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
+
+    // More connections than the cap, all of them held open.
+    let mut held = Vec::new();
+    for _ in 0..(crate_cap() + 8) {
+        match UnixStream::connect(scratch.at("ctl")) {
+            Ok(s) => held.push(s),
+            Err(_) => break,
+        }
+    }
+    // The supervisor is still there: the cap refused the extra
+    // connections, it did not wedge anything.
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor died when the clients piled up"
+    );
+    // With the pile gone, the socket works again. The closed connections are
+    // noticed when the loop next looks at them, so the question is asked
+    // until it is answered instead of exactly once.
+    drop(held);
+    let start = Instant::now();
+    let mut answered = false;
+    while start.elapsed() < Duration::from_secs(10) {
+        if zctl(&scratch, &["list"]).status.success() {
+            answered = true;
+            break;
+        }
+        sleep_ms(50);
+    }
+    assert!(
+        answered,
+        "the control socket did not recover after the clients left: {}",
+        scratch.tail("sup.log")
+    );
+}
+
+/// The cap the control socket enforces, as the test sees it.
+fn crate_cap() -> usize {
+    64
+}
+
+/// The visible state must describe the machine that is running.
+///
+/// Two things used to go wrong: a service deleted from the configuration
+/// left its state file behind, so the file kept claiming a service that no
+/// longer existed; and the file was written in place, so a reader could
+/// see half of the new content and half of the old one.
+#[test]
+fn the_visible_state_follows_the_plan() {
+    let _one = serial();
+    let scratch = Scratch::new("state");
+    if zctl_path().is_none() {
+        // No print macros outside `zrt::report` (the purity job): the
+        // reason goes to the scratch directory instead.
+        let _ = std::fs::write(scratch.at("skipped"), "no zctl binary\n");
+        return;
+    }
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 30", scratch.at("svc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    let _pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
+
+    // The state file exists and says the service is running.
+    let state = scratch.read("state/probe").expect("the state file");
+    assert!(
+        state.contains("state=Running"),
+        "the state file does not describe a running service: {state}"
+    );
+
+    // Remove the service and reload: its state file must go with it.
+    std::fs::remove_file(scratch.path().join("probe.conf")).expect("remove the description");
+    let out = zctl(&scratch, &["reload-all"]);
+    assert!(
+        out.status.success(),
+        "the reload was refused: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    sleep_ms(500);
+    assert!(
+        scratch.read("state/probe").is_none(),
+        "the state file of a deleted service survived the reload: it describes a \\
+         machine that is not this one"
+    );
+}
+
+/// zinit as a real PID 1.
+///
+/// Every other test in this file drives a *supervisor*. This one drives the
+/// *init*: PID 1 mounts `/proc`, `/sys` and `/run`, forks the supervisor,
+/// reaps orphans and answers signals. A PID namespace is the cheapest way
+/// to be PID 1 without a virtual machine:
+///
+/// ```text
+/// unshare --user --map-root-user --pid --fork --mount-proc
+/// ```
+///
+/// The shell that `unshare` forks *is* PID 1 of the new namespace, and it
+/// execs zinit, so the process that ends up as PID 1 is zinit. The
+/// namespace's own init is killed at the end of the test — the kernel
+/// tears the namespace down with it, and nothing survives.
+///
+/// The test skips itself where a user namespace is not available (a
+/// container without `CLONE_NEWUSER`, a kernel without it): the check is
+/// about the code, not about the machine's kernel configuration.
+#[test]
+#[cfg(target_os = "linux")]
+fn zinit_boots_as_pid_one_in_a_namespace() {
+    let _one = serial();
+    let scratch = Scratch::new("pid1");
+    if which("unshare").is_none() {
+        let _ = std::fs::write(scratch.at("skipped"), "no unshare binary\n");
+        return;
+    }
+    // The service the namespace is supposed to bring up, in its own
+    // configuration directory: `--init <dir>` makes that directory the
+    // whole configuration, exactly like `--sup <dir>`.
+    let services = scratch.path().join("services");
+    std::fs::create_dir_all(&services).expect("create the service directory");
+    scratch.conf(
+        "services/probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 60", scratch.at("svc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/pid1-namespace.sh"
+    );
+    let zinit = env!("CARGO_BIN_EXE_zinit");
+
+    let mut child = Command::new("unshare")
+        .args([
+            "--user",
+            "--map-root-user",
+            "--pid",
+            "--fork",
+            "--mount-proc",
+            "sh",
+            script,
+            &scratch.path().to_string_lossy(),
+            zinit,
+        ])
+        .stdin(Stdio::null())
+        // The namespace's processes inherit these descriptors, and a pipe
+        // they keep open is a pipe the test runner waits on forever. A file
+        // is read after the fact and blocks nobody.
+        .stdout(Stdio::from(
+            std::fs::File::create(scratch.at("ns.out")).expect("create the log"),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create(scratch.at("ns.err")).expect("create the log"),
+        ))
+        .spawn()
+        .expect("cannot spawn unshare");
+
+    // The namespace's PID 1 is a child of the `unshare` process, and it
+    // starts as the shell that execs zinit: poll until it says it is
+    // zinit, or until it is clear that there is no namespace here at all.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut comm = String::new();
+    loop {
+        let children =
+            std::fs::read_to_string(format!("/proc/{}/task/{}/children", child.id(), child.id()))
+                .unwrap_or_default();
+        if let Some(pid) = children.split_whitespace().next() {
+            comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            if comm.trim() == "zinit" {
+                break;
+            }
+        }
+        if Instant::now() > deadline {
+            break;
+        }
+        sleep_ms(100);
+    }
+    let ns_pid1 = children_pid(child.id());
+    if comm.trim() != "zinit" {
+        // No user namespace on this machine: the test has nothing to say.
+        // The namespace's PID 1 (if there is one) goes first, then the
+        // `unshare` process. Never a pid of 0 and never a process group:
+        // `kill(0, ...)` is "every process in my group" and a group kill
+        // would take the test runner (and the shell that started it) with
+        // it.
+        if ns_pid1 > 1 {
+            // SAFETY: the pid came from this test's own /proc entry.
+            unsafe {
+                libc::kill(ns_pid1 as i32, libc::SIGKILL);
+            }
+        }
+        // SAFETY: the pid is this test's own child.
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGKILL);
+        }
+        let _ = child.wait();
+        let _ = std::fs::write(scratch.at("skipped"), "no PID namespace\n");
+        return;
+    }
+
+    // The supervisor must come up and bind the control socket, and the
+    // service must be running: PID 1 mounted what it needed and the
+    // supervisor did its job inside the namespace.
+    let start = Instant::now();
+    let up = loop {
+        if scratch.pid("svc.pid").is_some_and(pid_alive) {
+            break true;
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            break false;
+        }
+        sleep_ms(100);
+    };
+    let mut stderr = String::new();
+    if !up {
+        stderr = scratch.tail("ns.err");
+    }
+    assert!(
+        up,
+        "the service never came up inside the namespace\\n{stderr}"
+    );
+
+    // Tear the namespace down: killing the `unshare` process takes PID 1
+    // with it, and the kernel cleans up everything inside. Only that one
+    // pid: a process-group kill here would take the test runner with it.
+    // SAFETY: the pid is this test's own child.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGKILL);
+    }
+    let _ = child.wait();
+    // The namespace's PID 1 is still alive (its parent died, so it was
+    // reparented); killing it is what actually empties the namespace.
+    // SAFETY: the pid came from this test's own /proc entry.
+    unsafe {
+        libc::kill(ns_pid1 as i32, libc::SIGKILL);
+    }
+}
+
+/// The first child of `pid`, from `/proc`.
+#[cfg(target_os = "linux")]
+fn children_pid(pid: u32) -> u32 {
+    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .ok()
+        .and_then(|c| c.split_whitespace().next().and_then(|p| p.parse().ok()))
+        .unwrap_or(0)
+}
+
+/// The full path of `name` in `PATH`, if it is there.
+#[cfg(target_os = "linux")]
+fn which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The sandbox must actually confine.
+///
+/// The filter's implicit baseline covers what libc needs to start (read,
+/// write, open, socket, clone, execve...), so the proof cannot be "the
+/// service cannot open a file". It is an operation outside the baseline:
+/// `unshare(2)` is not in it, so a service that tries it is either refused
+/// (errno mode) or killed (enforce mode).
+///
+/// The comparison is the point: the *same* command must succeed without
+/// confinement and fail with it. A test that only shows the confined
+/// service failing proves nothing — it might have failed for any reason.
+///
+/// Root only: `unshare(CLONE_NEWNS)` needs `CAP_SYS_ADMIN`, and without
+/// root the unconfined service fails too.
+#[test]
+#[cfg(target_os = "linux")]
+fn the_sandbox_really_confines() {
+    let _one = serial();
+    let scratch = Scratch::new("sandbox");
+    if unsafe { libc::geteuid() } != 0 {
+        let _ = std::fs::write(scratch.at("skipped"), "needs root\n");
+        return;
+    }
+    if which("unshare").is_none() {
+        let _ = std::fs::write(scratch.at("skipped"), "no unshare binary\n");
+        return;
+    }
+    // The command under test: it needs a namespace, and it says whether it
+    // got one. Each service writes **its own** answer — a shared file would be
+    // overwritten by whichever finished last, which is exactly the kind of
+    // test that passes for the wrong reason.
+    let probe = |name: &str| {
+        format!(
+            "/bin/sh -c 'unshare -m true 2>/dev/null; echo $? > {}'",
+            scratch.at(&format!("{name}.rc"))
+        )
+    };
+    // The same command, three times over: unconfined, capability-dropped
+    // and syscall-filtered.
+    scratch.conf("plain.conf", &desc(&probe("plain"), ""));
+    scratch.conf(
+        "nocaps.conf",
+        &desc(&probe("nocaps"), "drop-capabilities = sys_admin\n"),
+    );
+    scratch.conf(
+        "seccomp.conf",
+        &desc(&probe("seccomp"), "syscall-filter = errno\n"),
+    );
+
+    let mut sup = Sup::start(&scratch);
+
+    let rc = |name: &str| -> i32 {
+        let text = scratch.read(name).unwrap_or_default();
+        text.trim().parse().unwrap_or(-1)
+    };
+    // Wait for all three to have answered.
+    assert!(
+        wait_until(15_000, || {
+            scratch.read("plain.rc").is_some()
+                && scratch.read("nocaps.rc").is_some()
+                && scratch.read("seccomp.rc").is_some()
+        }),
+        "not every probe answered: plain={:?} nocaps={:?} seccomp={:?}\n{}",
+        scratch.read("plain.rc"),
+        scratch.read("nocaps.rc"),
+        scratch.read("seccomp.rc"),
+        scratch.tail("sup.log")
+    );
+
+    assert_eq!(
+        rc("plain.rc"),
+        0,
+        "the unconfined service could not create a namespace: the test proves \
+         nothing if the baseline operation fails"
+    );
+    assert_ne!(
+        rc("nocaps.rc"),
+        0,
+        "dropping CAP_SYS_ADMIN did not stop the service from creating a namespace"
+    );
+    assert_ne!(
+        rc("seccomp.rc"),
+        0,
+        "the syscall filter did not stop the service from creating a namespace"
+    );
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor died while supervising confined services"
+    );
+}
+
+/// A supervisor that comes back must not start a second copy of what is
+/// already running.
+///
+/// The supervisor that started the services died; its children were
+/// reparented to PID 1, which knows nothing about them. Without adoption,
+/// the new supervisor starts a copy of everything: the machine ends up
+/// with two of every daemon fighting over the ports, which is exactly what
+/// happened on real hardware.
+///
+/// The test: start a supervisor, kill it (the service survives), start a
+/// new one over the same state directory, and require that the service is
+/// the *same* process and that the new supervisor knows about it.
+#[test]
+fn a_restarted_supervisor_adopts_the_services_that_are_still_alive() {
+    let _one = serial();
+    let scratch = Scratch::new("adopt");
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 300", scratch.at("svc.pid")),
+            "restart = always\nrestart-delay = 100ms\n",
+        ),
+    );
+    let mut first = Sup::start(&scratch);
+    let pid = first.await_live_pid("svc.pid", START_DEADLINE_MS);
+
+    // Kill the supervisor the way a crash would: no cleanup, no goodbye.
+    // The service is not its child any more (the kernel reparents it), and
+    // it must survive.
+    // SAFETY: the pid is this test's own child.
+    unsafe {
+        libc::kill(first.pid(), libc::SIGKILL);
+    }
+    let _ = first.child.wait();
+    sleep_ms(300);
+    assert!(
+        pid_alive(pid),
+        "the service died with its supervisor: the test is not testing adoption"
+    );
+
+    // The new supervisor reads the same state directory.
+    let mut second = Sup::start(&scratch);
+    sleep_ms(1_500);
+
+    // The same process: no second copy.
+    assert_eq!(
+        scratch.pid("svc.pid"),
+        Some(pid),
+        "the new supervisor started a second copy of a service that was already running"
+    );
+    // And it knows about it: the state says the service is running under
+    // the supervisor's own account, not stopped.
+    let state = scratch.read("state/probe").expect("the state file");
+    assert!(
+        state.contains("state=Running"),
+        "the adopted service is not Running in the visible state: {state}"
+    );
+    assert!(
+        state.contains(&format!("pid={pid}")),
+        "the adopted service has the wrong pid in the visible state: {state}"
+    );
+    assert!(
+        second.exited().is_none(),
+        "the new supervisor died while adopting"
+    );
+
+    // And the adopted service is really supervised: when it dies, the new
+    // supervisor notices and starts it again. (An adopted process is not
+    // our child, so nobody may read its exit status — the death still has
+    // to reach the restart policy.)
+    // SAFETY: the pid is the service's own, reported by the service.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    let restarted = wait_until(START_DEADLINE_MS, || {
+        scratch
+            .pid("svc.pid")
+            .is_some_and(|p| p != pid && pid_alive(p))
+    });
+    assert!(
+        restarted,
+        "the adopted service died and was never restarted: the supervisor did not notice"
+    );
+}
+
+/// A supervisor that dies leaves the socket free for the next one.
+///
+/// The single-instance lock must not outlive the process that took it: a
+/// supervisor that died and a new one that cannot start is a machine with
+/// no supervisor at all. The lock is released by the kernel when the
+/// process goes away, so the next one takes the socket.
+#[test]
+fn a_dead_supervisor_leaves_the_socket_free() {
+    let _one = serial();
+    let scratch = Scratch::new("lockfree");
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 30", scratch.at("svc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let mut first = Sup::start(&scratch);
+    let _pid = first.await_live_pid("svc.pid", START_DEADLINE_MS);
+    // Kill it the way a crash would.
+    // SAFETY: the pid is this test's own child.
+    unsafe {
+        libc::kill(first.pid(), libc::SIGKILL);
+    }
+    let _ = first.child.wait();
+    sleep_ms(300);
+
+    // The next supervisor takes the same socket: the lock died with the
+    // process that held it. (It takes a moment to bind it, so the question
+    // is asked until it is answered.)
+    let mut second = Sup::start(&scratch);
+    let mut answered = false;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        let out = zctl(&scratch, &["list"]);
+        if out.status.success() {
+            answered = true;
+            break;
+        }
+        sleep_ms(100);
+    }
+    assert!(
+        answered,
+        "the second supervisor did not take the socket: {}",
+        scratch.tail("sup.log")
+    );
+    assert!(
+        second.exited().is_none(),
+        "the second supervisor stepped aside although the first one was dead"
+    );
+}
+
+/// A service with a cgroup lands in it, with its own pid.
+///
+/// The cgroup is not a label: the child is moved into
+/// `/sys/fs/cgroup/zinit.slice/<name>/` before it execs, so the kernel
+/// accounts the service there. The test reads the cgroup's own file: the
+/// pid has to be there, and it has to be the service's.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_service_with_a_cgroup_lands_in_it() {
+    let _one = serial();
+    let scratch = Scratch::new("cgroup");
+    if unsafe { libc::geteuid() } != 0
+        || !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+    {
+        // No print macros outside `zrt::report` (the purity job): the
+        // reason goes to the scratch directory instead.
+        let _ = std::fs::write(scratch.at("skipped"), "needs root and cgroup2\n");
+        return;
+    }
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 30", scratch.at("svc.pid")),
+            "restart = never\ncgroup = probe\n",
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    let pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
+
+    let procs = std::fs::read_to_string("/sys/fs/cgroup/zinit.slice/probe/cgroup.procs")
+        .expect("the cgroup has a procs file");
+    let pids: Vec<i32> = procs
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    assert!(
+        pids.contains(&pid),
+        "the service is not in its cgroup: {pids:?} does not contain {pid}"
+    );
+}
+
+/// `hibernate` is refused, and the refusal says why.
+///
+/// There is no resume target on this machine, so hibernating would either
+/// do nothing or leave a file the kernel cannot read back. The honest
+/// answer is a refusal with a code of its own, not a silent success.
+#[test]
+fn hibernate_is_refused_with_a_reason() {
+    let _one = serial();
+    let scratch = Scratch::new("hibernate");
+    if zctl_path().is_none() {
+        let _ = std::fs::write(scratch.at("skipped"), "no zctl binary\n");
+        return;
+    }
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 30", scratch.at("svc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    let _pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
+
+    let out = zctl(&scratch, &["hibernate"]);
+    let reply = String::from_utf8_lossy(&out.stdout);
+    // The id is the client's own token (`zctl` by default), so the check
+    // is on the code and the reason, not on the token.
+    assert!(
+        reply.starts_with("E ") && reply.contains(" 6 "),
+        "hibernate must be refused with code 6: {reply:?}"
+    );
+    assert!(
+        reply.contains("resume target"),
+        "the refusal must say what is missing: {reply:?}"
+    );
+    assert!(
+        !out.status.success(),
+        "a refused verb must not report success"
+    );
+    // And the machine is still up: the refusal changed nothing.
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor died on a refused hibernate"
+    );
+}
+
+/// Two stops asked at the same time stop the service once.
+///
+/// The commands arrive on two connections and are served in one loop, so the
+/// second one sees a service that is already `Stopping`: it must answer, not
+/// signal twice, and not leave the service half-stopped. The observable is
+/// the state: down, and the process gone.
+#[test]
+fn two_stops_at_once_stop_the_service_once() {
+    let _one = serial();
+    let scratch = Scratch::new("two-stops");
+    if zctl_path().is_none() {
+        let _ = std::fs::write(scratch.at("skipped"), "no zctl binary\n");
+        return;
+    }
+    scratch.conf(
+        "probe.conf",
+        &desc(
+            &format!("echo $$ > {}; exec /bin/sleep 30", scratch.at("svc.pid")),
+            "restart = never\n",
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    let pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
+
+    let (first, second) = std::thread::scope(|s| {
+        let a = s.spawn(|| zctl(&scratch, &["stop", "probe"]));
+        let b = s.spawn(|| zctl(&scratch, &["stop", "probe"]));
+        (
+            a.join().expect("first stop"),
+            b.join().expect("second stop"),
+        )
+    });
+    assert!(
+        first.status.success() && second.status.success(),
+        "a stop was refused: {:?} / {:?}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&second.stdout)
+    );
+    // The process being gone is not the supervisor knowing it: the state file
+    // is rewritten when the death has been reaped, which is a later moment.
+    // Both facts are asserted, so both are waited for.
+    assert!(
+        wait_until(REAP_DEADLINE_MS, || {
+            let state = scratch.read("state/probe").unwrap_or_default();
+            pid_gone(pid) && state.contains("state=Stopped") && state.contains("desired=Down")
+        }),
+        "the state never said the service was stopped: {:?}",
+        scratch.read("state/probe")
+    );
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor died on two simultaneous stops"
+    );
+}
+
+/// A service under a syscall filter runs, or the filter is not a filter.
+///
+/// Linux x86_64 only: the syscall-number table is verified for that
+/// architecture and nothing else, and everywhere else a configured filter is
+/// a spawn refusal by design ("loud refusal beats an unverified number"). The
+/// refusal is a different test; this one is about the filter working.
+///
+/// `SECCOMP_MODE_STRICT` and `SECCOMP_MODE_FILTER` are one digit apart, and
+/// the wrong one does not weaken the sandbox: it `SIGKILL`s the service on
+/// the first `execve`, so every filtered service never starts. The test is
+/// the plainest possible use of a filtered service — write a file, exit —
+/// and it needs no root, so it runs everywhere the suite runs.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn a_filtered_service_starts_and_does_its_work() {
+    let _one = serial();
+    let scratch = Scratch::new("seccomp-runs");
+    let probe = |tag: &str| format!("echo {tag} > {}", scratch.at(&format!("{tag}.done")),);
+    scratch.conf("plain.conf", &desc(&probe("plain"), ""));
+    scratch.conf(
+        "errno.conf",
+        &desc(&probe("errno"), "syscall-filter = errno\n"),
+    );
+    scratch.conf(
+        "enforce.conf",
+        &desc(&probe("enforce"), "syscall-filter = enforce\n"),
+    );
+
+    let mut sup = Sup::start(&scratch);
+    assert!(
+        wait_until(START_DEADLINE_MS, || {
+            scratch.read("plain.done").is_some()
+                && scratch.read("errno.done").is_some()
+                && scratch.read("enforce.done").is_some()
+        }),
+        "a filtered service never ran: plain={:?} errno={:?} enforce={:?}\n{}",
+        scratch.read("plain.done"),
+        scratch.read("errno.done"),
+        scratch.read("enforce.done"),
+        scratch.tail("sup.log")
+    );
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor died while supervising filtered services"
+    );
+}
+
+/// `syscall-allow` opens exactly the door it names.
+///
+/// `kill` is deliberately not in the implicit baseline — signalling any pid
+/// is a power a service should have to ask for. The test: the same command
+/// three times, unconfined, filtered, and filtered with `kill` allowed. The
+/// filter must refuse it and the allow list must let it through, which is
+/// the only end-to-end proof that the list is wired to anything.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn syscall_allow_opens_exactly_one_door() {
+    let _one = serial();
+    let scratch = Scratch::new("seccomp-allow");
+    // `kill -0 $$` asks the kernel whether the pid exists and sends nothing:
+    // no privileges needed, and the shell builtin means no fork.
+    let probe = |name: &str| {
+        format!(
+            "kill -0 $$; echo $? > {}",
+            scratch.at(&format!("{name}.rc"))
+        )
+    };
+    scratch.conf("plain.conf", &desc(&probe("plain"), ""));
+    scratch.conf(
+        "blocked.conf",
+        &desc(&probe("blocked"), "syscall-filter = errno\n"),
+    );
+    scratch.conf(
+        "allowed.conf",
+        &desc(
+            &probe("allowed"),
+            "syscall-filter = errno\nsyscall-allow = kill\n",
+        ),
+    );
+
+    let mut sup = Sup::start(&scratch);
+    assert!(
+        wait_until(START_DEADLINE_MS, || {
+            scratch.read("plain.rc").is_some()
+                && scratch.read("blocked.rc").is_some()
+                && scratch.read("allowed.rc").is_some()
+        }),
+        "a probe never answered: plain={:?} blocked={:?} allowed={:?}\n{}",
+        scratch.read("plain.rc"),
+        scratch.read("blocked.rc"),
+        scratch.read("allowed.rc"),
+        scratch.tail("sup.log")
+    );
+    let rc = |name: &str| -> String { scratch.read(name).unwrap_or_default().trim().to_string() };
+    assert_eq!(rc("plain.rc"), "0", "the unconfined probe failed");
+    assert_ne!(
+        rc("blocked.rc"),
+        "0",
+        "the filter let a service signal a pid without asking for it"
+    );
+    assert_eq!(
+        rc("allowed.rc"),
+        "0",
+        "`syscall-allow = kill` did not open the door it named"
+    );
+    assert!(sup.exited().is_none(), "the supervisor died");
+}
+
+/// A log that cannot be opened is a refusal, not a silent service.
+///
+/// Losing the log is losing the only evidence an operator has, so a service
+/// whose sink cannot be created must not run with its output going nowhere.
+/// The refusal names the real cause (the directory, the errno), and the
+/// supervisor stays up: a bad description is not a reason to stop the
+/// machine's init.
+#[test]
+fn a_log_that_cannot_be_opened_is_a_refusal() {
+    let _one = serial();
+    let scratch = Scratch::new("log-refused");
+    // The supervisor creates a missing log directory, so the refusal has to
+    // come from something a directory cannot be created under: a regular file
+    // in the way (`ENOTDIR`), which needs no privileges and no read-only mount.
+    std::fs::write(scratch.at("blocked"), b"not a directory").expect("write the blocker");
+    scratch.conf(
+        "probe.conf",
+        &format!(
+            "type = script\ncommand = echo ran > {}\nready = none\n\
+             log = file:{}/x.log\nrestart = never\n",
+            scratch.at("marker"),
+            scratch.at("blocked")
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    assert!(
+        wait_until(START_DEADLINE_MS, || {
+            scratch
+                .read("sup.log")
+                .is_some_and(|log| log.contains("cannot open log"))
+        }),
+        "the refusal never reached the log:\n{}",
+        scratch.tail("sup.log")
+    );
+    assert!(
+        scratch.read("marker").is_none(),
+        "the service ran with its log going nowhere"
+    );
+    assert!(
+        sup.exited().is_none(),
+        "the supervisor died over a bad log path"
+    );
+}
+
+/// A reload does not repeat a warning it already announced.
+///
+/// The advice is about a file; re-reading an unchanged file says nothing new,
+/// and a plan with a hundred `ready = none` services would print a hundred
+/// warnings (plus their help lines) on every single reload — burying the one
+/// line the operator reloaded to read.
+#[test]
+fn a_reload_does_not_repeat_warnings_it_already_announced() {
+    let _one = serial();
+    let scratch = Scratch::new("warnings-once");
+    if zctl_path().is_none() {
+        let _ = std::fs::write(scratch.at("skipped"), "no zctl binary\n");
+        return;
+    }
+    // `ready = none` on a `process` service is W003: a real warning, announced
+    // once at load. (A `script` gets no W003 — its readiness is the script.)
+    scratch.conf(
+        "probe.conf",
+        "type = process\ncommand = /bin/sleep 30\nready = none\nlog = none\n",
+    );
+    let mut sup = Sup::start(&scratch);
+    let warnings = || {
+        scratch
+            .read("sup.log")
+            .unwrap_or_default()
+            .matches("W003")
+            .count()
+    };
+    assert!(
+        wait_until(START_DEADLINE_MS, || warnings() > 0),
+        "the warning was never announced at load:\n{}",
+        scratch.tail("sup.log")
+    );
+    for _ in 0..2 {
+        let out = zctl(&scratch, &["reload-all"]);
+        assert!(
+            out.status.success(),
+            "reload failed: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+    sleep_ms(500);
+    assert_eq!(
+        warnings(),
+        1,
+        "the reload repeated a warning it had already announced:\n{}",
+        scratch.tail("sup.log")
+    );
+    assert!(sup.exited().is_none(), "the supervisor died");
+}
+
+/// `private-tmp` is a mount-namespace promise, and the promise is about every
+/// world-writable scratch directory, not just `/tmp`.
+///
+/// The comparison is the point: the same command runs twice, once with
+/// `private-tmp = yes` and once without, and the host looks for both markers.
+/// If the control's marker is missing the test proves nothing (the service
+/// never ran); if the private one's is present, the mount did not happen.
+///
+/// Root only: `unshare(CLONE_NEWNS)` needs `CAP_SYS_ADMIN`, and the spawn is
+/// refused without it (fail-closed), so a non-root run would be testing the
+/// refusal rather than the isolation.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_private_tmp_covers_the_scratch_directories() {
+    let _one = serial();
+    let scratch = Scratch::new("privtmp");
+    if unsafe { libc::geteuid() } != 0 {
+        let _ = std::fs::write(scratch.at("skipped"), "needs root\n");
+        return;
+    }
+    let tag = format!("zinit-priv-{}", std::process::id());
+    let marker = format!("/tmp/{tag}");
+    let control_marker = format!("/tmp/{tag}-control");
+    // Each instance writes its own marker into all three directories, so a
+    // single shared directory is enough to fail the test.
+    let probe = |name: &str| {
+        format!(
+            "/bin/sh -c 'for d in /tmp /var/tmp /dev/shm; do [ -d $d ] && echo x > $d/{tag}-{name}; done; \
+             echo ok > {}'",
+            scratch.at(&format!("{name}.done"))
+        )
+    };
+    scratch.conf(
+        "private.conf",
+        &desc(&probe("private"), "private-tmp = yes\n"),
+    );
+    scratch.conf("plain.conf", &desc(&probe("plain"), ""));
+    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&control_marker);
+
+    let _sup = Sup::start(&scratch);
+    assert!(
+        wait_until(START_DEADLINE_MS, || scratch.read("private.done").is_some()
+            && scratch.read("plain.done").is_some()),
+        "both services must have run: private={:?} plain={:?}\n{}",
+        scratch.read("private.done"),
+        scratch.read("plain.done"),
+        scratch.tail("sup.log")
+    );
+
+    // The control proves the probe would leave a marker in a shared
+    // directory, so a missing one below means isolation rather than a typo.
+    assert!(
+        std::path::Path::new(&control_marker).exists(),
+        "the unconfined service must leave its marker: the probe is broken"
+    );
+    for dir in ["/tmp", "/var/tmp", "/dev/shm"] {
+        let leaked = format!("{dir}/{tag}-private");
+        assert!(
+            !std::path::Path::new(&leaked).exists(),
+            "private-tmp leaked into {dir}"
+        );
+        let _ = std::fs::remove_file(format!("{dir}/{tag}-control"));
+    }
+    let _ = std::fs::remove_file(&control_marker);
+    let _ = std::fs::remove_file(&marker);
+}
+
+/// The post-fork path — ids, capability drop, seccomp, `execve` — without
+/// real root.
+///
+/// Those steps live in the child (they never return to the caller), so a unit
+/// test cannot reach them and a mutation run found most of `spawn.rs` alive:
+/// nothing was executing it. A user namespace fixes the *privilege* half of
+/// that: inside `unshare -U -r` the caller is uid 0 with `CAP_SETPCAP` and
+/// `CAP_SYS_ADMIN` over a world that is its own, which is exactly what the
+/// child path needs and exactly what a CI runner will never grant.
+///
+/// The test re-executes itself inside the namespace: the outer run is the
+/// launcher, the inner run is the real assertion. That keeps the assertion
+/// identical to what an operator would get on a real machine, and it is what
+/// the existing root-gated tests would look like if they could run in CI.
+#[test]
+#[cfg(target_os = "linux")]
+fn the_child_path_runs_with_privileges_inside_a_user_namespace() {
+    if std::env::var("ZINIT_IN_USERNS").is_err() {
+        // A hardened host can forbid unprivileged user namespaces: the GitHub
+        // runners do (`unshare -U -r` dies on /proc/self/uid_map with EPERM).
+        // The inner run would then fail before any assertion, which says
+        // nothing about the child path. Probe the exact invocation and skip
+        // when the host is the one refusing; where namespaces are allowed
+        // (a normal machine, the hardware box) the test still runs in full.
+        let probe = std::process::Command::new("unshare")
+            .args(["-U", "-r", "-p", "-f", "--mount-proc", "--", "true"])
+            .status();
+        if !matches!(probe, Ok(s) if s.success()) {
+            // Silent on purpose: the repository forbids print macros outside
+            // `zrt::report` (the "promises" check). A skipped proof is
+            // recorded in `docs/ACTA_ALPHA.md`, not shouted from stderr.
+            return;
+        }
+        // Outer run: same test binary, one test, inside a user namespace with
+        // a pid namespace and a private /proc.
+        let exe = std::env::current_exe().expect("own test binary");
+        let status = std::process::Command::new("unshare")
+            .args([
+                "-U",
+                "-r",
+                "-p",
+                "-f",
+                "--mount-proc",
+                "--",
+                exe.to_str().expect("utf-8 path"),
+                "--exact",
+                "the_child_path_runs_with_privileges_inside_a_user_namespace",
+                "--nocapture",
+            ])
+            .env("ZINIT_IN_USERNS", "1")
+            .status()
+            .expect("unshare is in util-linux; every CI image has it");
+        assert!(
+            status.success(),
+            "the inner run failed (if the host forbids unprivileged user \
+             namespaces, this test cannot prove anything here)"
+        );
+        return;
+    }
+    // Inner run: a real supervisor, a real service, and the three directives
+    // that only mean something with privileges.
+    let _one = serial();
+    let scratch = Scratch::new("userns");
+    scratch.conf(
+        "rooted.conf",
+        &desc(
+            &format!(
+                // Two observable effects, not just "it started": the bounding
+                // set after `drop-capabilities = all`, and the refusal of a
+                // syscall the filter does not allow. A mutation that turns
+                // either step into a no-op changes what this file says.
+                "/bin/sh -c 'id -u > {out}; grep CapBnd /proc/self/status >> {out}; \
+                 unshare -m true 2>/dev/null; echo rc=$? >> {out}; exec /bin/sleep 30'",
+                out = scratch.at("uid")
+            ),
+            // A bounding-set drop plus a syscall filter: the two steps that
+            // need real privilege inside the child. No `user =` line on
+            // purpose — a user namespace forbids `setgroups` (writing "deny"
+            // to /proc/self/setgroups is how `unshare -r` works), so the id
+            // step cannot be exercised here without failing for a reason that
+            // has nothing to do with zinit.
+            "drop-capabilities = all\nsyscall-filter = errno\n",
+        ),
+    );
+    let sup = Sup::start(&scratch);
+    assert!(
+        wait_until(START_DEADLINE_MS, || scratch.read("uid").is_some()),
+        "the child path never completed: state={:?}\n{}",
+        scratch.read("state/rooted"),
+        scratch.tail("sup.log")
+    );
+    let report = scratch.read("uid").unwrap_or_default();
+    let lines: Vec<&str> = report.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("0"),
+        "the service must be uid 0 here"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("CapBnd:") && l.contains("0000000000000000")),
+        "the bounding set must be empty after drop-capabilities = all: {report}"
+    );
+    assert!(
+        lines.iter().any(|l| l.trim() == "rc=1"),
+        "a syscall outside the baseline must be refused (`unshare -m`): {report}"
+    );
+    // It must also have reached Running, which is only true if `execve` was
+    // reached with the filter installed.
+    assert!(
+        wait_until(START_DEADLINE_MS, || {
+            scratch
+                .read("state/rooted")
+                .is_some_and(|s| s.contains("state=Running"))
+        }),
+        "the service never reached Running: {:?}\n{}",
+        scratch.read("state/rooted"),
+        scratch.tail("sup.log")
+    );
+    let _ = sup;
 }

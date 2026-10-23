@@ -15,3 +15,6 @@
 # cargo-fuzz working sets (corpus/artifacts regenerate every run)
 fuzz/corpus/
 fuzz/artifacts/
+
+# cargo-mutants scratch output
+/mutants.out*/

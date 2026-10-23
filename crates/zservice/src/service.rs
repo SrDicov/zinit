@@ -136,6 +136,26 @@ impl ManagedService {
         self.pid
     }
 
+    /// Take over a process that is already running.
+    ///
+    /// The supervisor that started it died; this one finds the process
+    /// still alive and adopts it instead of starting a second copy. The
+    /// process is not our child (the kernel reparented it to PID 1), so:
+    ///
+    /// * the process group is unknown — the stop path signals it by pid,
+    ///   which is what `adopted` already means for a `Forking` daemon;
+    /// * the exec handshake is long over — the process is running, not
+    ///   starting;
+    /// * its death is watched through a pidfd, and nobody can say how it
+    ///   died (see the tracker's `ECHILD` arm).
+    pub fn adopt(&mut self, pid: i32) {
+        self.pid = Some(pid);
+        self.pgid = None;
+        self.adopted = true;
+        self.exec_confirmed = false;
+        self.ready = ReadyWait::None;
+    }
+
     /// The process group to signal, if any.
     pub const fn pgid(&self) -> Option<i32> {
         self.pgid
@@ -360,11 +380,11 @@ impl ManagedService {
     /// Drain the exec-error pipe once.
     ///
     /// `Some(ExecOk)` on `EOF` (the image was replaced — the first point at
-    /// which the process counts as real), `Some(SpawnFailed{errno})` on four
-    /// bytes (whatever failed in the child, with its errno; a second
-    /// diagnostic word naming the step may follow and is discarded here),
-    /// `None` while inconclusive. The pipe is closed on the first conclusive
-    /// read; later calls answer `None` without touching the kernel.
+    /// which the process counts as real), `Some(SpawnFailed{errno, step})`
+    /// on eight bytes (whatever failed in the child, with its errno and its
+    /// pre-exec step tag; see `spawn::child_step_name`), `None` while
+    /// inconclusive. The pipe is closed on the first conclusive read; later
+    /// calls answer `None` without touching the kernel.
     ///
     /// Known race, documented: a child killed between `fork` and `exec` also
     /// reads as `EOF`. The supervisor correlates with the reaper — a
@@ -376,7 +396,7 @@ impl ManagedService {
             Some(f) => f,
             None => return Ok(None),
         };
-        let mut buf = [0u8; 4];
+        let mut buf = [0u8; 8];
         let mut got = 0;
         loop {
             let mut one = [0u8; 1];
@@ -398,12 +418,14 @@ impl ManagedService {
                 Ok(_) => {
                     buf[got] = one[0];
                     got += 1;
-                    if got == 4 {
-                        let errno = u32::from_le_bytes(buf) as i32;
+                    if got == 8 {
+                        let errno = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as i32;
+                        let step = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
                         self.close_exec_fd();
                         return Ok(Some(Event::SpawnFailed {
                             idx: self.idx,
                             errno,
+                            step,
                         }));
                     }
                 }
@@ -577,6 +599,17 @@ impl ManagedService {
             zrt::sys::ExitStatus::Signaled { signal, .. } => Some(Event::Signalled {
                 idx: self.idx,
                 signal,
+            }),
+            // `Reported(-1)` is the marker for "the process is gone and
+            // nobody can say how": an adopted process, whose death the
+            // kernel reported and whose exit status nobody may read (it
+            // was never our child). It is a death — the service is not
+            // running any more — and it is not a clean exit, so the
+            // restart policy treats it as a failure. Signal 0 is the
+            // marker for "unknown signal".
+            zrt::sys::ExitStatus::Reported(raw) if raw < 0 => Some(Event::Signalled {
+                idx: self.idx,
+                signal: 0,
             }),
             zrt::sys::ExitStatus::Reported(_) => None,
         };

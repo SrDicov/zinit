@@ -56,6 +56,14 @@ pub const MAX_LINE_BYTES: usize = 4096;
 /// Hard cap on buffered input or unflushed output per client. Past it the
 /// client is dropped (input) or its replies discarded at flush (output).
 pub const MAX_BUFFERED_BYTES: usize = 65536;
+/// How many clients may be connected at once.
+///
+/// The supervisor is the one process that must not run out of memory, and
+/// every client costs a descriptor and a buffer. A local process that
+/// opens connections in a loop would otherwise grow the supervisor without
+/// bound; past the cap the connection is closed before it is registered,
+/// so the cost of refusing it is one descriptor.
+pub const MAX_CLIENTS: usize = 64;
 
 /// One parsed client frame, with the connection it arrived on.
 ///
@@ -96,12 +104,235 @@ pub enum Command {
     },
     /// `reload-all`: rebuild the plan without disturbing live pids.
     ReloadAll { client: RawFd, id: String },
+    /// `poweroff | reboot | halt | suspend | hibernate`: machine power.
+    /// `hibernate` always answers an error (no resume target exists);
+    /// the rest stop every service first, then act.
+    Power {
+        client: RawFd,
+        id: String,
+        action: PowerAction,
+    },
     /// `version`: binary version plus the backend capability line.
     Version { client: RawFd, id: String },
     /// `help`: the verbs this server speaks.
     Help { client: RawFd, id: String },
+    /// `emergency`: put a shell on the console, whatever the plan says.
+    Emergency { client: RawFd, id: String },
 }
 
+/// What a verb is allowed to do, from the caller's point of view.
+///
+/// Three classes, because the blast radius is not the same: reading a
+/// service's state changes nothing, stopping a service changes one
+/// service, and powering the machine off ends everything for everybody.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VerbClass {
+    /// `status`, `list`, `version`, `help`: nobody is touched.
+    Read,
+    /// `start`, `stop`, `restart`, `kick`, `reload-all`: one service (or
+    /// the plan) changes.
+    Mutate,
+    /// `poweroff`, `reboot`, `halt`, `suspend`, `hibernate`: the machine
+    /// changes.
+    Power,
+}
+
+impl Command {
+    /// Which class does this command belong to?
+    ///
+    /// The split is what the credential check in [`CtlServer`] enforces: a
+    /// peer that may look may not touch, and a peer that may touch services
+    /// may not end the machine.
+    pub fn verb_class(&self) -> VerbClass {
+        match self {
+            Command::Status { .. }
+            | Command::List { .. }
+            | Command::Version { .. }
+            | Command::Help { .. } => VerbClass::Read,
+            Command::Start { .. }
+            | Command::Stop { .. }
+            | Command::Restart { .. }
+            | Command::Kick { .. }
+            | Command::ReloadAll { .. } => VerbClass::Mutate,
+            // Taking the console is a machine-wide act, like the power
+            // verbs: it is the one thing an operator does not want a
+            // stray program of their own user doing by accident.
+            Command::Power { .. } | Command::Emergency { .. } => VerbClass::Power,
+        }
+    }
+}
+
+/// The client's token, so a refusal can name who it refuses.
+fn cmd_id(cmd: &Command) -> String {
+    match cmd {
+        Command::Status { id, .. }
+        | Command::List { id, .. }
+        | Command::Start { id, .. }
+        | Command::Stop { id, .. }
+        | Command::Restart { id, .. }
+        | Command::Kick { id, .. }
+        | Command::ReloadAll { id, .. }
+        | Command::Power { id, .. }
+        | Command::Version { id, .. }
+        | Command::Help { id, .. }
+        | Command::Emergency { id, .. } => id.clone(),
+    }
+}
+
+/// May this peer run this verb?
+///
+/// The rules, in order:
+///
+/// * Reading is always allowed. A peer that connected can be told what the
+///   machine is doing.
+/// * Root may do anything: it already owns the machine.
+/// * A peer that is neither root nor the supervisor's own user may not
+///   mutate. The socket is `0600`, so this case is already unreachable in
+///   practice — the rule is there for the day an operator loosens the mode
+///   or a group gets access.
+/// * A peer that *is* the supervisor's user may mutate, but only through a
+///   known client: `zctl` (or the supervisor itself). Otherwise any
+///   process of that user could power the machine off by writing one line
+///   into the socket.
+///
+/// When the platform cannot name the peer's binary at all (no `/proc`), the
+/// uid stands on its own and the supervisor announces that weaker check at
+/// startup. Where the platform *can* name it, a `None` is a failed lookup and
+/// the power verbs are refused.
+///
+/// Note what this is not: a boundary against a malicious peer of the same
+/// user. That peer can copy `zctl` and be `zctl`. The socket's mode is
+/// the real boundary; this is defence in depth and a guard against
+/// accidents.
+pub fn authorize(
+    peer: Option<&zrt::sys::PeerCred>,
+    peer_exe: Option<&Path>,
+    self_uid: u32,
+    class: VerbClass,
+) -> bool {
+    if class == VerbClass::Read {
+        return true;
+    }
+    let Some(peer) = peer else {
+        // A platform that cannot say who is calling gets the strict answer.
+        return false;
+    };
+    if peer.uid == 0 {
+        return true;
+    }
+    if peer.uid != self_uid {
+        return false;
+    }
+    if class == VerbClass::Mutate {
+        // Managing services is what this socket is for: the owner of the
+        // socket may do it, from the client or from a script.
+        return true;
+    }
+    // Powering the machine off is the one verb that ends everything for
+    // everybody, so it takes the known client (`zctl`/`zinit`) or root. Root
+    // was handled above, so an operator with root is never blocked by this.
+    //
+    // `None` means the platform cannot name the peer's executable (no
+    // `/proc`, e.g. the BSDs). There the only boundary left is the socket's
+    // own `0600`: any process of the owner's user may ask. That is the
+    // documented threat model — a guard against an accident, not against the
+    // owner's own code — but it is a *weaker* check, so the supervisor says so
+    // at startup instead of letting a bug report discover it.
+    match peer_exe {
+        // `None` is two different facts wearing the same shape, and they must
+        // not share an answer. On Linux the way to name the peer exists, so a
+        // `None` here means the `readlink` failed — a peer that closed its
+        // end between `accept` and the read, or a `/proc` this process cannot
+        // read. Failing closed costs nothing: `zctl` writes the frame and then
+        // waits for the reply, so a legitimate client is alive here. On a
+        // platform with no `/proc` at all it is the only information there is,
+        // and the supervisor announces the weaker check at startup.
+        None => !cfg!(any(target_os = "linux", target_os = "android")),
+        Some(exe) => {
+            matches!(
+                executable_name(exe).as_deref(),
+                Some("zctl") | Some("zinit")
+            ) && trusted_executable(exe)
+        }
+    }
+}
+
+/// The file name of the executable the kernel resolved, without the marker a
+/// replaced binary carries.
+///
+/// A package upgrade unlinks the old inode while the running process keeps
+/// it, and `/proc/<pid>/exe` then reads `/usr/bin/zinit (deleted)`. That is
+/// still the init this machine booted: refusing the name would mean the
+/// machine cannot power off after any upgrade of itself.
+fn executable_name(exe: &Path) -> Option<String> {
+    let name = exe.file_name()?.to_string_lossy().into_owned();
+    Some(name.strip_suffix(" (deleted)").unwrap_or(&name).to_string())
+}
+
+/// Whether a peer executable sits where a `zctl`/`zinit` is installed.
+///
+/// The kernel reports the path it resolved for the peer, so a copy of `zctl`
+/// in `/tmp` does not qualify: the operator's install directories and the
+/// directory the supervisor itself was started from do. That turns "any
+/// process of my user that happens to be called `zctl`" into "a `zctl` where
+/// a `zctl` gets installed", which is the difference between a guard and a
+/// word. It is still not a boundary against the owner of the account.
+fn trusted_executable(exe: &Path) -> bool {
+    const SYSTEM: [&str; 6] = [
+        "/usr/bin",
+        "/usr/sbin",
+        "/bin",
+        "/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+    ];
+    let Some(dir) = exe.parent() else {
+        return false;
+    };
+    if SYSTEM.iter().any(|d| dir == Path::new(d)) {
+        return true;
+    }
+    // The supervisor's own directory is a trust root only when the operator
+    // says so. Trusting it by default was a hole: if the supervisor runs from
+    // a build tree, `/tmp`, or an initramfs (where its directory is `/`), then
+    // the one process the check exists to constrain — the owner of the
+    // account — can drop a file called `zctl` there and get the power verbs.
+    // `ZINIT_TRUST_SELF_DIR=1` covers a development install and the test
+    // suite, which run from `target/`; production uses the install dirs.
+    if std::env::var_os("ZINIT_TRUST_SELF_DIR").is_none() {
+        return false;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|self_exe| self_exe.parent().map(Path::to_path_buf))
+        .is_some_and(|self_dir| self_dir == dir)
+}
+
+/// A machine-power verb. Parsed in [`Command`], executed by the supervisor
+/// (stop every service first, except `suspend`, which keeps state).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PowerAction {
+    /// Stop the CPU, leave the power on.
+    Halt,
+    /// Stop everything, then cut the power.
+    Poweroff,
+    /// Stop everything, then boot again.
+    Reboot,
+    /// Sync and sleep (RAM stays powered). No services are stopped.
+    Suspend,
+    /// Refused: hibernation needs a resume target that does not exist.
+    Hibernate,
+}
+
+/// Error codes: `1` bad frame, `2` unknown command or arity, `3` unknown
+/// service, `4` not applicable, `5` reload failed, `6` not permitted.
+///
+/// The first five are the frozen contract (C4). `6` was added when the
+/// control socket started checking who is calling: a client whose
+/// credentials do not allow the verb gets its own code, because reusing
+/// `5` ("reload failed") for a refusal would tell every existing client
+/// the wrong thing. A code the client does not know is still a code it can
+/// print, so the extension breaks nobody.
 /// A frame that parsed but means nothing: the id to blame, a code, a reason.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CtlError {
@@ -208,9 +439,53 @@ pub fn parse_line(client: RawFd, line: &str) -> Result<Command, CtlError> {
             no_args(&id, verb)?;
             Ok(Command::ReloadAll { client, id })
         }
+        "poweroff" => {
+            no_args(&id, verb)?;
+            Ok(Command::Power {
+                client,
+                id,
+                action: PowerAction::Poweroff,
+            })
+        }
+        "reboot" => {
+            no_args(&id, verb)?;
+            Ok(Command::Power {
+                client,
+                id,
+                action: PowerAction::Reboot,
+            })
+        }
+        "halt" => {
+            no_args(&id, verb)?;
+            Ok(Command::Power {
+                client,
+                id,
+                action: PowerAction::Halt,
+            })
+        }
+        "suspend" => {
+            no_args(&id, verb)?;
+            Ok(Command::Power {
+                client,
+                id,
+                action: PowerAction::Suspend,
+            })
+        }
+        "hibernate" => {
+            no_args(&id, verb)?;
+            Ok(Command::Power {
+                client,
+                id,
+                action: PowerAction::Hibernate,
+            })
+        }
         "version" => {
             no_args(&id, verb)?;
             Ok(Command::Version { client, id })
+        }
+        "emergency" => {
+            no_args(&id, verb)?;
+            Ok(Command::Emergency { client, id })
         }
         "help" => {
             no_args(&id, verb)?;
@@ -329,6 +604,14 @@ struct Client {
     /// then hang up. The client stays readable until then, but nothing more
     /// is parsed from it.
     close_when_drained: bool,
+    /// Who is on the other end, captured at accept time.
+    ///
+    /// `None` means the platform could not say, and the mutating verbs are
+    /// refused: a socket that cannot name its caller must not be a socket
+    /// that can power the machine off.
+    peer: Option<zrt::sys::PeerCred>,
+    /// The path of the peer's binary, when it could be read.
+    peer_exe: Option<PathBuf>,
 }
 
 /// The listening control socket and its clients.
@@ -342,6 +625,9 @@ pub struct CtlServer {
     listener: RawFd,
     path: PathBuf,
     clients: Vec<Client>,
+    /// The user this supervisor runs as: the peer a same-user connection is
+    /// compared against.
+    self_uid: u32,
 }
 
 impl CtlServer {
@@ -354,6 +640,7 @@ impl CtlServer {
             listener,
             path: path.to_path_buf(),
             clients: Vec::new(),
+            self_uid: zrt::sys::geteuid(),
         })
     }
 
@@ -373,15 +660,35 @@ impl CtlServer {
         loop {
             match zrt::sys::unix_accept(self.listener) {
                 Ok(fd) => {
+                    if self.clients.len() >= MAX_CLIENTS {
+                        // No more room: the connection is closed before it
+                        // is registered, so refusing it costs one
+                        // descriptor and nothing else.
+                        let _ = zrt::sys::close(fd);
+                        continue;
+                    }
                     if reactor.add(fd, Interest::Read).is_err() {
                         let _ = zrt::sys::close(fd);
                         continue;
                     }
+                    // Who is calling, captured while the connection is still
+                    // fresh: the peer can close its end, but the kernel
+                    // keeps the credentials for the life of the socket.
+                    let peer = zrt::sys::peercred(fd).ok();
+                    let peer_exe = peer.and_then(|p| {
+                        if p.pid > 0 {
+                            std::fs::read_link(format!("/proc/{}/exe", p.pid)).ok()
+                        } else {
+                            None
+                        }
+                    });
                     self.clients.push(Client {
                         fd,
                         input: Vec::new(),
                         output: Vec::new(),
                         close_when_drained: false,
+                        peer,
+                        peer_exe,
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -468,7 +775,29 @@ impl CtlServer {
                         }
                     };
                     match parse_line(fd, text) {
-                        Ok(cmd) => out.push(cmd),
+                        Ok(cmd) => {
+                            // The credential check happens here, before the
+                            // command reaches the supervisor: a refused verb
+                            // is answered in band and never becomes an
+                            // action, so nothing to undo afterwards.
+                            let allowed = authorize(
+                                self.clients[i].peer.as_ref(),
+                                self.clients[i].peer_exe.as_deref(),
+                                self.self_uid,
+                                cmd.verb_class(),
+                            );
+                            if allowed {
+                                out.push(cmd);
+                            } else {
+                                let id = cmd_id(&cmd);
+                                let frame = render_err(
+                                    &id,
+                                    6,
+                                    "permission denied: this peer may not run that verb",
+                                );
+                                self.clients[i].output.extend_from_slice(frame.as_bytes());
+                            }
+                        }
                         Err(e) => {
                             let frame = render_err(&e.id, e.code, &e.msg);
                             self.clients[i].output.extend_from_slice(frame.as_bytes());
@@ -559,6 +888,139 @@ mod tests {
         parse_line(7, line)
     }
 
+    /// Who may run what, spelled out as a table.
+    ///
+    /// The policy is the whole point of the check, and a policy that only
+    /// exists inside an `if` in the accept path is a policy nobody can
+    /// check. Each row is a peer; the columns are the two verb classes.
+    #[test]
+    fn the_credential_policy_is_explicit() {
+        let root = zrt::sys::PeerCred {
+            pid: 10,
+            uid: 0,
+            gid: 0,
+        };
+        let owner = zrt::sys::PeerCred {
+            pid: 11,
+            uid: 1000,
+            gid: 1000,
+        };
+        let other = zrt::sys::PeerCred {
+            pid: 12,
+            uid: 1001,
+            gid: 1001,
+        };
+        let zctl = Path::new("/sbin/zctl");
+        let shell = Path::new("/bin/sh");
+
+        // Reading is always allowed.
+        for peer in [&root, &owner, &other] {
+            assert!(
+                authorize(Some(peer), None, 1000, VerbClass::Read),
+                "a peer may always look"
+            );
+        }
+        // Root may do anything.
+        assert!(authorize(Some(&root), None, 1000, VerbClass::Mutate));
+        assert!(authorize(Some(&root), None, 1000, VerbClass::Power));
+        // The owner's own user may manage services.
+        assert!(authorize(Some(&owner), Some(zctl), 1000, VerbClass::Mutate));
+        assert!(authorize(
+            Some(&owner),
+            Some(shell),
+            1000,
+            VerbClass::Mutate
+        ));
+        // ...but the power verbs take the known client.
+        assert!(authorize(Some(&owner), Some(zctl), 1000, VerbClass::Power));
+        assert!(
+            !authorize(Some(&owner), Some(shell), 1000, VerbClass::Power),
+            "any program of the owner's user must not be able to power the machine off"
+        );
+        // Another user may not change anything.
+        assert!(!authorize(
+            Some(&other),
+            Some(zctl),
+            1000,
+            VerbClass::Mutate
+        ));
+        assert!(!authorize(Some(&other), Some(zctl), 1000, VerbClass::Power));
+        // An unknown peer may not change anything: a platform that cannot
+        // say who is calling gets the strict answer.
+        assert!(!authorize(None, None, 1000, VerbClass::Mutate));
+        assert!(!authorize(None, None, 1000, VerbClass::Power));
+        // A peer whose binary could not be named: on a platform with no
+        // `/proc` the uid is all there is and the supervisor announces it; on
+        // Linux the lookup could have been done, so its failure is refused
+        // rather than rewarded.
+        assert_eq!(
+            authorize(Some(&owner), None, 1000, VerbClass::Power),
+            !cfg!(any(target_os = "linux", target_os = "android")),
+            "a failed executable lookup must not grant the power verbs on Linux"
+        );
+        // A binary with the right name where no `zctl` is installed is not a
+        // client: this is the hole the basename check left open.
+        assert!(
+            !authorize(
+                Some(&owner),
+                Some(Path::new("/tmp/zctl")),
+                1000,
+                VerbClass::Power
+            ),
+            "a copy of zctl anywhere is not a client"
+        );
+        assert!(
+            authorize(
+                Some(&owner),
+                Some(Path::new("/usr/local/bin/zctl")),
+                1000,
+                VerbClass::Power
+            ),
+            "an installed zctl is a client"
+        );
+        // A package upgrade unlinks the old binary; the running process keeps
+        // the inode and `/proc/<pid>/exe` says "(deleted)". Refusing that name
+        // would mean an upgraded machine could not power itself off.
+        assert!(
+            authorize(
+                Some(&owner),
+                Some(Path::new("/usr/bin/zinit (deleted)")),
+                1000,
+                VerbClass::Power
+            ),
+            "the running binary keeps its name after an upgrade"
+        );
+    }
+
+    /// The three classes of verb, spelled out.
+    #[test]
+    fn the_verbs_fall_into_three_classes() {
+        for line in ["C 1 status sshd", "C 1 list", "C 1 version", "C 1 help"] {
+            let cmd = parse(line).expect("parses");
+            assert_eq!(cmd.verb_class(), VerbClass::Read, "{line}");
+        }
+        for line in [
+            "C 1 start sshd",
+            "C 1 stop sshd",
+            "C 1 restart sshd",
+            "C 1 kick sshd",
+            "C 1 reload-all",
+        ] {
+            let cmd = parse(line).expect("parses");
+            assert_eq!(cmd.verb_class(), VerbClass::Mutate, "{line}");
+        }
+        for line in [
+            "C 1 poweroff",
+            "C 1 reboot",
+            "C 1 halt",
+            "C 1 suspend",
+            "C 1 hibernate",
+        ] {
+            let cmd = parse(line).expect("parses");
+            assert_eq!(cmd.verb_class(), VerbClass::Power, "{line}");
+        }
+    }
+
     #[test]
     fn every_verb_parses_with_its_arity() {
         assert_eq!(
@@ -581,8 +1043,44 @@ mod tests {
             parse("C 7 reload-all"),
             Ok(Command::ReloadAll { .. })
         ));
-        assert!(matches!(parse("C 8 version"), Ok(Command::Version { .. })));
-        assert!(matches!(parse("C 9 help"), Ok(Command::Help { .. })));
+        assert!(matches!(
+            parse("C 8 poweroff"),
+            Ok(Command::Power {
+                action: PowerAction::Poweroff,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse("C 9 reboot"),
+            Ok(Command::Power {
+                action: PowerAction::Reboot,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse("C 10 halt"),
+            Ok(Command::Power {
+                action: PowerAction::Halt,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse("C 11 suspend"),
+            Ok(Command::Power {
+                action: PowerAction::Suspend,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse("C 12 hibernate"),
+            Ok(Command::Power {
+                action: PowerAction::Hibernate,
+                ..
+            })
+        ));
+        assert!(matches!(parse("C 13 version"), Ok(Command::Version { .. })));
+        assert!(matches!(parse("C 14 help"), Ok(Command::Help { .. })));
+        assert!(parse("C 15 poweroff now").is_err(), "power takes no args");
     }
 
     #[test]

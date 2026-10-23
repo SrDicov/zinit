@@ -84,7 +84,7 @@ fn main() -> ExitCode {
 /// Short usage, printed for local mistakes. Server-side `help` (a verb the
 /// supervisor answers) is passed through, never answered here.
 const USAGE: &str = "usage: zctl [--socket PATH] [--id TOKEN] <verb> [name]";
-const TLDR_HELP: &str = "usage: zctl [--socket PATH] [--id TOKEN] <verb> [name]\nverbs: status <name> | list | start <name> | stop <name> | restart <name> | kick <name> | reload-all | version | help";
+const TLDR_HELP: &str = "usage: zctl [--socket PATH] [--id TOKEN] <verb> [name]\nverbs: status <name> | list | start <name> | stop <name> | restart <name> | kick <name> | reload-all | poweroff | reboot | halt | suspend | hibernate | emergency | version | help";
 
 /// Print usage to stderr and exit 2. `print!` would go to the console the
 /// supervisor may be handing over; usage errors belong on stderr.

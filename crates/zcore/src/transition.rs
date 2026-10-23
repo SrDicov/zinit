@@ -28,7 +28,9 @@ use crate::action::{Action, log};
 use crate::event::Event;
 use crate::reconcile::should_restart;
 use crate::runtime::{Runtime, ServiceState};
-use crate::types::{Desired, Idx, LogLevel, Plan, Restart, ServiceKind, SignalKind, State};
+use crate::types::{
+    Desired, Idx, LogLevel, OnFatal, Plan, Restart, ServiceKind, SignalKind, State,
+};
 
 /// Outcome of applying one event.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -500,13 +502,39 @@ fn handle_death(
         // it, so `zctl status` reports the truth - wanted up, not running -
         // rather than quietly rewriting intent. The reconciler is told to
         // leave it alone via this flag, which only an operator clears.
+        // What the failure means for the machine is the operator's call
+        // (`on-fatal`, default `Warn`): an unmarked failure holds one
+        // service, never the boot.
         runtime.get_mut(idx).restart_suppressed = true;
-        let (level, hint) = if sp.restart == Restart::Never {
-            (LogLevel::Warn, "; restart is disabled for this service")
-        } else {
-            (LogLevel::Info, "; it will not be retried (use `zctl kick`)")
-        };
-        actions.push(log(idx, level, alloc::format!("{description}{hint}")));
+        match sp.on_fatal {
+            OnFatal::Ignore => {
+                actions.push(log(idx, LogLevel::Info, description));
+            }
+            OnFatal::Warn => {
+                let (level, hint) = if sp.restart == Restart::Never {
+                    (LogLevel::Warn, "; restart is disabled for this service")
+                } else {
+                    (LogLevel::Info, "; it will not be retried (use `zctl kick`)")
+                };
+                actions.push(log(idx, level, alloc::format!("{description}{hint}")));
+            }
+            OnFatal::Halt => {
+                actions.push(log(
+                    idx,
+                    LogLevel::Warn,
+                    alloc::format!("{description}; on-fatal = halt"),
+                ));
+                actions.push(Action::Halt { idx });
+            }
+            OnFatal::Reboot => {
+                actions.push(log(
+                    idx,
+                    LogLevel::Warn,
+                    alloc::format!("{description}; on-fatal = reboot"),
+                ));
+                actions.push(Action::Reboot { idx });
+            }
+        }
     }
 
     actions.push(Action::MarkDown {
@@ -634,6 +662,91 @@ mod tests {
             rt.check_invariants(&p)
         );
         assert!(t.actions.iter().any(|a| matches!(a, Action::MarkReady(0))));
+    }
+
+    fn dead_service(restart: Restart, on_fatal: OnFatal) -> (Plan, Runtime) {
+        let mut sp = ServicePlan::new(String::from("a"));
+        sp.restart = restart;
+        sp.on_fatal = on_fatal;
+        let p = plan1(sp);
+        let mut rt = Runtime::from_plan(&p);
+        let mut s = ServiceState::wanted_up();
+        s.state = State::Running;
+        s.pid = Some(100);
+        *rt.get_mut(0) = s;
+        (p, rt)
+    }
+
+    #[test]
+    fn on_fatal_reboot_emits_reboot_action() {
+        let (p, mut rt) = dead_service(Restart::Never, OnFatal::Reboot);
+        let t = apply(&Event::Exited { idx: 0, code: 1 }, &mut rt, &p, 10);
+        assert!(
+            rt.get(0).restart_suppressed,
+            "terminal death holds the service"
+        );
+        assert!(
+            t.actions
+                .iter()
+                .any(|a| matches!(a, Action::Reboot { idx: 0 })),
+            "reboot marked critical must reboot: {:?}",
+            t.actions
+        );
+    }
+
+    #[test]
+    fn on_fatal_halt_emits_halt_action() {
+        let (p, mut rt) = dead_service(Restart::Never, OnFatal::Halt);
+        let t = apply(&Event::Exited { idx: 0, code: 1 }, &mut rt, &p, 10);
+        assert!(
+            t.actions
+                .iter()
+                .any(|a| matches!(a, Action::Halt { idx: 0 })),
+            "halt marked critical must halt: {:?}",
+            t.actions
+        );
+    }
+
+    #[test]
+    fn on_fatal_default_warns_and_never_halts() {
+        // Default policy: loud, held, machine untouched.
+        let (p, mut rt) = dead_service(Restart::Never, OnFatal::Warn);
+        let t = apply(&Event::Exited { idx: 0, code: 1 }, &mut rt, &p, 10);
+        assert!(
+            !t.actions
+                .iter()
+                .any(|a| matches!(a, Action::Halt { .. } | Action::Reboot { .. })),
+            "unmarked failure must not move the machine: {:?}",
+            t.actions
+        );
+        assert!(
+            t.actions.iter().any(|a| matches!(
+                a,
+                Action::Log {
+                    level: LogLevel::Warn,
+                    ..
+                }
+            )),
+            "default failure must be loud: {:?}",
+            t.actions
+        );
+    }
+
+    #[test]
+    fn on_fatal_ignore_logs_info() {
+        let (p, mut rt) = dead_service(Restart::Never, OnFatal::Ignore);
+        let t = apply(&Event::Exited { idx: 0, code: 1 }, &mut rt, &p, 10);
+        assert!(
+            t.actions.iter().any(|a| matches!(
+                a,
+                Action::Log {
+                    level: LogLevel::Info,
+                    ..
+                }
+            )),
+            "ignored failure stays quiet: {:?}",
+            t.actions
+        );
     }
 
     #[test]

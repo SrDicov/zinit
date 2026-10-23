@@ -31,9 +31,19 @@
 //! its own filter (that would need `seccomp(2)`, which is not allow-listed).
 //! `bpf` and `seccomp` themselves are not in the name table at all — not even
 //! as user-allowable entries — so a filtered service cannot punch its own
-//! hole. `ptrace`, `io_uring`, `perf`, keyring and mount-family calls are
-//! absent for the same reason, or because their numbers were never verified
-//! (see below).
+//! hole. `ptrace`, `io_uring`, `perf` and keyring calls are absent for the
+//! same reason, or because their numbers were never verified (see below).
+//!
+//! Two limits worth stating plainly rather than discovering later:
+//!
+//! * Mount-family calls are absent from the **implicit** baseline, but a few
+//!   of them (`unshare`, `chroot`, `pivot_root`, `mknod`) are user-allowable
+//!   entries: an operator who writes them into `syscall-allow` gets them.
+//! * Only the syscall number is inspected, never its arguments. So `clone`
+//!   and `clone3` are allowed as themselves — which means a filtered service
+//!   can still ask for `CLONE_NEWUSER`, and `ioctl` is allowed wholesale
+//!   (`TIOCSTI` included). Filtering arguments is the upgrade path; it is
+//!   deliberately not attempted here.
 //!
 //! # Number provenance
 //!
@@ -58,24 +68,57 @@ const SECCOMP_DATA_NR_OFFSET: u32 = 0;
 /// `seccomp_data.arch` offset.
 const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
 
+/// `struct seccomp_data`: `nr` (0), `arch` (4), `instruction_pointer` (8),
+/// then `args[6]` as six little-endian `u64` starting at 16. The low half of
+/// an argument is the offset + 0; the high half is + 4.
+const SECCOMP_DATA_ARGS_OFFSET: u32 = 16;
+
 /// BPF instruction classes and modes (linux/filter.h).
 const BPF_LD: u16 = 0x00;
 const BPF_W: u16 = 0x00;
 const BPF_ABS: u16 = 0x20;
 const BPF_JMP: u16 = 0x05;
 const BPF_JEQ: u16 = 0x10;
+const BPF_JSET: u16 = 0x40;
 const BPF_K: u16 = 0x00;
 const BPF_RET: u16 = 0x06;
 
 /// Return actions (linux/seccomp.h).
+/// Namespace flags that a filtered service may not ask for through `clone`.
+///
+/// Every namespace `clone` can create. The dangerous pair is user + mount
+/// (root inside a private world); the rest are not escalations by themselves,
+/// but a service that was not given a namespace should not be able to invent
+/// one, and a mask with holes is a mask nobody can reason about.
+const CLONE_NS_MASK: u32 = 0x1000_0000 // CLONE_NEWUSER
+    | 0x0002_0000 // CLONE_NEWNS
+    | 0x2000_0000 // CLONE_NEWPID
+    | 0x4000_0000 // CLONE_NEWNET
+    | 0x0400_0000 // CLONE_NEWUTS
+    | 0x0800_0000 // CLONE_NEWIPC
+    | 0x0200_0000; // CLONE_NEWCGROUP
+
+/// `TIOCSTI`: push a byte into a terminal's input queue. Allowed for a
+/// process that owns the tty, and a way to type into another user's shell
+/// when the tty is shared, which is why it is filtered by argument.
+const TIOCSTI: u32 = 0x5412;
+
 const RET_KILL_PROCESS: u32 = 0x8000_0000;
 const RET_ALLOW: u32 = 0x7fff_0000;
 const RET_ERRNO: u32 = 0x0005_0000;
 
 /// `prctl` option and filter mode (linux/prctl.h). Defined here rather than
 /// taken from `libc` so a missing binding is impossible by construction.
+///
+/// `SECCOMP_MODE_FILTER` is **2**. `1` is `SECCOMP_MODE_STRICT`, which is a
+/// different thing entirely: the kernel installs its own hard-coded filter
+/// that allows `read`, `write`, `_exit` and `sigreturn` and nothing else, and
+/// kills the process with `SIGKILL` on anything else — `execve` included. The
+/// wrong value looked like a working sandbox right up to the first service
+/// that tried to run: `strace` showed `prctl(PR_SET_SECCOMP,
+/// SECCOMP_MODE_STRICT)` and a `killed by SIGKILL` one line later.
 const PR_SET_SECCOMP: i32 = 22;
-const SECCOMP_MODE_FILTER: u64 = 1;
+const SECCOMP_MODE_FILTER: u64 = 2;
 
 /// Audit architecture tokens (linux/audit.h): machine + 64-bit + little-endian.
 const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
@@ -86,6 +129,25 @@ const AUDIT_ARCH_RISCV64: u32 = 0xC000_00F3;
 /// program is not a filter but a second kernel, and `build` says so with
 /// `None` instead of wrapping an offset.
 pub const MAX_ALLOW: usize = 200;
+
+/// The longest program [`build`] can produce: the architecture load and its
+/// refusal, the syscall-number load, two jumps to the argument blocks, one
+/// jump per allowed number, the default action, the allow return, and the two
+/// four-instruction argument blocks.
+///
+/// `install` used to refuse anything past `MAX_ALLOW + 5`, so the largest
+/// allow list `build` accepted could never be installed — a service that
+/// configured 200 syscalls failed to start with "impossible length". The two
+/// bounds now come from the same expression.
+pub const MAX_PROGRAM: usize = MAX_ALLOW + 16;
+
+/// Whether a program is a length `install` can hand the kernel.
+///
+/// A separate predicate so the bound can be tested: a filter that is really
+/// installed is one-way and would take the test process with it.
+fn program_length_is_plausible(len: usize) -> bool {
+    (1..=MAX_PROGRAM).contains(&len)
+}
 
 /// One cBPF instruction. Layout-identical to `struct sock_filter`, defined
 /// here so this module compiles on targets whose `libc` never heard of it;
@@ -196,6 +258,10 @@ pub fn syscall_nr(name: &str) -> Option<u32> {
         "getsockopt" => 55,
         "clone" => 56,
         "fork" => 57,
+        // `vfork` is what dash uses for fork-and-exec; without it every
+        // `sh -c` that runs an external command reports "Cannot fork".
+        "vfork" => 58,
+        "waitid" => 247,
         "execve" => 59,
         "exit" => 60,
         "wait4" => 61,
@@ -241,6 +307,13 @@ pub fn syscall_nr(name: &str) -> Option<u32> {
         "setresuid" => 117,
         "setresgid" => 119,
         "getpgid" => 121,
+        // `getpgrp` is a syscall of its own on x86_64 (111), not an alias of
+        // `getpgid` (121), and glibc's `getpgrp()` uses it. A shell calls it
+        // during job-control initialisation, so a missing entry here is a
+        // shell that dies before running a single line.
+        "getpgrp" => 111,
+        "getresuid" => 118,
+        "getresgid" => 120,
         "capget" => 125,
         "capset" => 126,
         "rt_sigpending" => 127,
@@ -424,6 +497,9 @@ pub const IMPLICIT: &[&str] = &[
     "getegid",
     "getgroups",
     "getpgid",
+    "getpgrp",
+    "getresuid",
+    "getresgid",
     "uname",
     "clock_gettime",
     "clock_getres",
@@ -440,6 +516,13 @@ pub const IMPLICIT: &[&str] = &[
     "sigaltstack",
     "tgkill",
     "clone",
+    // Any service that runs a child — a shell script, a wrapper, a launcher —
+    // has to wait for it. `wait4` only ever reaches your own children, so it
+    // grants nothing over another process; `kill` deliberately stays out of
+    // the baseline, because signalling *any* pid is a different power.
+    "wait4",
+    "waitid",
+    "vfork",
     "clone3",
     "execve",
     "exit",
@@ -529,8 +612,16 @@ pub fn build(extra: &[u32], on_violation: OnViolation) -> Option<Vec<Insn>> {
         OnViolation::Kill => RET_KILL_PROCESS,
         OnViolation::Errno => RET_ERRNO | libc::EPERM as u32,
     };
+    // The two syscalls whose *arguments* matter, resolved through the same
+    // verified table as everything else. `clone3` is conspicuously absent:
+    // its flags live behind a pointer, which a cBPF program cannot
+    // dereference, so a filtered service can still ask for a user namespace
+    // through it. That is a limit of this mechanism, written down in
+    // `docs/SECCOMP.md`, not a number to guess at.
+    let clone_nr = syscall_nr("clone")?;
+    let ioctl_nr = syscall_nr("ioctl")?;
     let n = allow.len();
-    let mut prog = Vec::with_capacity(4 + n + 1);
+    let mut prog = Vec::with_capacity(n + 16);
     // Validate the architecture first: without this, an x32-ABI process
     // (same instruction set, compacted numbers) walks straight through a
     // filter written for the native table.
@@ -538,13 +629,41 @@ pub fn build(extra: &[u32], on_violation: OnViolation) -> Option<Vec<Insn>> {
     prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, arch, 1, 0));
     prog.push(stmt(BPF_RET | BPF_K, action));
     prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
+    // Two jumps out of the allow list, to the argument blocks that sit after
+    // it. Layout, with `n` allowed numbers:
+    //   0..3 prologue, 4 clone jump, 5 ioctl jump, 6..5+n allow jumps,
+    //   6+n default, 7+n ALLOW, 8+n clone block, 12+n ioctl block.
+    let clone_block = 8 + n;
+    let ioctl_block = 12 + n;
+    prog.push(jump(
+        BPF_JMP | BPF_JEQ | BPF_K,
+        clone_nr,
+        (clone_block - 5) as u8,
+        0,
+    ));
+    prog.push(jump(
+        BPF_JMP | BPF_JEQ | BPF_K,
+        ioctl_nr,
+        (ioctl_block - 6) as u8,
+        0,
+    ));
     for (i, nr) in allow.iter().enumerate() {
-        // On match, skip forward to ALLOW; otherwise fall through. Entry `i`
-        // of `n` skips `n - 1 - i`: the default-action return plus the
-        // entries after it... precisely: ALLOW sits at index `4 + n + 1`
-        // while this entry sits at `4 + i`, so the skip is `n - i`.
+        // On match, skip forward to ALLOW; otherwise fall through. The entry
+        // sits at `6 + i` and ALLOW at `7 + n`, so the skip is `n - i`.
         prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, *nr, (n - i) as u8, 0));
     }
+    prog.push(stmt(BPF_RET | BPF_K, action));
+    prog.push(stmt(BPF_RET | BPF_K, RET_ALLOW));
+    // clone: a namespace flag anywhere in the first argument is the
+    // violation; a plain `clone(SIGCHLD, …)` (what fork and pthread_create
+    // do) falls through to ALLOW.
+    prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARGS_OFFSET));
+    prog.push(jump(BPF_JMP | BPF_JSET | BPF_K, CLONE_NS_MASK, 0, 1));
+    prog.push(stmt(BPF_RET | BPF_K, action));
+    prog.push(stmt(BPF_RET | BPF_K, RET_ALLOW));
+    // ioctl: only TIOCSTI in the request argument, not ioctl wholesale.
+    prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARGS_OFFSET + 8));
+    prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, TIOCSTI, 0, 1));
     prog.push(stmt(BPF_RET | BPF_K, action));
     prog.push(stmt(BPF_RET | BPF_K, RET_ALLOW));
     Some(prog)
@@ -559,7 +678,7 @@ pub fn build(extra: &[u32], on_violation: OnViolation) -> Option<Vec<Insn>> {
 /// (including a failing `execve`'s own error report) runs under the filter.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn install(filter: &[Insn]) -> io::Result<()> {
-    if filter.is_empty() || filter.len() > MAX_ALLOW + 5 {
+    if !program_length_is_plausible(filter.len()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "seccomp filter has an impossible length",
@@ -602,6 +721,225 @@ pub fn install(_filter: &[Insn]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Every number in the baseline really is in the assembled program.
+    ///
+    /// The baseline is a list of names; the program is a list of numbers. A
+    /// name that resolves but is dropped on the way (or a jump that skips the
+    /// wrong entry) is a filter that blocks what it says it allows, and the
+    /// symptom is a shell failing at `getpgrp` with `EPERM`.
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn the_program_allows_every_implicit_syscall() {
+        let prog = super::build(&[], super::OnViolation::Errno).expect("filter builds");
+        for name in super::IMPLICIT {
+            let nr = super::syscall_nr(name).expect("implicit name resolves");
+            assert!(
+                prog.iter().any(
+                    |i| i.code == (super::BPF_JMP | super::BPF_JEQ | super::BPF_K) && i.k == nr
+                ),
+                "`{name}` ({nr}) is in the baseline and not in the program"
+            );
+        }
+    }
+
+    /// Does this environment allow an unprivileged user namespace at all?
+    ///
+    /// Called with the permissive filter installed and before ours: if the
+    /// kernel refuses here, an `EPERM` later cannot be blamed on the rule.
+    /// A successful `clone` creates a child that continues in this function;
+    /// it exits immediately, which is also the "allowed" answer.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn probe_namespace_clone() -> bool {
+        // SAFETY: `clone` with a zero stack behaves like fork; every branch
+        // leaves through `_exit`.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_clone,
+                (0x1000_0000u64) | (libc::SIGCHLD as u64),
+                0u64,
+                0u64,
+                0u64,
+                0u64,
+            )
+        };
+        if rc == 0 {
+            // The *new* child, not the caller: it leaves at once, which is
+            // also how a successful clone reports itself.
+            // SAFETY: `_exit` never returns.
+            unsafe { libc::_exit(0) };
+        }
+        if rc > 0 {
+            return true;
+        }
+        // SAFETY: reading the errno of the call above.
+        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        !matches!(errno, libc::EPERM | libc::EACCES)
+    }
+
+    /// The argument rules, exercised for real rather than read off the
+    /// program: a filter that *looks* right and never fires is the failure
+    /// mode this test exists for.
+    ///
+    /// The filter is installed in a forked child, because installing one is
+    /// irreversible and would take the test process with it. `PR_SET_NO_NEW_PRIVS`
+    /// is what lets an unprivileged child install it at all.
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn a_namespace_clone_and_a_terminal_injection_are_refused() {
+        let prog = super::build(&[], super::OnViolation::Errno).expect("filter builds");
+        // SAFETY: fork takes no arguments; the child _exits with its verdict
+        // and never returns to the harness.
+        match unsafe { libc::fork() } {
+            -1 => panic!("fork failed"),
+            0 => {
+                // SAFETY: integer argument, no pointers, nothing retained.
+                let nnp = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+                if nnp != 0 {
+                    // SAFETY: `_exit` never returns.
+                    unsafe { libc::_exit(10) };
+                }
+                // Attribution control: this environment may already refuse an
+                // unprivileged user namespace (Docker's default seccomp,
+                // Ubuntu's apparmor restriction, an old sysctl). A permissive
+                // filter is installed first — stacking is allowed with NNP —
+                // so the same probe can be run before ours.
+                let permissive = [super::stmt(super::BPF_RET | super::BPF_K, super::RET_ALLOW)];
+                // Order matters and it is the whole point: the probe must run
+                // under the *permissive* filter only. Chaining `install(&prog)`
+                // before the probe put the strict filter on top, so the probe
+                // saw our own EPERM, concluded "the environment denies it" and
+                // exited 22 — a green test that never ran the check. An
+                // installation failure is not "inconclusive" either, so it
+                // keeps its own code.
+                if super::install(&permissive).is_err() {
+                    // SAFETY: `_exit` never returns.
+                    unsafe { libc::_exit(10) };
+                }
+                let ns_allowed = probe_namespace_clone();
+                let tiocsti_allowed = probe_tiocsti();
+                if super::install(&prog).is_err() {
+                    // SAFETY: `_exit` never returns.
+                    unsafe { libc::_exit(10) };
+                }
+                if !ns_allowed {
+                    // The kernel denies an unprivileged user namespace on its
+                    // own: an EPERM below could not be blamed on the rule.
+                    // SAFETY: `_exit` never returns.
+                    unsafe { libc::_exit(22) };
+                }
+                // A user namespace needs no privilege to ask for, which is
+                // exactly why the filter has to say no.
+                // SAFETY: `clone` with a zero stack behaves like fork and
+                // returns a pid or -1.
+                let rc = unsafe {
+                    libc::syscall(
+                        libc::SYS_clone,
+                        (0x1000_0000u64) | (libc::SIGCHLD as u64),
+                        0u64,
+                        0u64,
+                        0u64,
+                        0u64,
+                    )
+                };
+                if rc >= 0 {
+                    // SAFETY: `_exit` never returns.
+                    unsafe { libc::_exit(11) };
+                }
+                // SAFETY: reading the errno of the call above.
+                let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno != libc::EPERM {
+                    unsafe { libc::_exit(12) };
+                }
+                // The rule is targeted: a plain clone (what fork and
+                // pthread_create do) must still be allowed.
+                let rc = unsafe {
+                    libc::syscall(
+                        libc::SYS_clone,
+                        libc::SIGCHLD as u64,
+                        0u64,
+                        0u64,
+                        0u64,
+                        0u64,
+                    )
+                };
+                if rc < 0 {
+                    unsafe { libc::_exit(13) };
+                }
+                // And `ioctl` is allowed except for the one request that
+                // types into somebody else's terminal.
+                let byte: u8 = b'x';
+                let rc = unsafe {
+                    libc::syscall(
+                        libc::SYS_ioctl,
+                        0 as libc::c_int,
+                        TIOCSTI as libc::c_ulong,
+                        &byte as *const u8,
+                    )
+                };
+                if rc >= 0 {
+                    unsafe { libc::_exit(14) };
+                }
+                let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno != libc::EPERM {
+                    unsafe { libc::_exit(15) };
+                }
+                // Kernel 6.2+ refuses TIOCSTI without CAP_SYS_ADMIN, and a
+                // hardened container may too: if the permissive filter was
+                // already denied, this run did not verify our rule.
+                unsafe { libc::_exit(if tiocsti_allowed { 0 } else { 23 }) };
+            }
+            pid => {
+                let mut status = 0;
+                // SAFETY: live `c_int`; blocking wait on our own child.
+                assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid);
+                let code = if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    -1
+                };
+                assert!(
+                    code == 0 || code == 22 || code == 23,
+                    "10=install, 11=new-user-namespace allowed, 12=wrong errno,                      13=fork() broke, 14=TIOCSTI allowed, 15=wrong errno"
+                );
+            }
+        }
+    }
+
+    /// Does this environment allow `TIOCSTI` at all? Same question as the
+    /// namespace probe, and the same reason: an `EPERM` that the kernel would
+    /// have given anyway cannot be blamed on the rule.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn probe_tiocsti() -> bool {
+        let byte: u8 = b'x';
+        // SAFETY: a live one-byte buffer and an integer request.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_ioctl,
+                0 as libc::c_int,
+                TIOCSTI as libc::c_ulong,
+                &byte as *const u8,
+            )
+        };
+        if rc >= 0 {
+            return true;
+        }
+        // SAFETY: reading the errno of the call above.
+        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        !matches!(errno, libc::EPERM | libc::EACCES)
+    }
+
+    /// The mode number is the difference between a filter and a kill switch.
+    ///
+    /// `SECCOMP_MODE_STRICT` (1) installs the kernel's own four-syscall
+    /// filter and `SIGKILL`s the process on `execve`; `SECCOMP_MODE_FILTER`
+    /// (2) installs the program built here. A `1` here is not a weaker
+    /// sandbox, it is a service that never starts, and `strace` is the only
+    /// place it shows.
+    #[test]
+    fn the_filter_mode_is_the_filter_mode() {
+        assert_eq!(super::SECCOMP_MODE_FILTER, 2, "1 is SECCOMP_MODE_STRICT");
+    }
+
     use super::*;
 
     /// The program for two allowed calls, written out by hand: any drift in
@@ -610,8 +948,9 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn two_call_program_has_exact_shape() {
         let prog = build(&[60, 231], OnViolation::Kill).expect("builds");
-        // 4 header + 2 + IMPLICIT.len() entries + default + allow. Check the
-        // skeleton around the interesting bits instead of the whole length.
+        // 4 prologue + 2 constrained jumps + IMPLICIT.len() allow jumps +
+        // default + allow + two four-instruction argument blocks. (`60` and
+        // `231` are already in the baseline, so they add no jump.)
         assert_eq!(
             prog[0],
             stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET)
@@ -621,16 +960,21 @@ mod tests {
             prog[3],
             stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET)
         );
-        // Last two are always default-action then allow.
+        // The allow return sits before the argument blocks; each block ends
+        // with deny-then-allow, so the last two are the ioctl pair.
         let n = prog.len();
+        let allow_at = 7 + IMPLICIT.len();
+        assert_eq!(n, IMPLICIT.len() + 16, "no slack in the program");
+        assert_eq!(prog[allow_at], stmt(BPF_RET | BPF_K, RET_ALLOW));
         assert_eq!(prog[n - 2], stmt(BPF_RET | BPF_K, RET_KILL_PROCESS));
         assert_eq!(prog[n - 1], stmt(BPF_RET | BPF_K, RET_ALLOW));
-        // Every jump lands on the final ALLOW: entry at index i skips to n-1.
-        for (i, insn) in prog.iter().enumerate().take(n - 2).skip(4) {
+        // Every generic allow jump lands on ALLOW (the two constrained jumps
+        // land on their blocks and are checked by the behavioural test).
+        for (i, insn) in prog.iter().enumerate().take(allow_at).skip(6) {
             assert_eq!(insn.jf, 0, "entry {i} must fall through on mismatch");
             assert_eq!(
                 insn.jt as usize,
-                n - 1 - (i + 1),
+                allow_at - i - 1,
                 "entry {i} must skip to ALLOW"
             );
         }
@@ -690,5 +1034,18 @@ mod tests {
     #[test]
     fn install_rejects_impossible_lengths() {
         assert!(install(&[]).is_err());
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn the_install_bound_fits_what_build_produces() {
+        // The prologue is four statements and the epilogue two, so a list at
+        // the limit builds to `MAX_ALLOW + 6` and must still be installable.
+        let prog = build(&[], OnViolation::Kill).expect("the implicit baseline builds");
+        assert_eq!(prog.len(), IMPLICIT.len() + 16);
+        assert_eq!(MAX_PROGRAM, MAX_ALLOW + 16);
+        assert!(program_length_is_plausible(prog.len()));
+        assert!(!program_length_is_plausible(0));
+        assert!(!program_length_is_plausible(MAX_PROGRAM + 1));
     }
 }

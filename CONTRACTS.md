@@ -42,8 +42,32 @@ server →  E {id} <code> <message>\n   on failure
 
 Sin prefijo de longitud ni negociación. Códigos: `1` trama mala,
 `2` comando desconocido, `3` servicio desconocido, `4` no aplicable,
-`5` reload fallido. Ruta `$ZINIT_SOCKET` o `/run/zinit/ctl`; verbos
-`status/list/start/stop/restart/kick/reload-all/version/help`.
+`5` reload fallido, `6` sin permiso. Ruta `$ZINIT_SOCKET` o
+`/run/zinit/ctl`; verbos
+`status/list/start/stop/restart/kick/reload-all/version/help` más los
+verbos de potencia (`poweroff/reboot/halt/suspend/hibernate`).
+
+**Credenciales del cliente** (añadido después de congelar el
+formato; el formato no cambió, la política sí). El servidor captura
+`SO_PEERCRED` al aceptar (`getpeereid` en BSD/macOS) y clasifica al
+cliente en tres clases de verbo:
+
+| clase | verbos | quién puede |
+|---|---|---|
+| lectura | `status list version help` | cualquiera que conecte |
+| gestión | `start stop restart kick reload-all` | root, o el mismo usuario que el supervisor |
+| potencia | `poweroff reboot halt suspend hibernate` | root, o el mismo usuario **usando `zctl`** |
+
+Un cliente al que no se le puede atribuir un binario (plataforma sin
+`/proc` o sin pid del peer) cae al caso del uid. El código `6` es
+nuevo: reutilizar `5` ("reload fallido") para un rechazo mentiría a
+los clientes que ya existían, y un código que el cliente no conoce
+igual lo puede imprimir.
+
+El socket es `0600`: el límite real es el modo del socket. Lo anterior
+es defensa en profundidad y un guard contra accidentes (un `echo`
+suelto al socket), no una frontera contra el código del propio
+usuario: ese puede copiar `zctl` y ser `zctl`.
 
 ## C5 — Entorno del lado del hijo (`zservice/spawn.rs`, `DESIGN.md` §6)
 

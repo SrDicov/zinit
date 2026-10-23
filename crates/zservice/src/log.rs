@@ -281,6 +281,11 @@ fn rotate(h: &mut LogHandle) -> io::Result<()> {
         // Reopen the live path even if the rotation half-finished; the error
         // still propagates so the supervisor can report it.
         if h.fd < 0 {
+            // equivalent (cargo-mutants): with `result.is_err()` the fd is
+            // still -1 here (`close` set it above; `h.fd` is only assigned
+            // once the reopen `open` already succeeded, i.e. `result` was
+            // `Ok`), so `<` and `<=` cannot differ;
+            // `rotation_failure_reopens_the_live_fd` pins that state.
             match open_append(&path) {
                 Ok(fd) => h.fd = fd,
                 Err(_) => return result,
@@ -343,6 +348,9 @@ fn open_append(path: &Path) -> io::Result<RawFd> {
     let fd = unsafe {
         libc::open(
             c.as_ptr(),
+            // equivalent (cargo-mutants): the flags are disjoint bitsets
+            // (see the `annotated_or_flags_are_disjoint_bitsets` test), so
+            // `|` cannot differ from `^` here.
             libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_CLOEXEC,
             0o644 as libc::c_uint,
         )
@@ -356,6 +364,9 @@ fn open_append(path: &Path) -> io::Result<RawFd> {
 /// Open `/dev/null` for writing.
 fn open_devnull() -> io::Result<RawFd> {
     // SAFETY: static literal, NUL-terminated by construction; the fd is fresh.
+    // equivalent (cargo-mutants): the flags are disjoint bitsets (see the
+    // `annotated_or_flags_are_disjoint_bitsets` test), so `|` cannot differ
+    // from `^` here.
     let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
@@ -385,7 +396,31 @@ fn write_all(fd: RawFd, mut buf: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    /// Runs `body` in a forked child. The runner's threads share one fd table,
+    /// so freeing fd 0 in the parent races every other test (and the runner's
+    /// stdin) — a mutex does not help, because unrelated tests keep opening
+    /// files and can steal the low slot. `body` must only touch paths computed
+    /// before the fork: it runs in a child of a multi-threaded process.
+    pub(crate) fn in_isolated_fd_table(body: impl FnOnce() -> bool) -> bool {
+        // SAFETY: plain fork; the child only opens/closes/dups stdio and _exits,
+        // and never allocates.
+        match unsafe { libc::fork() } {
+            -1 => panic!("fork: {}", io::Error::last_os_error()),
+            0 => {
+                let ok = body();
+                // SAFETY: leaving the child without running parent destructors.
+                unsafe { libc::_exit(if ok { 0 } else { 1 }) }
+            }
+            pid => {
+                let mut status = 0;
+                // SAFETY: waiting on the child pid we just created.
+                unsafe { libc::waitpid(pid, &mut status, 0) };
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+            }
+        }
+    }
+
     use super::*;
 
     fn tmpdir(name: &str) -> PathBuf {
@@ -492,6 +527,7 @@ mod tests {
         let dir = tmpdir("syslog-roundtrip");
         let path = dir.join("dev-log.sock");
         let listener = bind_dgram(&path);
+        bound_recv(listener);
         let mut h = open_syslog_at(&path).expect("daemon present");
         write_line(&mut h, b"hello").expect("write");
         h.close();
@@ -541,6 +577,34 @@ mod tests {
         fd
     }
 
+    /// The receive-side watchdog: a mutant that turns a write into `Ok(())`
+    /// without `write(2)` must make the datagram tests *fail* (~3 s later,
+    /// `EAGAIN` on the timed socket), not hang the whole test binary on a
+    /// silent blocking socket — a hung run is a `TIMEOUT`; a failed one is a
+    /// caught mutant.
+    fn bound_recv(fd: RawFd) {
+        let tv = libc::timeval {
+            tv_sec: 3,
+            tv_usec: 0,
+        };
+        // SAFETY: `fd` is an owned test socket; `SO_RCVTIMEO` reads exactly
+        // one `timeval` and retains nothing.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVTIMEO,
+                    &raw const tv as *const libc::c_void,
+                    core::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                )
+            },
+            0,
+            "setsockopt SO_RCVTIMEO: {}",
+            io::Error::last_os_error()
+        );
+    }
+
     #[test]
     fn long_lines_still_terminate() {
         let dir = tmpdir("long");
@@ -561,6 +625,427 @@ mod tests {
         assert_eq!(
             sibling(p, 1).as_os_str().as_bytes(),
             b"/var/log/zinit/sshd.log.1"
+        );
+    }
+
+    /// Logging to a fixed 4 KiB threshold (`4096`) differs by one byte from
+    /// "up to 4095 in one write, longer in two": both sides of the boundary
+    /// must land identically on disk, and the boundary line itself must not
+    /// overflow the stack buffer (`4096th byte is reserved for the newline`).
+    #[test]
+    fn boundary_line_sizes_round_trip() {
+        let dir = tmpdir("boundary");
+        let log = dir.join("svc.log");
+        let mut h = open_sink(&file_sink(&log, 1 << 20, 1)).expect("open");
+        let mid = vec![b'x'; 4095];
+        let edge = vec![b'y'; 4096];
+        write_line(&mut h, &mid).expect("4095-byte line");
+        write_line(&mut h, &edge).expect("4096-byte line");
+        h.close();
+        let content = std::fs::read(&log).expect("read");
+        assert_eq!(content.len(), 4095 + 1 + 4096 + 1);
+        assert_eq!(&content[..4095], mid.as_slice());
+        assert_eq!(content[4095], b'\n');
+        assert_eq!(&content[4096..4096 + 4096], edge.as_slice());
+        assert_eq!(content[4096 + 4096], b'\n');
+    }
+
+    /// The datagram path shares the same 4096 framing; the boundary line must
+    /// still go out complete (and must not index past the stack buffer).
+    ///
+    /// Linux only: Darwin's `net.local.dgram.maxdgram` defaults to 2048, so a
+    /// 4096-byte `send` fails with `EMSGSIZE` before any of this framing is
+    /// observable. The fallback then redials `/dev/log`, which is not what the
+    /// test bound, and the failure surfaces as a misleading `ENOENT`.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn datagram_carries_boundary_line() {
+        let dir = tmpdir("dgram-boundary");
+        let path = dir.join("dev-log.sock");
+        let listener = bind_dgram(&path);
+        bound_recv(listener);
+        let mut h = open_syslog_at(&path).expect("daemon present");
+        let edge = vec![b'z'; 4096];
+        write_line(&mut h, &edge).expect("boundary datagram");
+        h.close();
+        let mut buf = vec![0u8; 5000];
+        // SAFETY: `listener` is an owned bound datagram socket; recvfrom with
+        // null address arguments writes at most buf.len() and retains nothing.
+        let n = unsafe {
+            libc::recvfrom(
+                listener,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+                0,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(n as usize, 4096, "boundary line is its own datagram");
+        assert_eq!(&buf[..4096], edge.as_slice());
+        // SAFETY: same owned socket; the terminator follows as its own write.
+        let n = unsafe {
+            libc::recvfrom(
+                listener,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+                0,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(n, 1, "the newline datagram");
+        assert_eq!(buf[0], b'\n');
+        let _ = zrt::sys::close(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `close` is idempotent and handoff-safe: after it, the sink refuses
+    /// writes with `NotConnected` (not a leaked-EBADF from a raw write).
+    #[test]
+    fn closed_sink_refuses_writes_with_notconnected() {
+        let dir = tmpdir("closed");
+        let log = dir.join("svc.log");
+        let mut h = open_sink(&file_sink(&log, 1 << 20, 1)).expect("open");
+        write_line(&mut h, b"before").expect("write before close");
+        h.close();
+        h.close(); // double close is intentionally tolerated
+        let e = write_line(&mut h, b"after").expect_err("closed sink must refuse");
+        assert_eq!(e.kind(), io::ErrorKind::NotConnected, "{e}");
+        assert_eq!(std::fs::read(&log).expect("read"), b"before\n");
+    }
+
+    /// fd 0 is a live descriptor like any other: only a *negative* fd means
+    /// closed. (`fd <= 0` mutants would refuse fd 0 outright.)
+    #[test]
+    fn fd_zero_writes_normally() {
+        assert!(
+            in_isolated_fd_table(|| {
+                // SAFETY: fd 0 is this child's alone.
+                let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
+                if null < 0 || unsafe { libc::dup2(null, 0) } != 0 {
+                    return false;
+                }
+                unsafe { libc::close(null) };
+                // SAFETY: fd 0 now is /dev/null in this child.
+                let mut h = LogHandle {
+                    fd: 0,
+                    path: None,
+                    max_bytes: u64::MAX,
+                    backups: 0,
+                    datagram: false,
+                };
+                let ok = write_line(&mut h, b"into fd zero").is_ok();
+                h.close();
+                ok
+            }),
+            "writing through fd 0 must behave like any other descriptor"
+        );
+    }
+
+    /// A file already at exactly `max_bytes` must rotate on the next line:
+    /// "past max_bytes" means `size < max` keeps, `size == max` rotates.
+    #[test]
+    fn rotate_triggers_at_exact_max_bytes() {
+        let dir = tmpdir("exact-max");
+        let log = dir.join("svc.log");
+        std::fs::write(&log, b"0123456789").expect("seed file at exactly max");
+        let mut h = open_sink(&file_sink(&log, 10, 1)).expect("open");
+        write_line(&mut h, b"ab").expect("write past max");
+        h.close();
+        let gen1 = log.with_extension("log.1");
+        assert_eq!(
+            std::fs::read(&gen1).expect("generation 1"),
+            b"0123456789",
+            "the full previous file is the rotated generation"
+        );
+        assert_eq!(std::fs::read(&log).expect("live"), b"ab\n");
+    }
+
+    /// When rotation fails (unwritable directory) the handle must come back
+    /// usable through the recovery reopen — and never keep writing through a
+    /// dangling fd (e.g. borrowed stdout).
+    #[test]
+    fn rotation_failure_recovers_without_dangling_fd() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("rot-fail");
+        let log = dir.join("svc.log");
+        let mut h = open_sink(&file_sink(&log, 4, 1)).expect("open");
+        write_line(&mut h, b"aaaa").expect("first");
+        write_line(&mut h, b"bbbb").expect("second");
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555));
+        write_line(&mut h, b"cc").expect_err("rotation must fail on read-only dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
+        write_line(&mut h, b"dd").expect("recovery must have left a usable fd");
+        h.close();
+        assert_eq!(
+            std::fs::read(&log).expect("read"),
+            b"dd\n",
+            "nothing may go to a dangling fd; live log restarted at dd"
+        );
+        assert_eq!(
+            std::fs::read(log.with_extension("log.1")).expect("gen1"),
+            b"bbbb\n"
+        );
+    }
+
+    /// The failure path reopens the live file so the fd stays valid (nameable
+    /// through `fd()`): a skipped reopen leaves the killed `-1` handle.
+    #[test]
+    fn rotation_failure_reopens_the_live_fd() {
+        let dir = tmpdir("rot-reopen");
+        let log = dir.join("svc.log");
+        let mut h = open_sink(&file_sink(&log, 4, 1)).expect("open");
+        write_line(&mut h, b"aaaa").expect("fill");
+        // Target of the final rename is a directory: the rename fails, but
+        // the live path itself is still perfectly openable.
+        std::fs::create_dir(dir.join("svc.log.1")).expect("block .1");
+        write_line(&mut h, b"bb").expect_err("rename must fail");
+        assert_ne!(
+            h.fd(),
+            -1,
+            "recovery must reopen the live path, keeping the fd valid"
+        );
+        h.close();
+        let _ = std::fs::remove_dir(dir.join("svc.log.1"));
+    }
+
+    /// Three backups shift oldest→newest in order: `.3` is the oldest line's
+    /// generation, `.1` the newest, the live file the current one.
+    #[test]
+    fn shift_generations_keeps_history_in_order() {
+        let dir = tmpdir("shift-table");
+        let log = dir.join("svc.log");
+        let mut h = open_sink(&file_sink(&log, 8, 3)).expect("open");
+        for name in ["first!!", "second!", "third!!", "fourth!"] {
+            write_line(&mut h, name.as_bytes()).expect(name);
+        }
+        h.close();
+        assert_eq!(
+            std::fs::read(log.with_extension("log.1")).expect("gen1"),
+            b"third!!\n"
+        );
+        assert_eq!(
+            std::fs::read(log.with_extension("log.2")).expect("gen2"),
+            b"second!\n"
+        );
+        assert_eq!(
+            std::fs::read(log.with_extension("log.3")).expect("gen3"),
+            b"first!!\n"
+        );
+        assert_eq!(std::fs::read(&log).expect("live"), b"fourth!\n");
+    }
+
+    /// `.0` is not a generation: shifting may never touch a pre-existing
+    /// `path + ".0"` file. (Indexes start at 1; a mandate from `log.0` data
+    /// would clobber unrelated state.)
+    #[test]
+    fn generation_zero_is_never_touched() {
+        let dir = tmpdir("gen-zero");
+        let log = dir.join("svc.log");
+        let zero = log.with_extension("log.0");
+        std::fs::write(&zero, b"unrelated").expect("seed .0");
+        let mut h = open_sink(&file_sink(&log, 8, 3)).expect("open");
+        for _ in 0..3 {
+            write_line(&mut h, b"abcdefg").expect("write");
+        }
+        h.close();
+        assert_eq!(
+            std::fs::read(&zero).expect(".0 must survive every rotation"),
+            b"unrelated"
+        );
+    }
+
+    /// Opening a directory is a hard error (EISDIR), not a success with a
+    /// dead fd (`fd <= 0` mutants report failure; `==` lets `-1` through).
+    #[test]
+    fn open_append_refuses_a_directory() {
+        let dir = tmpdir("open-dir");
+        let e = open_append(&dir).expect_err("cannot open(2) a directory");
+        assert_ne!(e.kind(), io::ErrorKind::Other, "real errno, {e}");
+    }
+
+    /// open(2) can legitimately return fd 0 (after the runner frees it);
+    /// that is a success, not `fd > 0` territory. Restores fd 0 on exit.
+    #[test]
+    fn open_append_accepts_fd_zero() {
+        let path = tmpdir("fd0-open").join("fresh.log");
+        assert!(
+            in_isolated_fd_table(|| {
+                // SAFETY: fd 0 is this child's alone.
+                unsafe { libc::close(0) };
+                let Ok(fd) = open_append(&path) else {
+                    return false;
+                };
+                fd == 0
+                    && write_all(fd, b"hi").is_ok()
+                    && std::fs::read(&path).is_ok_and(|b| b == b"hi")
+            }),
+            "a fresh file must claim the freed low fd 0"
+        );
+    }
+
+    /// Reopening an existing log must succeed, and two open handles must
+    /// interleave at the end (O_APPEND), never clobber from offset 0 — a
+    /// bit-mangled flags expression loses exactly that guarantee.
+    #[test]
+    fn reopened_and_parallel_handles_append() {
+        let dir = tmpdir("append-reopen");
+        let log = dir.join("svc.log");
+        let mut h1 = open_sink(&file_sink(&log, 1 << 20, 1)).expect("first");
+        write_line(&mut h1, b"aaaaaaaaaaaa").expect("write h1");
+        h1.close();
+        let mut h2 = open_sink(&file_sink(&log, 1 << 20, 1)).expect("reopen");
+        write_line(&mut h2, b"bbbbbbbbbbbb").expect("write h2");
+        h2.close();
+        let content = std::fs::read(&log).expect("read");
+        assert!(
+            content.starts_with(b"aaaaaaaaaaaa\n"),
+            "a second handle must append, not clobber offset 0: {content:?}"
+        );
+        assert!(content.ends_with(b"bbbbbbbbbbbb\n"));
+    }
+
+    /// The `|`s in `open_append` and `open_devnull` annotated
+    /// `// equivalent (cargo-mutants)` pair flags that are disjoint
+    /// bitsets, and only disjoint bitsets make `a | b` identical to
+    /// `a ^ b` for every input. These asserts are the machine check behind
+    /// those annotations: shrink one pair and this test fails exactly when
+    /// a claimed equivalence stops holding.
+    #[test]
+    fn annotated_or_flags_are_disjoint_bitsets() {
+        assert_eq!(libc::O_WRONLY & libc::O_CREAT, 0, "open_append: 1/2");
+        assert_eq!(libc::O_WRONLY & libc::O_APPEND, 0, "open_append: 1/3");
+        assert_eq!(libc::O_WRONLY & libc::O_CLOEXEC, 0, "open_append: 1/4");
+        assert_eq!(libc::O_CREAT & libc::O_APPEND, 0, "open_append: 2/3");
+        assert_eq!(libc::O_CREAT & libc::O_CLOEXEC, 0, "open_append: 2/4");
+        assert_eq!(libc::O_APPEND & libc::O_CLOEXEC, 0, "open_append: 3/4");
+    }
+
+    /// `Drop` runs `close`: a handle leaving scope must not leak the sink
+    /// descriptor into the table — `<impl Drop for LogHandle>::drop with ()`
+    /// would quietly burn an fd per service teardown.
+    #[test]
+    fn drop_closes_the_file_descriptor() {
+        let h = open_sink(&zcore::LogSink::None).expect("open");
+        let fd = h.fd();
+        drop(h);
+        // SAFETY: `F_GETFD` only observes one descriptor and retains nothing.
+        let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_eq!(
+            rc,
+            -1,
+            "dropping the handle must close its fd: {}",
+            io::Error::last_os_error()
+        );
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    }
+
+    /// A directory blocking a generation makes the shift's rename fail with
+    /// `EISDIR` — a *real* error, not a missing-generation `ENOENT`: the
+    /// guard must swallow only `ENOENT`. Its `true`-mutant swallows the
+    /// `EISDIR`, finishes the rotation anyway, and rewrites the history the
+    /// blocker was protecting.
+    #[test]
+    fn shift_reports_real_rename_errors_not_just_enoent() {
+        let dir = tmpdir("shift-eisdir");
+        let log = dir.join("svc.log");
+        std::fs::create_dir(log.with_extension("log.2")).expect("block .2");
+        let mut h = open_sink(&file_sink(&log, 4, 2)).expect("open");
+        write_line(&mut h, b"aaaa").expect("fill to 5 bytes (no rotate yet)");
+        write_line(&mut h, b"bbbb").expect("rotate 1: .1 := aaaa, live := bbbb");
+        write_line(&mut h, b"cc").expect_err("rename .1 -> .2 onto a directory is EISDIR");
+        h.close();
+        assert_eq!(
+            std::fs::read(&log).expect("live"),
+            b"bbbb\n",
+            "a failed shift must not move or truncate the live file"
+        );
+        assert_eq!(
+            std::fs::read(log.with_extension("log.1")).expect("gen1"),
+            b"aaaa\n",
+            "the blocked rename must abort the whole shift"
+        );
+    }
+
+    /// The live file may vanish between `fstat` (on the still-open fd) and
+    /// the final rename — an external `unlink(2)` in between is legal. The
+    /// final-rename `ENOENT` is recovery, not failure: the fresh reopen
+    /// recreates the path and the line lands. A `false`-mutant turns that
+    /// `ENOENT` into `Err`, keeping the service dark for a vanished file.
+    #[test]
+    fn rotate_survives_a_vanished_live_file() {
+        let dir = tmpdir("shift-gone");
+        let log = dir.join("svc.log");
+        let mut h = open_sink(&file_sink(&log, 4, 1)).expect("open");
+        write_line(&mut h, b"aaaa").expect("fill to 5 bytes");
+        std::fs::remove_file(&log).expect("unlink between fstat and rename");
+        write_line(&mut h, b"bbbb").expect("rotation must recover over a vanished live file");
+        h.close();
+        assert_eq!(
+            std::fs::read(&log).expect("recreated live file"),
+            b"bbbb\n",
+            "the fresh open(2) recreates the name and takes the line"
+        );
+        assert!(
+            !log.with_extension("log.1").exists(),
+            "nothing was available to rotate"
+        );
+    }
+
+    /// `open(2)` can legitimately hand back fd 0 for `/dev/null` too;
+    /// `fd < 0` mutants that read `<= 0` refuse the descriptor (and answer
+    /// with a stale errno, worse than the truth). Mirrors
+    /// `open_append_accepts_fd_zero`.
+    #[test]
+    fn open_devnull_accepts_fd_zero() {
+        assert!(
+            in_isolated_fd_table(|| {
+                // SAFETY: fd 0 is this child's alone.
+                unsafe { libc::close(0) };
+                open_sink(&zcore::LogSink::None).is_ok_and(|h| h.fd() == 0)
+            }),
+            "/dev/null must keep the freed low fd 0"
+        );
+    }
+
+    /// One rotation must terminate in microseconds. The sentinel waits 5 s
+    /// and then aborts the whole binary.
+    ///
+    /// WHY THIS IS THE FIRST (alphabetically ordered) TEST: the mutants
+    /// that make the generation-shift loop spin (`i -= 1` given `i /= 1`)
+    /// hang the *first* rotation with `backups > 1` — whatever test it is —
+    /// so the crash must be armed before any rotate runs, and only this
+    /// test sorts early enough. Without it those mutants burn the mutator's
+    /// full 60 s budget every run instead of failing.
+    #[test]
+    fn a_rotation_terminates_before_the_suite_spins() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let done: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let guard = std::thread::spawn(move || {
+            for _ in 0..50 {
+                if done.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            // crashes the whole test binary: that is the point — a hung
+            // mutant must fail fast, and the sentinel only fires on a hang.
+            std::process::abort()
+        });
+        let dir = tmpdir("shift-term");
+        let log = dir.join("svc.log");
+        std::fs::write(&log, b"0123456789").expect("seed at exactly max");
+        let mut h = open_sink(&file_sink(&log, 10, 2)).expect("open");
+        write_line(&mut h, b"ab").expect("one rotation must terminate");
+        h.close();
+        done.store(true, Ordering::Relaxed);
+        guard.join().expect("sentinel finishes");
+        assert_eq!(std::fs::read(&log).expect("live"), b"ab\n");
+        assert_eq!(
+            std::fs::read(log.with_extension("log.1")).expect("gen1"),
+            b"0123456789"
         );
     }
 }

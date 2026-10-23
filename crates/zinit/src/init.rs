@@ -3,7 +3,9 @@
 //! Four jobs, no more (`DESIGN.md` §3):
 //!
 //! 1. Block every signal, so nothing can interrupt a `fork` or be lost.
-//! 2. Mount the minimum: `/proc`, `/sys`, `/run`.
+//! 2. Mount the minimum: `/proc`, `/sys`, `/run`, and the cgroup2
+//!    hierarchy (without it every `cgroup =` service fails obscurely,
+//!    and nothing else mounts it on a systemd-less boot).
 //! 3. Fork+exec the supervisor, `zinit --sup`.
 //! 4. Reap, unconditionally, forever.
 //!
@@ -15,6 +17,7 @@
 use std::ffi::{CStr, CString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 use zrt::report::announce_degradation;
 
@@ -33,7 +36,7 @@ const IDLE_MS: u64 = 50;
 ///
 /// `main` calls this and nothing else. The `!` is load-bearing: a PID 1 that
 /// returned would take the machine's only init down with it.
-pub fn run() -> ! {
+pub fn run(config: Option<&Path>) -> ! {
     // ── 1. Signals ──────────────────────────────────────────────────────
     //
     // A child that exits between the kernel's decision to notify and the
@@ -47,11 +50,17 @@ pub fn run() -> ! {
             "could not block signals ({e}); continuing unblocked"
         ));
     }
-    // ponytail: power signals (firmware `SIGTERM`) are queued and ignored, not
-    // forwarded. Forwarding them means delivering to the supervisor's control
-    // socket, which does not exist until a later phase; until then, being
-    // unreachable to shutdown is a smaller failure than an init that
-    // half-handles them.
+    // The power signals are the exception: `SIGTERM` and `SIGINT` to PID 1
+    // mean "shut the machine down", which is what the kernel's Ctrl-Alt-Del
+    // turns into and what an operator at the console expects from
+    // `kill -TERM 1`. The handler only sets a flag (signal context allows
+    // nothing else); the loop below does the work.
+    if let Err(e) = zrt::signals::install_power_handler() {
+        announce_degradation(&format!(
+            "cannot install the power-signal handler ({e}); the machine will not shut \
+             down from a signal"
+        ));
+    }
 
     // ── 2. The minimum ──────────────────────────────────────────────────
     //
@@ -65,6 +74,10 @@ pub fn run() -> ! {
     // allocates nothing.
     let exe = self_path();
     let mut sup: Option<i32> = None;
+    // Set when another supervisor owns the control socket: this process is
+    // then a bare reaper, which is exactly what a machine whose supervisor
+    // lives elsewhere needs.
+    let mut other_supervisor = false;
     // Two "say each distinct failure once" gates. An init that repeats the
     // same line twenty times a second turns stderr into the bottleneck and
     // buries the boot that actually needed reading.
@@ -76,17 +89,29 @@ pub fn run() -> ! {
         // here (fork failed, supervisor died) are both transient or fixed by
         // the next tick, and neither is a reason to stop reaping.
         if let (None, Some(exe)) = (sup, exe.as_deref()) {
-            match spawn_supervisor(exe) {
-                Ok(pid) => sup = Some(pid),
-                Err(e) => announce_once(
-                    &mut last_errno,
-                    e.raw_os_error().unwrap_or(libc::EINVAL),
-                    format!("fork failed ({e}); no supervisor running"),
-                ),
+            // The socket belongs to somebody else: spawning another
+            // supervisor would only make them fight for it. The loop
+            // still falls through to the reaper below — an init that stops
+            // reaping is worse than one that supervises nothing.
+            if !other_supervisor {
+                match spawn_supervisor(exe, config) {
+                    Ok(pid) => sup = Some(pid),
+                    Err(e) => announce_once(
+                        &mut last_errno,
+                        e.raw_os_error().unwrap_or(libc::EINVAL),
+                        format!("fork failed ({e}); no supervisor running"),
+                    ),
+                }
             }
         }
 
-        match (sup, zrt::sys::waitpid_blocking(-1)) {
+        // A power signal, if one arrived, is acted on before the wait: the
+        // machine must not sit in `waitpid` waiting for a child to die.
+        if let Some(sig) = zrt::signals::power_signalled() {
+            request_verb(verb_for(sig));
+        }
+
+        match (sup, zrt::sys::waitpid_interruptible(-1)) {
             // The supervisor died. Say how, then let the top of the loop
             // relaunch it at once: the wait above already slept until the
             // death, so there is no tick to wait out. Never fatal: a machine
@@ -94,17 +119,39 @@ pub fn run() -> ! {
             // exited is halted.
             (Some(pid), Ok(w)) if w.pid == pid => {
                 let code = w.status.code();
-                announce_once(
-                    &mut last_exit,
-                    code,
-                    format!("supervisor (pid {pid}) exited with {code}; relaunching"),
-                );
-                sup = None;
+                if code == crate::sup::OTHER_SUPERVISOR_EXIT {
+                    // Another supervisor owns the control socket: the
+                    // machine is governed, and a second one fighting for
+                    // the socket would be worse than none. Announce it once
+                    // and stop relaunching.
+                    announce_once(
+                        &mut last_exit,
+                        code,
+                        format!(
+                            "another supervisor already owns the control socket \
+                             (pid {pid} stepped aside); not relaunching"
+                        ),
+                    );
+                    sup = None;
+                    // Keep reaping, but do not spawn another supervisor.
+                    // The flag below says "there is a supervisor, not mine".
+                    other_supervisor = true;
+                } else {
+                    announce_once(
+                        &mut last_exit,
+                        code,
+                        format!("supervisor (pid {pid}) exited with {code}; relaunching"),
+                    );
+                    sup = None;
+                }
             }
             // Any other child of ours — an orphan the kernel re-parented to
             // PID 1 when its parent died. It means nothing here beyond the
             // obligation to reap it, which is why this arm does nothing.
             (_, Ok(_)) => {}
+            // Interrupted by a signal: the loop's turn again, and the
+            // power check at the top of it sees the flag. Not a failure.
+            (_, Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
             // No children at all (`ECHILD`): bare reaper, or every fork
             // failing. Sleep instead of spinning; the top of the loop
             // retries the spawn past transient fork failures.
@@ -162,6 +209,10 @@ fn mount_minimum() {
         ("proc", "/proc", None),
         ("sysfs", "/sys", None),
         ("tmpfs", "/run", Some("mode=0755")),
+        // No systemd means no cgroup2 mount, and without one every
+        // `cgroup =` spawn dies with a bare ENOENT deep in the child
+        // path. The source word is ignored for cgroup2; the type is not.
+        ("cgroup2", "/sys/fs/cgroup", None),
     ];
     for (fstype, target, data) in TABLE.iter().copied() {
         match zrt::sys::mount(
@@ -177,6 +228,30 @@ fn mount_minimum() {
             // for a question the kernel has already answered with an errno.
             Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
             Err(e) => announce_degradation(&format!("cannot mount {target} ({e}); continuing")),
+        }
+    }
+
+    // `/dev` needs the kernel's device nodes. Without them there is no
+    // `/dev/null`, no `/dev/console` and no `/dev/tty1`, so every console
+    // service dies at `open` and the machine has no terminal at all.
+    //
+    // Mounted only when nothing else provided them: an initramfs `/dev`
+    // usually carries extra directories (`/dev/pts`, `/dev/shm`,
+    // `/dev/mqueue`) that a fresh devtmpfs would hide, and hiding them is
+    // worse than the missing nodes.
+    if !Path::new("/dev/null").exists() {
+        match zrt::sys::mount(
+            Some(Path::new("devtmpfs")),
+            Path::new("/dev"),
+            Some("devtmpfs"),
+            flags,
+            None,
+        ) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+            Err(e) => {
+                announce_degradation(&format!("cannot mount devtmpfs on /dev ({e}); continuing"))
+            }
         }
     }
 }
@@ -215,13 +290,94 @@ fn self_path() -> Option<CString> {
     }
 }
 
+/// Ask the supervisor to power the machine off.
+///
+/// The power lives in the supervisor: it is the one that stops every service,
+/// writes the breadcrumb and makes the syscall. PID 1 only *asks*, through
+/// the same control socket an operator uses, so there is exactly one power
+/// path in the machine.
+///
+/// The socket may not be there yet — the supervisor binds it a moment after
+/// it starts — so the request is retried for a while before it is given up
+/// on. Giving up is loud: a machine that was told to power off and did not
+/// is a machine whose operator is waiting for a screen that never goes dark.
+fn request_verb(verb: &'static str) {
+    use std::path::PathBuf;
+    let path = std::env::var_os(crate::ctl::SOCKET_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(crate::ctl::DEFAULT_SOCKET_PATH));
+    request_verb_at(&path, verb);
+}
+
+/// The verb a power signal asks for.
+///
+/// `Ctrl-Alt-Del` reaches PID 1 as `SIGINT`, and the kernel's contract for it
+/// is a **reboot** — that is the whole point of the key combination. An
+/// operator running `kill -TERM 1` is asking for the machine to go down.
+/// Getting this backwards powers a desktop off when the user asked it to
+/// restart.
+fn verb_for(sig: zrt::signals::Signal) -> &'static str {
+    match sig {
+        zrt::signals::Signal::Int => "reboot",
+        _ => "poweroff",
+    }
+}
+
+/// Ask the supervisor at `path` to act on `verb`.
+///
+/// The path is a parameter so the test can point it at a fake server
+/// instead of the real one: the socket path comes from the environment, and
+/// a test that changes the environment changes it for the whole process.
+fn request_verb_at(path: &std::path::Path, verb: &'static str) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    // Ten tries, 200 ms apart: two seconds is plenty for a supervisor that
+    // is starting, and short enough that the operator is not left waiting.
+    for attempt in 0..10 {
+        match UnixStream::connect(path) {
+            Ok(mut stream) => {
+                let frame = format!("C 1 {verb}\n");
+                if stream.write_all(frame.as_bytes()).is_err() {
+                    announce_degradation("power signal: cannot write to the control socket");
+                    return;
+                }
+                let mut reply = String::new();
+                let _ = BufReader::new(&stream).read_line(&mut reply);
+                announce_degradation(&format!(
+                    "power signal: the supervisor answered {:?}",
+                    reply.trim()
+                ));
+                return;
+            }
+            Err(e) => {
+                if attempt == 9 {
+                    announce_degradation(&format!(
+                        "power signal: no control socket at {} ({e}); the machine stays up. \
+                         Use `zctl poweroff` once the supervisor is up.",
+                        path.display()
+                    ));
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+}
+
 /// Fork and exec `zinit --sup`. The child's pid, or the fork's error.
 ///
 /// Everything the child touches is built here, in the parent: the binary path
 /// and the whole `argv` array. Past `fork` the child runs one syscall and one
 /// exit, which is the entire mitigation `DESIGN.md` §9.1 asks for.
-fn spawn_supervisor(exe: &CStr) -> io::Result<i32> {
-    let argv = zrt::sys::exec_argv(&[exe, c"--sup"]);
+fn spawn_supervisor(exe: &CStr, config: Option<&Path>) -> io::Result<i32> {
+    // The supervisor's own argument: an explicit directory is the whole
+    // configuration, exactly like `zinit --sup <dir>`. Without it the
+    // default layers decide.
+    let dir = config.and_then(|p| CString::new(p.as_os_str().as_bytes()).ok());
+    let argv = match dir.as_ref() {
+        Some(d) => zrt::sys::exec_argv(&[exe, c"--sup", d.as_c_str()]),
+        None => zrt::sys::exec_argv(&[exe, c"--sup"]),
+    };
     match zrt::sys::fork() {
         // `execvp_or_exit` is the sanctioned single-exit child path: it execs
         // and, on any failure, `_exit(127)`. An absolute `file` means `execvp`
@@ -238,6 +394,60 @@ mod tests {
     /// The only part of an init that can be tested without becoming one:
     /// `current_exe` must resolve and survive the `CString` conversion,
     /// because every supervisor relaunch goes through it.
+    /// The power signal becomes a power verb on the control socket.
+    ///
+    /// PID 1 does not power the machine off itself: the supervisor owns
+    /// that path (stop every service, breadcrumb, sync, syscall), and one
+    /// path is easier to reason about than two. The test is a fake server
+    /// that reads the frame the init sends, for both verbs.
+    #[test]
+    fn a_power_signal_becomes_a_power_verb() {
+        /// Send one verb to a fake socket and return the frame it received.
+        fn round(verb: &'static str) -> String {
+            use std::io::{BufRead, BufReader};
+            use std::os::unix::net::UnixListener;
+            let dir =
+                std::env::temp_dir().join(format!("zinit-powertest-{}-{verb}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("scratch");
+            let path = dir.join("ctl");
+            let _ = std::fs::remove_file(&path);
+            let listener = UnixListener::bind(&path).expect("bind the fake socket");
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(stream);
+                let mut frame = String::new();
+                reader.read_line(&mut frame).expect("read the frame");
+                frame
+            });
+            super::request_verb_at(&path, verb);
+            let frame = server.join().expect("the server thread finished");
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir_all(&dir);
+            frame
+        }
+
+        assert_eq!(
+            round("poweroff"),
+            "C 1 poweroff\n",
+            "the power signal did not become a poweroff"
+        );
+        assert_eq!(
+            round("reboot"),
+            "C 1 reboot\n",
+            "the power signal did not become a reboot"
+        );
+    }
+
+    /// Ctrl-Alt-Del asks for a reboot; `SIGTERM` asks for the machine to go
+    /// down. Backwards, a desktop powers off when the user asked it to
+    /// restart.
+    #[test]
+    fn the_signal_names_the_verb() {
+        use zrt::signals::Signal;
+        assert_eq!(super::verb_for(Signal::Int), "reboot");
+        assert_eq!(super::verb_for(Signal::Term), "poweroff");
+    }
+
     #[test]
     fn own_binary_path_is_resolvable() {
         assert!(

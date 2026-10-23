@@ -62,7 +62,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use zcore::{Budget, ListenAddr, Restart, SeccompAction, ServiceKind};
+use zcore::{Budget, ListenAddr, OnFatal, Restart, SeccompAction, ServiceKind};
 
 use crate::parser::Directive;
 use crate::value::{LogSpec, ReadySpec, ReadySpecKind, RestartSpec, RunAs};
@@ -287,8 +287,9 @@ pub fn validate_service_name(name: &str) -> Result<(), NameError> {
 ///
 /// # The dependency lists
 ///
-/// [`depends_required`](Self::depends_required) and
-/// [`depends_optional`](Self::depends_optional) are two `Vec<String>` and not a
+/// [`depends_required`](Self::depends_required),
+/// [`depends_optional`](Self::depends_optional), and
+/// [`depends_after`](Self::depends_after) are three `Vec<String>` and not a
 /// struct with two fields in it. The struct version reads better and is one
 /// more type that can disagree with itself about what "empty" means; the two
 /// vectors are what `zcore::ServicePlan` has, what `graph.rs` walks, and what a
@@ -308,12 +309,20 @@ pub struct ServiceDesc {
     /// Names that are waited for opportunistically. A missing one is a warning
     /// in `graph.rs`, not an error.
     pub depends_optional: Vec<String>,
+    /// Names that must have been *attempted* before this service may start.
+    /// Order without gating: a missing, failed, or disabled one releases the
+    /// waiter (warned in `graph.rs`, never fatal). This is dinit's
+    /// `after`/`waits-for`/`before` semantics; `depends_optional` stays the
+    /// edge that neither orders nor blocks (wants/).
+    pub depends_after: Vec<String>,
     /// Restart policy, its budget and its delay.
     ///
     /// One field, not three: DESIGN.md §4.3 keeps the budget as a pair
     /// precisely so the two numbers cannot drift apart, and splitting the delay
     /// out into a `ServiceDesc` field would put it back in a place where it can.
     pub restart: RestartSpec,
+    /// What a terminal failure of this service means for the machine.
+    pub on_fatal: OnFatal,
     /// Readiness strategy.
     pub ready: ReadySpec,
     /// How long to wait for a clean stop before `SIGKILL`.
@@ -440,7 +449,9 @@ impl Default for ServiceDesc {
             command: String::new(),
             depends_required: Vec::new(),
             depends_optional: Vec::new(),
+            depends_after: Vec::new(),
             restart: RestartSpec::default(),
+            on_fatal: OnFatal::Warn,
             ready: ReadySpec {
                 kind: ReadySpecKind::Notify,
                 arg: String::new(),
@@ -552,6 +563,9 @@ impl ServiceDesc {
         if over.is_explicit(Directive::Restart) {
             self.restart.policy = over.restart.policy;
         }
+        if over.is_explicit(Directive::OnFatal) {
+            self.on_fatal = over.on_fatal;
+        }
         if over.is_explicit(Directive::RestartBudget) {
             self.restart.budget.capacity = over.restart.budget.capacity;
             self.restart.budget.window_ms = over.restart.budget.window_ms;
@@ -638,6 +652,11 @@ impl ServiceDesc {
                     self.depends_optional.push(name.clone());
                 }
             }
+            for name in &over.depends_after {
+                if !self.depends_after.iter().any(|n| n == name) {
+                    self.depends_after.push(name.clone());
+                }
+            }
         }
         for (k, v) in &over.env {
             match self.env.iter_mut().rev().find(|(ek, _)| ek == k) {
@@ -685,10 +704,11 @@ impl ServiceDesc {
         self.restart.policy
     }
 
-    /// Whether `name` is declared at all, in either list.
+    /// Whether `name` is declared at all, in any list.
     pub fn depends_on(&self, name: &str) -> bool {
         self.depends_required.iter().any(|n| n == name)
             || self.depends_optional.iter().any(|n| n == name)
+            || self.depends_after.iter().any(|n| n == name)
     }
 
     /// Whether `name` is declared as a *required* edge.
@@ -696,9 +716,9 @@ impl ServiceDesc {
         self.depends_required.iter().any(|n| n == name)
     }
 
-    /// Total number of edges, required plus optional.
+    /// Total number of edges, required plus optional plus order-only.
     pub fn depends_len(&self) -> usize {
-        self.depends_required.len() + self.depends_optional.len()
+        self.depends_required.len() + self.depends_optional.len() + self.depends_after.len()
     }
 
     /// Look up an environment entry by key.

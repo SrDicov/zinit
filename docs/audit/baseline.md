@@ -1,0 +1,121 @@
+# Línea base — 2026-10-22
+
+Números medidos, no estimados. La fuente es el árbol de trabajo de este
+commit (`3ec683b`); el binario es el `release` local con el perfil del
+workspace (`panic=abort`, `lto`, `codegen-units=1`, `opt-level="s"`,
+`strip`).
+
+## Líneas de código
+
+| crate | src | tests | total | qué es |
+|---|---:|---:|---:|---|
+| `zcore` | 3 491 | 714 | 4 205 | núcleo puro: `no_std`, `forbid(unsafe_code)`, 0 deps |
+| `zconfig` | 11 701 | 0 | 11 701 | parser + grafo + plan (`&str -> Plan`) |
+| `zrt` | 7 340 | 0 | 7 340 | la única capa de syscalls (solo `libc`) |
+| `zservice` | 5 813 | 0 | 5 813 | spawn, readiness, logs, sandbox |
+| `zinit` | 4 712 | 1 702 | 6 414 | el binario: `--init`, `--sup`, `check` |
+| `zctl` | 216 | 0 | 216 | el cliente de control |
+| **total** | **33 273** | **2 416** | **35 689** | |
+
+## Tests
+
+| crate | `#[test]` |
+|---|---:|
+| `zcore` | 66 (incluye 10 de propiedades) |
+| `zconfig` | 304 |
+| `zrt` | 54 |
+| `zservice` | 79 |
+| `zinit` | 52 |
+| `zctl` | 4 |
+| **total** | **559** |
+
+Además: `crates/zcore/tests/properties.rs` (propiedades del núcleo),
+`crates/zinit/tests/{control_socket,supervises_real_service,import_runsv}.rs`
+(integración con procesos reales), `fuzz/fuzz_targets/parse_service.rs`
+(libFuzzer sobre el parser).
+
+## Binario
+
+| artefacto | bytes | perfil |
+|---|---:|---|
+| `zinit` (release local) | 685 256 | glibc, `strip` |
+| `zctl` (release local) | 294 448 | glibc, `strip` |
+| `zinit` (artefacto musl de CI) | 774 832 | musl estático, `strip` |
+
+El presupuesto de CI es 1 MiB para el `zinit` estático: 774 832 B deja
+un margen de 20 %. El `zctl` no está en el presupuesto (es un shim de
+216 líneas).
+
+## Dependencias
+
+`cargo tree -p zinit` → los crates del workspace + `libc`. Nada más. El
+job `purity` de CI falla el build si aparece una tercera parte.
+
+## Matriz de CI
+
+| workflow | qué cubre |
+|---|---|
+| `ci` | glibc/musl × x86_64/i686/aarch64 + macOS, clippy `-D warnings`, `fmt`, purity, licence, size budget, msrv 1.85, docs, nightly, miri (`zcore` sólo) |
+| `property-tests` | las propiedades del núcleo en release |
+| `fuzz` | `no_panic` del parser + libFuzzer 10 min |
+| `alpine-e2e` | musl real: busybox, `setsid` EPERM, reactor |
+| `distro` | void (glibc+musl), alpine, arch, eweos, gentoo, chimera |
+| `release` | matriz + `zigbuild` (riscv64 musl) + publicación |
+
+## Tiempos medidos (4 núcleos, local)
+
+| paso | tiempo |
+|---|---:|
+| `cargo build --workspace --release` (incremental) | 13 s |
+| `cargo test --workspace --release` | 61 s |
+| `cargo clippy --workspace --all-targets` | 4 s |
+
+El veredicto de build/test/lint es de GitHub Actions; estos números son
+solo para saber cuánto tarda un ciclo local.
+
+## Escala: 500 servicios (medido el 2026-10-22)
+
+Plan de 500 `process` idénticos (`/bin/sleep 120`, `restart = never`),
+supervisor local, `target/release/zinit`:
+
+| medida | valor |
+|---|---:|
+| convergencia (todos `running`) | **622 ms** |
+| `VmRSS` del supervisor | **4,0 MB** |
+| `VmPeak` | 5,3 MB |
+| descriptores abiertos | **1008** (≈2 por servicio) |
+| hilos | **1** |
+| hijos directos | 500 |
+| zombis | **0** |
+| ficheros de estado | 500 |
+
+Lectura: el coste por servicio es de ~8 KB de RSS y dos descriptores, así
+que el techo real es `RLIMIT_NOFILE / 2` (~500 servicios con un límite
+duro de 1024; el supervisor sube el blando al duro al arrancar). Por
+encima de eso hace falta un ayudante que abra descriptores por el
+supervisor, que es exactamente el peso que este proyecto no quiere: se
+documenta el techo en vez de construirlo.
+
+## Soak-proxy local (2026-10-22, mientras la caja está apagada)
+
+El soak de 24 h necesita la máquina real, así que se midió lo que un soak
+detecta (fugas) en corto: 90 servicios `process` + un `reload-all` y un
+`stop`/`start` cada 20 s durante 5 minutos, muestreando el supervisor.
+
+| t | RSS | fds | zombis | hijos |
+|---|---:|---:|---:|---:|
+| 20 s | 3144 kB | 188 | 0 | 90 |
+| 100 s | 3148 kB | 188 | 0 | 90 |
+| 180 s | 3312 kB | 188 | 0 | 90 |
+| 280 s | 3444 kB | 188 | 0 | 90 |
+
+RSS oscila entre 3,1 y 3,4 MB sin pendiente, descriptores constantes,
+cero zombis y los 90 hijos intactos: 16 recargas del plan no filtran ni
+un descriptor ni dejan un proceso sin recoger. **No es un soak de 24 h**,
+es la evidencia de que las dos fugas que un soak busca (memoria y
+descriptores) no aparecen en el ciclo de recarga.
+
+Efecto secundario encontrado y arreglado: 16 recargas escribían **2896
+líneas** de log, porque cada carga repetía todos los avisos del plan
+(`W003` y su ayuda, una vez por servicio y por recarga). Ahora se anuncian
+una vez por proceso (`ebb4af9`).

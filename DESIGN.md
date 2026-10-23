@@ -431,7 +431,7 @@ no está en el init, está en **cinco syscalls** que no existen igual en todas p
 | Seguimiento de hijos | `pidfd_open` (5.3+) | `kqueue` `EVFILT_PROC`/`NOTE_EXIT` | idem; fallback `waitpid(WNOHANG)` + `SIGCHLD` |
 | Señalas como fds | `signalfd` | `kqueue` `EVFILT_SIGNAL` | **Las señales entran por el mismo reactor que todo lo demás.** Fallback: self-pipe |
 | uid/gid | `setresuid`/`setresgid` | **no existen** | Detección en runtime: si hay `setresuid`, usarlo; si no, `setuid`+verificación explícita de `getuid()==geteuid()` |
-| No-new-privs | `prctl(PR_SET_NO_NEW_PRIVS)` | — | Linux; no-op + aviso en BSD |
+| No-new-privs | `prctl(PR_SET_NO_NEW_PRIVS)` | — | Linux, solo tras drop de uid; no-op + aviso en BSD |
 | ASLR off por servicio | `personality(ADDR_NO_RANDOMIZE)` | — | Linux; no-op + aviso |
 | Capabilities | `libcap` (CGO) | — | Linux; en BSD el modelo es uid/gid, sin fallo |
 | cgroups | v2 (unificada), v1 (legacy) | jails (v2) | Linux: v2 con fallback v1. BSD: no-op + aviso |
@@ -498,7 +498,7 @@ cgroup.create("zinit.slice/nombre")        → es el ÚLTIMO paso con privilegio
 place(child_pid)                           
 fijo: fds de log, fds de notify,           cerrar todo lo demás
        socket de control                   personality(ADDR_NO_RANDOMIZE)  [Linux]
-                                           prctl(NO_NEW_PRIVS)           [Linux]
+                                           prctl(NO_NEW_PRIVS) [solo tras drop de uid]
                                            fchown/fchmod sobre el fd     [no TOCTOU]
                                            cap_set_proc / cap_set        [Linux/libcap]
                                            setsid + TIOCSCTTY            [console]
@@ -603,7 +603,8 @@ toca nadie.
 - **Property test clave**: *"para todo orden topológico y toda secuencia de eventos,
   el estado final es alcanzable"* — prueba que el reconciliador converge y no oscila.
 
-**b) `zservice` — parser.**
+**b) `zconfig` — parser.** (El parser vive aquí, no en `zservice`: esta sección lo
+asignaba al crate equivocado.)
 - Fuzz target sobre el parser de configuración (formato plano, blando, fuzzible bien).
 - Fuzz target sobre el parser del protocolo NDJSON.
 - Tests de tabla: cada directiva, cada valor, cada error.
@@ -632,7 +633,7 @@ toca nadie.
     zinit.conf              # socket, usuario por defecto, límites globales
     services.d/*.conf       # descripciones de servicio
     zinit.d/*.conf          # drop-in que sobrescribe services.d
-    scripts.d/              # scripts de shell equivalentes a los stages 1/2/3
+    scripts.d/              # (diseño; ningún camino del código lo lee hoy)
 /etc/default/zinit          # knob de paquete (sysv, por compatibilidad)
 
 /run/zinit/                 # tmpfs: socket, pidfiles, estado
@@ -640,13 +641,15 @@ toca nadie.
 /usr/lib/tmpfiles.d/zinit.conf
 ```
 
-**Compatibilidad sysv**: `zctl` y un shim `sv` que traduce los argumentos de `sv` más usados
-(`up`, `down`, `status`, `restart`, `term`) a `zctl`. Coste: 60 líneas de shell. Beneficio:
-los scripts de runit existentes se leen sin reescribir.
+**Compatibilidad sysv (diseño, no implementado).** Un shim `sv` que traduzca
+los argumentos de `sv` más usados (`up`, `down`, `status`, `restart`, `term`) a
+`zctl`, y al revés un `zinit import-runit /etc/service` que convierta un árbol
+de runit.
 
-Y al revés, opcional: `zinit import-runit /etc/service > /etc/zinit/services.d/`
-convierte un árbol de runit. Convierte `depends` heurísticas en `.target` documentadas a mano,
-no mágicas — la translator **avisa** de lo que no puede convertir.
+Hoy **no hay ninguno de los dos**: el repo trae `scripts/service` (frente sysv)
+y `scripts/runsv-import.sh` (importador externo), no el shim `sv` ni el verbo
+`import-runit`. La sección se deja como diseño con este aviso para que nadie
+ejecute un comando que no existe.
 
 ---
 
