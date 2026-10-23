@@ -31,9 +31,19 @@
 //! its own filter (that would need `seccomp(2)`, which is not allow-listed).
 //! `bpf` and `seccomp` themselves are not in the name table at all — not even
 //! as user-allowable entries — so a filtered service cannot punch its own
-//! hole. `ptrace`, `io_uring`, `perf`, keyring and mount-family calls are
-//! absent for the same reason, or because their numbers were never verified
-//! (see below).
+//! hole. `ptrace`, `io_uring`, `perf` and keyring calls are absent for the
+//! same reason, or because their numbers were never verified (see below).
+//!
+//! Two limits worth stating plainly rather than discovering later:
+//!
+//! * Mount-family calls are absent from the **implicit** baseline, but a few
+//!   of them (`unshare`, `chroot`, `pivot_root`, `mknod`) are user-allowable
+//!   entries: an operator who writes them into `syscall-allow` gets them.
+//! * Only the syscall number is inspected, never its arguments. So `clone`
+//!   and `clone3` are allowed as themselves — which means a filtered service
+//!   can still ask for `CLONE_NEWUSER`, and `ioctl` is allowed wholesale
+//!   (`TIOCSTI` included). Filtering arguments is the upgrade path; it is
+//!   deliberately not attempted here.
 //!
 //! # Number provenance
 //!
@@ -94,6 +104,24 @@ const AUDIT_ARCH_RISCV64: u32 = 0xC000_00F3;
 /// program is not a filter but a second kernel, and `build` says so with
 /// `None` instead of wrapping an offset.
 pub const MAX_ALLOW: usize = 200;
+
+/// The longest program [`build`] can produce: the architecture load and its
+/// refusal, the syscall-number load, one jump per allowed number, the default
+/// action and the allow return.
+///
+/// `install` used to refuse anything past `MAX_ALLOW + 5`, so the largest
+/// allow list `build` accepted could never be installed — a service that
+/// configured 200 syscalls failed to start with "impossible length". The two
+/// bounds now come from the same expression.
+pub const MAX_PROGRAM: usize = MAX_ALLOW + 6;
+
+/// Whether a program is a length `install` can hand the kernel.
+///
+/// A separate predicate so the bound can be tested: a filter that is really
+/// installed is one-way and would take the test process with it.
+fn program_length_is_plausible(len: usize) -> bool {
+    (1..=MAX_PROGRAM).contains(&len)
+}
 
 /// One cBPF instruction. Layout-identical to `struct sock_filter`, defined
 /// here so this module compiles on targets whose `libc` never heard of it;
@@ -588,7 +616,7 @@ pub fn build(extra: &[u32], on_violation: OnViolation) -> Option<Vec<Insn>> {
 /// (including a failing `execve`'s own error report) runs under the filter.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn install(filter: &[Insn]) -> io::Result<()> {
-    if filter.is_empty() || filter.len() > MAX_ALLOW + 5 {
+    if !program_length_is_plausible(filter.len()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "seccomp filter has an impossible length",
@@ -752,5 +780,18 @@ mod tests {
     #[test]
     fn install_rejects_impossible_lengths() {
         assert!(install(&[]).is_err());
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn the_install_bound_fits_what_build_produces() {
+        // The prologue is four statements and the epilogue two, so a list at
+        // the limit builds to `MAX_ALLOW + 6` and must still be installable.
+        let prog = build(&[], OnViolation::Kill).expect("the implicit baseline builds");
+        assert_eq!(prog.len(), IMPLICIT.len() + 6);
+        assert_eq!(MAX_PROGRAM, MAX_ALLOW + 6);
+        assert!(program_length_is_plausible(prog.len()));
+        assert!(!program_length_is_plausible(0));
+        assert!(!program_length_is_plausible(MAX_PROGRAM + 1));
     }
 }

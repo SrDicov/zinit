@@ -195,9 +195,10 @@ fn cmd_id(cmd: &Command) -> String {
 ///   process of that user could power the machine off by writing one line
 ///   into the socket.
 ///
-/// When the platform cannot name the peer's binary (no `/proc`, no peer
-/// pid), the uid stands on its own: the check degrades to what it was
-/// before, rather than locking the owner out of their own machine.
+/// When the platform cannot name the peer's binary at all (no `/proc`), the
+/// uid stands on its own and the supervisor announces that weaker check at
+/// startup. Where the platform *can* name it, a `None` is a failed lookup and
+/// the power verbs are refused.
 ///
 /// Note what this is not: a boundary against a malicious peer of the same
 /// user. That peer can copy `zctl` and be `zctl`. The socket's mode is
@@ -238,12 +239,49 @@ pub fn authorize(
     // owner's own code — but it is a *weaker* check, so the supervisor says so
     // at startup instead of letting a bug report discover it.
     match peer_exe {
-        None => true,
+        // `None` is two different facts wearing the same shape, and they must
+        // not share an answer. On Linux the way to name the peer exists, so a
+        // `None` here means the `readlink` failed — a peer that closed its
+        // end between `accept` and the read, or a `/proc` this process cannot
+        // read. Failing closed costs nothing: `zctl` writes the frame and then
+        // waits for the reply, so a legitimate client is alive here. On a
+        // platform with no `/proc` at all it is the only information there is,
+        // and the supervisor announces the weaker check at startup.
+        None => !cfg!(any(target_os = "linux", target_os = "android")),
         Some(exe) => {
             let name = exe.file_name().map(|n| n.to_string_lossy().into_owned());
-            matches!(name.as_deref(), Some("zctl") | Some("zinit"))
+            matches!(name.as_deref(), Some("zctl") | Some("zinit")) && trusted_executable(exe)
         }
     }
+}
+
+/// Whether a peer executable sits where a `zctl`/`zinit` is installed.
+///
+/// The kernel reports the path it resolved for the peer, so a copy of `zctl`
+/// in `/tmp` does not qualify: the operator's install directories and the
+/// directory the supervisor itself was started from do. That turns "any
+/// process of my user that happens to be called `zctl`" into "a `zctl` where
+/// a `zctl` gets installed", which is the difference between a guard and a
+/// word. It is still not a boundary against the owner of the account.
+fn trusted_executable(exe: &Path) -> bool {
+    const SYSTEM: [&str; 6] = [
+        "/usr/bin",
+        "/usr/sbin",
+        "/bin",
+        "/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+    ];
+    let Some(dir) = exe.parent() else {
+        return false;
+    };
+    if SYSTEM.iter().any(|d| dir == Path::new(d)) {
+        return true;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|self_exe| self_exe.parent().map(Path::to_path_buf))
+        .is_some_and(|self_dir| self_dir == dir)
 }
 
 /// A machine-power verb. Parsed in [`Command`], executed by the supervisor
@@ -887,12 +925,35 @@ mod tests {
         // say who is calling gets the strict answer.
         assert!(!authorize(None, None, 1000, VerbClass::Mutate));
         assert!(!authorize(None, None, 1000, VerbClass::Power));
-        // A peer whose binary could not be named falls back to the uid: on a
-        // platform without `/proc` there is no way to tell the client from
-        // any other process of the same user, and a `zctl poweroff` that
-        // silently stopped working would be the worse failure. The supervisor
-        // announces the weaker check at startup.
-        assert!(authorize(Some(&owner), None, 1000, VerbClass::Power));
+        // A peer whose binary could not be named: on a platform with no
+        // `/proc` the uid is all there is and the supervisor announces it; on
+        // Linux the lookup could have been done, so its failure is refused
+        // rather than rewarded.
+        assert_eq!(
+            authorize(Some(&owner), None, 1000, VerbClass::Power),
+            !cfg!(any(target_os = "linux", target_os = "android")),
+            "a failed executable lookup must not grant the power verbs on Linux"
+        );
+        // A binary with the right name where no `zctl` is installed is not a
+        // client: this is the hole the basename check left open.
+        assert!(
+            !authorize(
+                Some(&owner),
+                Some(Path::new("/tmp/zctl")),
+                1000,
+                VerbClass::Power
+            ),
+            "a copy of zctl anywhere is not a client"
+        );
+        assert!(
+            authorize(
+                Some(&owner),
+                Some(Path::new("/usr/local/bin/zctl")),
+                1000,
+                VerbClass::Power
+            ),
+            "an installed zctl is a client"
+        );
     }
 
     /// The three classes of verb, spelled out.

@@ -11,7 +11,7 @@ commit). Base: `2f449e3`.
 | C2 | `suspend` responde antes de dormirse | `56fea77` | test que falla con el código viejo (`E ... suspend failed` en vez de `R 1 0 suspending`) |
 | C3 | Tope de clientes en el socket de control | `7cd13f1` | test que abre más conexiones que el tope y exige que el supervisor siga vivo |
 | C4 | El supervisor re-adopta los servicios vivos | `a9dc307` | test que mata el supervisor y exige que el nuevo NO arranque una copia; falla con el código viejo (pid distinto) |
-| C5 | Estado visible honesto (atómico + poda) | `3597c57` (previo) | test: el fichero de un servicio borrado desaparece tras el reload |
+| C5 | Estado visible honesto (atómico + poda) | `a951a46` | test: el fichero de un servicio borrado desaparece tras el reload |
 | — | `kill -TERM 1` apaga la máquina | `62b8397`…`20c91d4` | test de la conversión señal→verbo `poweroff` |
 | — | Modo emergencia (config rota → shell + socket) | `a2b3a64` | test: config rota → el supervisor no muere, el socket responde, `reload-all` recoge el plan real |
 | — | Cerrojo de instancia única (flock) | `b816d19` | test: el segundo supervisor se aparta con el código 11; otro: un supervisor muerto deja el socket libre |

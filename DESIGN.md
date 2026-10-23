@@ -603,7 +603,8 @@ toca nadie.
 - **Property test clave**: *"para todo orden topológico y toda secuencia de eventos,
   el estado final es alcanzable"* — prueba que el reconciliador converge y no oscila.
 
-**b) `zservice` — parser.**
+**b) `zconfig` — parser.** (El parser vive aquí, no en `zservice`: esta sección lo
+asignaba al crate equivocado.)
 - Fuzz target sobre el parser de configuración (formato plano, blando, fuzzible bien).
 - Fuzz target sobre el parser del protocolo NDJSON.
 - Tests de tabla: cada directiva, cada valor, cada error.
@@ -632,7 +633,7 @@ toca nadie.
     zinit.conf              # socket, usuario por defecto, límites globales
     services.d/*.conf       # descripciones de servicio
     zinit.d/*.conf          # drop-in que sobrescribe services.d
-    scripts.d/              # scripts de shell equivalentes a los stages 1/2/3
+    scripts.d/              # (diseño; ningún camino del código lo lee hoy)
 /etc/default/zinit          # knob de paquete (sysv, por compatibilidad)
 
 /run/zinit/                 # tmpfs: socket, pidfiles, estado
@@ -640,13 +641,15 @@ toca nadie.
 /usr/lib/tmpfiles.d/zinit.conf
 ```
 
-**Compatibilidad sysv**: `zctl` y un shim `sv` que traduce los argumentos de `sv` más usados
-(`up`, `down`, `status`, `restart`, `term`) a `zctl`. Coste: 60 líneas de shell. Beneficio:
-los scripts de runit existentes se leen sin reescribir.
+**Compatibilidad sysv (diseño, no implementado).** Un shim `sv` que traduzca
+los argumentos de `sv` más usados (`up`, `down`, `status`, `restart`, `term`) a
+`zctl`, y al revés un `zinit import-runit /etc/service` que convierta un árbol
+de runit.
 
-Y al revés, opcional: `zinit import-runit /etc/service > /etc/zinit/services.d/`
-convierte un árbol de runit. Convierte `depends` heurísticas en `.target` documentadas a mano,
-no mágicas — la translator **avisa** de lo que no puede convertir.
+Hoy **no hay ninguno de los dos**: el repo trae `scripts/service` (frente sysv)
+y `scripts/runsv-import.sh` (importador externo), no el shim `sv` ni el verbo
+`import-runit`. La sección se deja como diseño con este aviso para que nadie
+ejecute un comando que no existe.
 
 ---
 

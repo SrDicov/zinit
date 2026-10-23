@@ -1408,7 +1408,14 @@ mod tests {
         .expect("valid graph");
         assert_eq!(check_acyclic(&g), None);
         assert!(!has_cycle(&g));
-        assert!(topological_order(&g).is_ok());
+        // `is_ok()` alone proves nothing about the answer: a function that
+        // returned the reverse order also returns `Ok`, and the whole point of
+        // this pass is that `b` starts after `a`.
+        assert_eq!(
+            topological_order(&g).expect("an acyclic graph orders"),
+            vec![0, 1],
+            "the dependency must come first"
+        );
     }
 
     /// A cycle is an `Err`, never a panic. This crate is built

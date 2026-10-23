@@ -67,7 +67,8 @@ plus a boot target.
 
 ## From dinit: live conversion (verified on Artix, P1 2026-10-16)
 
-With `z-dinit-generator`. dinit stays PID 1 throughout; the zinit
+With `z-dinit-generator`, que vive en su **propio repo**, no en este árbol
+(`../z-dinit-generator`, el binario `zdg`). dinit stays PID 1 throughout; the zinit
 supervisor runs beside it until the window. Evidence: P1 ran 65/65
 dinit services covered by 94 zinit services, 0 missing.
 

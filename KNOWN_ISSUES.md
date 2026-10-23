@@ -167,7 +167,7 @@ soak restarts on the release binary.
   camino está implementado y con test de regresión, pero el syscall
   final sólo se prueba en la máquina.
 - **Timers**: resuelto por la vía de no hacerlos. La máquina trae
-  `cronie`/`crond` (evidencia en `z-dinit-generator/evidence/`), así que un
+  `cronie`/`crond` (evidencia en el repo del generador, `z-dinit-generator/evidence/`), así que un
   planificador dentro de zinit sería la misma función dos veces. 
 
 ## El filtro de syscalls no filtraba: era `SECCOMP_MODE_STRICT` (2026-10-22)
@@ -264,3 +264,56 @@ incluida la repetición del mismo commit (`a5c8508`, dos pasadas verdes).
 - Siguiente paso si vuelve: el mensaje nuevo dice el desenlace exacto; con
   eso se decide entre endurecer el hijo (preparar todo antes del `fork`) o
   gatear el test a Linux, donde vive el camino de producción (`setresuid`).
+
+## Lo que la auditoría independiente encontró (2026-10-23)
+
+Cuatro afirmaciones del reporte anterior no resistían el código. Dos se
+arreglaron, dos se documentan como límite real.
+
+**Arreglado — el verbo de potencia se autorizaba por nombre de fichero.**
+`authorize()` aceptaba `poweroff` de cualquier proceso del mismo uid cuyo
+binario se llamara `zctl`/`zinit`, estuviera donde estuviera. Ahora el
+ejecutable tiene que estar en un directorio de instalación (`/usr/bin`,
+`/usr/sbin`, `/bin`, `/sbin`, `/usr/local/{bin,sbin}`) o en el mismo
+directorio que el supervisor (árbol de build, prefijo propio). Un
+`/tmp/zctl` ya no pasa. Sigue sin ser una frontera contra el dueño de la
+cuenta —un proceso suyo puede escribir en su propio `$HOME`— y eso está
+dicho en el docstring desde el principio.
+
+**Arreglado — fail-open en Linux cuando fallaba el `readlink`.**
+`/proc/<pid>/exe` se lee al aceptar la conexión; si el peer muere en esa
+ventana o `/proc` no es legible, `peer_exe` era `None` y `None` concedía
+potencia. Ahora `None` en Linux es **rechazo** (un `zctl` legítimo está vivo:
+escribe la trama y espera la respuesta), y en plataformas sin `/proc` se
+mantiene el uid y se anuncia al arrancar. El anuncio estaba bajo
+`cfg(not(linux))`, así que la degradación de Linux era invisible: por eso
+pasaba desapercibida.
+
+**Arreglado — off-by-one entre `build` e `install` del filtro seccomp.**
+`build` aceptaba 200 números y producía 206 instrucciones; `install`
+rechazaba más de 205. Una política en el límite se construía y luego no se
+podía instalar. Ambos límites salen ahora de `MAX_PROGRAM`, con un test que
+pina la relación (sin instalar un filtro real, que sería irreversible).
+
+**Límite real, documentado — el filtro mira números, no argumentos.**
+Un servicio filtrado puede seguir pidiendo `clone(CLONE_NEWUSER)` y usar
+`ioctl` (`TIOCSTI` incluido): el cBpf clásico no inspecciona argumentos.
+Filtrar argumentos exige revisar la ABI por arquitectura; no se hace aquí.
+
+**Límite real, documentado — `private-tmp` aísla `/tmp`, y nada más.**
+`/var/tmp` y `/dev/shm` siguen siendo del host y compartidos entre
+servicios. Además `MS_PRIVATE` es best-effort (`let _ =`), que en un
+contenedor anidado puede no aplicarse.
+
+**Hallazgo en el repo del generador (fuera de este árbol, y bloquea quitar
+dinit).** La conversión pierde semántica en al menos: `capabilities` /
+`securebits` (se avisa y el servicio convertido corre con **todas** las
+capacidades, cuando dinit las restringía), `starts-on-console` (no está en
+el match, cae al aviso genérico), `kill-all-on-stop` (ignorada), `waits-for`
+(se convierte además en `pulls`, que activa de más), `restart` (default
+`always` cableado, dinit lo decide en build-time), `socket-permissions`
+(dinit 666, zinit 0600), `start-timeout` (dinit manda SIGINT al grupo;
+zinit sólo aplica el plazo con `ready = notify`) e `inittab-*` (sin utmp).
+Doce claves mapeadas no tienen test. Nada de esto es de este repo: se
+arregla allí, y es la razón por la que quitar dinit no es sólo desinstalar
+un paquete.

@@ -2985,6 +2985,24 @@ mod tests {
         let adopted = adopt_names(&old_plan, &new_plan);
         assert_eq!(adopted.len(), 2);
         assert_eq!(adopted.iter().filter(|a| a.is_some()).count(), 1);
+        // *Which* index got the survivor is the whole contract: pairing is by
+        // name, never by position. Counting the `Some`s cannot tell a correct
+        // pairing from a swapped one, so name the two indices.
+        let at = |name: &str| {
+            new_plan
+                .services
+                .iter()
+                .position(|sp| sp.name == name)
+                .expect("the service is in the new plan")
+        };
+        assert!(
+            adopted[at("keeper")].is_some(),
+            "the survivor must be adopted at its own index"
+        );
+        assert!(
+            adopted[at("newcomer")].is_none(),
+            "a newcomer must not inherit the survivor's index"
+        );
         // Descriptions stay aligned to the *new* plan: the loop's only real
         // hazard, checked again because a reload rebuilds both vectors.
         for (idx, sp) in new_plan.services.iter().enumerate() {

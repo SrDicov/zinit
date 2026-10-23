@@ -1,0 +1,52 @@
+name: flake-hunt
+
+# One suspect test, hammered on the platforms it runs on, until it either
+# fails with evidence or does not.
+#
+# Dispatch-only on purpose: it exists to answer "is this a real flake on
+# macOS, or a one-off?" without paying for macOS minutes on every push. The
+# test named here must print *which* outcome it saw when it fails — the whole
+# point is to replace "it failed once" with a root cause.
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Iterations per platform"
+        required: false
+        default: "300"
+      test:
+        description: "Test path (module::tests::name)"
+        required: false
+        default: "identity::tests::dropping_to_our_own_ids_is_either_clean_or_untouched"
+
+jobs:
+  hunt:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the test binary once
+        run: cargo test -p zservice --lib --no-run
+      - name: Hammer it
+        shell: bash
+        run: |
+          set -u
+          bin=$(find target/debug/deps -maxdepth 1 -type f -name 'zservice-*' -perm -u+x | head -n 1)
+          if [ -z "$bin" ]; then echo "no test binary found"; exit 1; fi
+          echo "binary: $bin"
+          fails=0
+          for i in $(seq 1 "${{ inputs.runs }}"); do
+            if ! "$bin" --exact "${{ inputs.test }}" --test-threads=1 >"/tmp/out.$i" 2>&1; then
+              fails=$((fails + 1))
+              echo "--- failure on iteration $i"
+              cat "/tmp/out.$i"
+            fi
+            rm -f "/tmp/out.$i"
+          done
+          echo "runs=${{ inputs.runs }} fails=$fails"
+          test "$fails" -eq 0
