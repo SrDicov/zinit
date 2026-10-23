@@ -235,6 +235,9 @@ pub(crate) fn drain_notify(fd: RawFd, pending: &mut Vec<u8>) -> io::Result<(bool
                     break;
                 }
             }
+            // equivalent (cargo-mutants): this Interrupted guard can never
+            // fire — `zrt::sys::read` retries EINTR internally, so no test
+            // can observe it taken and its mutants have no observable effect.
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) => return Err(e),
@@ -353,11 +356,16 @@ fn run_check_child(
     // async-signal-safe path `DESIGN.md` §9.1 requires.
     unsafe {
         libc::close(r);
+        // equivalent (cargo-mutants): ^ would be the same value as | here;
+        // O_RDWR and O_CLOEXEC are disjoint bits.
         let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
         if null >= 0 {
             libc::dup2(null, 0);
             libc::dup2(null, 1);
             libc::dup2(null, 2);
+            // equivalent (cargo-mutants): this close is redundant — `null`
+            // owns O_CLOEXEC and the `execve` below closes the descriptor
+            // either way, so every close-branch mutant here is unobservable.
             if null > 2 {
                 libc::close(null);
             }
@@ -425,6 +433,8 @@ impl EnvBlock {
 /// supervisor is woken by signals constantly, and surfacing that as an error
 /// would turn every probe into a lie under load.
 fn poll_readable(fd: RawFd, timeout_ms: u64) -> io::Result<bool> {
+    // equivalent (cargo-mutants): ^ would be the same value as | here;
+    // POLLIN and POLLHUP are disjoint bits.
     let mut pfd = libc::pollfd {
         fd,
         events: libc::POLLIN | libc::POLLHUP,
@@ -474,6 +484,8 @@ pub fn probe_tcp(port: u16) -> io::Result<bool> {
 fn new_probe_socket() -> io::Result<RawFd> {
     // SAFETY: `socket` takes three ints; `SOCK_STREAM | SOCK_CLOEXEC |
     // SOCK_NONBLOCK` on `AF_INET` is the canonical loopback-probe form.
+    // equivalent (cargo-mutants): ^ is the same value as | on every union
+    // below; the SOCK_* flags are disjoint bits.
     let fd = unsafe {
         libc::socket(
             libc::AF_INET,
@@ -487,6 +499,8 @@ fn new_probe_socket() -> io::Result<RawFd> {
     Ok(fd)
 }
 
+// (cargo-mutants): every mutant inside this target-out branch compiles away
+// on Linux and can never fail the suite here; BSD/Apple builds exercise it.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn new_probe_socket() -> io::Result<RawFd> {
     // SAFETY: `socket` takes three ints; no flags exist here, so the fd is
@@ -1071,45 +1085,280 @@ mod tests {
         let _ = zrt::sys::close(w);
     }
 
-    /// `EINTR` mid-read must retry, not surface: `alarm(1)` lands while the
-    /// read is parked on a *blocking* pipe, and the writer only speaks after
-    /// the signal, so both the `Interrupted => continue` retry and the next
-    /// read are exercised. The payload leads with an empty line (`rel = 0` in
-    /// the parse loop), which is what makes additive-arithmetic mutants off
-    /// the `start +=` line fail instead of passing.
+    /// `EINTR` mid-read must retry, not surface. The signal is delivered to
+    /// this thread while the read is parked on a *blocking* pipe, and the
+    /// payload `"\nREADY=1\n"` (leading empty line: `rel = 0` in the parse
+    /// loop) is written only afterwards, so both the `Interrupted =>
+    /// continue` retry and the next read are exercised deterministically —
+    /// a fixed 100 ms handoff instead of a racy one-second alarm.
     #[test]
     fn drain_notify_retries_on_eintr() {
-        unsafe extern "C" fn on_sigalrm(_: libc::c_int) {}
-        let (r, w) = zrt::sys::pipe2(true).expect("pipe");
-        let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
-        action.sa_sigaction = on_sigalrm as *const () as usize;
-        // No SA_RESTART: the parked read() must wake up with EINTR.
-        action.sa_flags = 0;
-        let mut old: libc::sigaction = unsafe { core::mem::zeroed() };
-        // SAFETY: registering this test's own no-op handler for SIGALRM while
-        // its alarm is pending; the previous action is restored at the end.
-        // Nothing else in the test binary arms SIGALRM.
-        let rc = unsafe { libc::sigaction(libc::SIGALRM, &raw const action, &raw mut old) };
-        assert_eq!(rc, 0, "sigaction(SIGALRM) runs");
-        unsafe { libc::alarm(1) };
+        arm_sigalrm_waker();
+        let (r, w) = zrt::sys::pipe2(true).expect("pipe"); // blocking
         let writer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(1500));
+            std::thread::sleep(Duration::from_millis(300));
             zrt::sys::write(w, b"\nREADY=1\n").expect("notify");
         });
         let mut pending = Vec::new();
         let (done, guard) = hang_sentinel();
+        let alarm = sigalrm_here_after(100);
         let drained = drain_notify(r, &mut pending);
         done.store(true, Ordering::Relaxed);
         guard.join().expect("sentinel finishes");
+        alarm.join().expect("alarm thread finishes");
         writer.join().expect("writer finishes");
         assert!(
             matches!(drained, Ok((true, false))),
             "EINTR must retry the read, not surface"
         );
-        unsafe { libc::alarm(0) };
-        // SAFETY: `old` came from the registering `sigaction` above and the
-        // alarm is disarmed before it is restored.
-        unsafe { libc::sigaction(libc::SIGALRM, &raw const old, std::ptr::null_mut()) };
+        let _ = zrt::sys::close(r);
+    }
+
+    /// A real error is an `Err`, never "nothing yet": a `WouldBlock` guard
+    /// turned unconditional (true) would swallow `EBADF` as `(false, false)`
+    /// and the caller would keep polling a dead descriptor forever.
+    #[test]
+    fn drain_notify_propagates_a_dead_descriptor() {
+        let mut pending = Vec::new();
+        assert!(
+            drain_notify(-1, &mut pending).is_err(),
+            "a closed descriptor is an error, not silence"
+        );
+    }
+
+    /// Bytes without a newline obey the any-byte rule only when they are not
+    /// whitespace: `&&`→`||` in the lone-bytes branch would call spaces a
+    /// handshake.
+    #[test]
+    fn notify_whitespace_without_a_newline_is_not_readiness() {
+        let (r, w) = zrt::sys::pipe2(true).expect("pipe");
+        zrt::sys::set_nonblocking(r, true).expect("nonblock");
+        let mut pending = Vec::new();
+        zrt::sys::write(w, b"   ").expect("write");
+        assert_eq!(
+            drain_notify(r, &mut pending).expect("drain"),
+            (false, false),
+            "spaces with no newline are not a handshake"
+        );
+        let _ = zrt::sys::close(r);
+        let _ = zrt::sys::close(w);
+    }
+
+    /// A `Tcp` wait is due strictly past its instant: `<`→`>` would answer
+    /// "wrong time" exactly when the service is up.
+    #[test]
+    fn tcp_check_strictly_past_its_due_instant_probes() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        let mut w = ReadyWait::Tcp {
+            port,
+            next_due_ms: 0,
+        };
+        assert!(
+            w.check(1).expect("probe runs"),
+            "past due with a live listener is readiness now"
+        );
+    }
+
+    /// Probe children that exercise the fork paths run isolated in their own
+    /// process group: a mutated child half may signal or kill its whole
+    /// group, and that must never reach the test binary or the driver behind
+    /// it. The modes do the actual work inside `run_check_probe_entry`.
+    fn probe_child(mode: &str) -> std::process::ExitStatus {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("self executable"));
+        cmd.arg("run_check_probe_entry").arg("--nocapture");
+        cmd.env("ZREADY_PROBE_MODE", mode);
+        cmd.process_group(0);
+        cmd.status().expect("spawn probe child")
+    }
+
+    /// One process-wide SIGALRM no-op handler, installed exactly once: the
+    /// signal action table is process-wide, so concurrent arm/restore pairs
+    /// would race; every test here only needs "SIGALRM wakes a parked
+    /// syscall with EINTR", which one common no-op handler provides. Senders
+    /// are always targeted `tgkill`s at a single requesting thread.
+    fn arm_sigalrm_waker() {
+        static ARM: std::sync::Once = std::sync::Once::new();
+        ARM.call_once(|| {
+            unsafe extern "C" fn on_sigalrm(_: libc::c_int) {}
+            let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+            action.sa_sigaction = on_sigalrm as *const () as usize;
+            // No SA_RESTART: parked read/poll must wake with EINTR.
+            action.sa_flags = 0;
+            let mut old: libc::sigaction = unsafe { core::mem::zeroed() };
+            // SAFETY: registering the suite-wide no-op alarm handler once;
+            // the previous action is captured and left unmourned — nothing
+            // else in this binary puts SIGALRM to term.
+            let rc = unsafe { libc::sigaction(libc::SIGALRM, &raw const action, &raw mut old) };
+            assert_eq!(rc, 0, "sigaction(SIGALRM) runs");
+        });
+    }
+
+    /// Deliver SIGALRM to the *calling* thread `delay_ms` from now; the
+    /// caller must be (about to be) parked inside the syscall whose EINTR
+    /// behaviour is under test.
+    fn sigalrm_here_after(delay_ms: u64) -> std::thread::JoinHandle<()> {
+        // SAFETY: both ids describe this very process/thread.
+        let (pid, tid) = unsafe { (libc::getpid(), libc::gettid()) };
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            // SAFETY: tgkill is the documented thread-targeted delivery.
+            unsafe { libc::tgkill(pid, tid, libc::SIGALRM) };
+        })
+    }
+
+    /// The sacrifice fork branch is the one with caller privileges: flipping
+    /// it makes the run_check *caller* itself exec away and drop the
+    /// process's exit status on the floor (here 7). The probe child, a
+    /// process the suite can afford to lose, catches that.
+    #[test]
+    fn run_check_reports_the_child_status_not_the_callers() {
+        assert!(
+            probe_child("exit7").success(),
+            "run_check must return false, not exec the caller away"
+        );
+    }
+
+    /// The child half seals stdio onto /dev/null. Layout A frees 0, 1 and 2,
+    /// so the seal `open` lands at 0 and the check must see fds 0 and 2
+    /// readable *and* writable; layout B leaves only 2 free, so the seal
+    /// open lands exactly at 2 and that descriptor must survive the whole
+    /// dup/close dance (it does in mutants that close fd 2 "early"). fd 1 is
+    /// untested in A: the probe pipe legitimately re-uses it and the real
+    /// `close(w)` closes it again.
+    #[test]
+    fn run_check_child_seals_stdio() {
+        assert!(
+            probe_child("writeprobe").success(),
+            "a plain check can still write through the sealed stdout"
+        );
+        assert!(
+            probe_child("sealA").success(),
+            "with fd 0/1 freed, the seal must rewire fd 1"
+        );
+    }
+
+    /// With slot 0 freed before the probe, the probe socket must still win a
+    /// usable low descriptor; `fd < 0` mutants that call fd 0 a failure make
+    /// this probe error out.
+    #[test]
+    fn probe_socket_wins_the_lowest_free_descriptor() {
+        assert!(probe_child("kprobe").success());
+    }
+
+    #[test]
+    fn run_check_probe_entry() {
+        let Ok(mode) = std::env::var("ZREADY_PROBE_MODE") else {
+            return; // ordinary suite run: nothing to do
+        };
+        let ok = match mode.as_str() {
+            "exit7" => !run_check("exit 7", 2_000).unwrap_or(true),
+            "writeprobe" => run_check("echo hi", 2_000).unwrap_or(false),
+            "sealA" => {
+                // Free slots 0 and 2 so the probe pipe lands at (2, 3): the
+                // child half's own close(w) can then never eat a dup'd stdio.
+                // Slot 0 gets a read-only placeholder, duplicated onto fd 1,
+                // so a dup2 block that is skipped wholesale leaves the check
+                // writing through a read-only fd 1 — and failing.
+                // SAFETY: raw descriptors are closed/redirected only in this
+                // fresh probe child, whose stdio we re-seal right after.
+                unsafe {
+                    close_fds(&[0, 2]);
+                    let ro = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+                    assert_eq!(ro, 0, "/dev/null must reopen at slot 0");
+                    libc::dup2(0, 1);
+                }
+                run_check("echo hi", 2_000).unwrap_or(false)
+            }
+            "kprobe" => {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+                let port = l.local_addr().expect("addr").port();
+                // SAFETY: slot 0 is a normally reusable low descriptor; the
+                // probe socket acquires it (lowest free) and stays valid.
+                unsafe { libc::close(0) };
+                probe_tcp(port).unwrap_or(false)
+            }
+            other => panic!("unknown probe mode {other}"),
+        };
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
+    /// Close descriptor numbers before a stdio-sensitive probe.
+    ///
+    /// # SAFETY
+    /// Callers run in a fresh probe child state where 0/1/2 belong to them.
+    unsafe fn close_fds(fds: &[RawFd]) {
+        // SAFETY: as documented; each fd is owned or free in the caller.
+        for &fd in fds {
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// A listener whose accept queue is capped at one slot and stuffed with
+    /// two unaccepted connections: the kernel then drops new SYNs, which is
+    /// the only way a loopback connect stays in `EINPROGRESS` long enough
+    /// for the `poll(POLLOUT)` after it to time out or eat a signal.
+    fn stuffed_listener() -> (std::net::TcpListener, [std::net::TcpStream; 2], u16) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&l);
+        // SAFETY: `fd` is the listener's own descriptor; re-listening only
+        // tightens queueing policy, it evicts nothing.
+        unsafe { libc::listen(fd, 1) };
+        let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+        let one = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+            .expect("first fits");
+        let two = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(200));
+        (l, [one, two.expect("second queued")], port)
+    }
+
+    /// A full accept queue is the only way a loopback connect parks in
+    /// `EINPROGRESS`: the poll after it runs to its timeout, and `n < 0`
+    /// mutants pretending `0` is an error verdict turn that silent delay
+    /// into a hard failure.
+    #[test]
+    fn probe_tcp_reports_a_full_backlog_as_not_ready() {
+        let (_l, fillers, port) = stuffed_listener();
+        drop(fillers);
+        assert!(
+            !probe_tcp(port).expect("probe runs"),
+            "the queue is full: the probe must wait out its poll, silently"
+        );
+    }
+
+    /// A signal must not break the in-progress probe any more than a read:
+    /// the poll restarts after EINTR and still reports the timeout calmly.
+    #[test]
+    fn probe_tcp_poll_survives_a_signal() {
+        arm_sigalrm_waker();
+        let (_l, fillers, port) = stuffed_listener();
+        drop(fillers);
+        let alarm = sigalrm_here_after(200);
+        let ok = probe_tcp(port).expect("a signal is not an error");
+        alarm.join().expect("alarm thread finishes");
+        assert!(
+            !ok,
+            "backlogged probe still waits, re-polling through EINTR"
+        );
+    }
+
+    /// `interrupted => continue` in `poll_readable`: a signal mid-wait is a
+    /// retry, not an error, and the data that arrives after it is still seen.
+    #[test]
+    fn poll_readable_retries_when_interrupted() {
+        arm_sigalrm_waker();
+        let (r, w) = zrt::sys::pipe2(true).expect("pipe");
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            zrt::sys::write(w, b"x").expect("write");
+        });
+        let alarm = sigalrm_here_after(200);
+        let readable = poll_readable(r, 1_500).expect("a signal is not an error");
+        alarm.join().expect("alarm thread finishes");
+        writer.join().expect("writer thread finishes");
+        assert!(readable, "data written after the EINTR is still seen");
         let _ = zrt::sys::close(r);
     }
 }
