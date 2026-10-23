@@ -479,6 +479,29 @@ pub(crate) fn current_ids() -> (u32, u32, u32, u32) {
 mod tests {
     use super::*;
 
+    /// An absolute cgroup path under a plain directory: the directory gets
+    /// created, but there is no `cgroup.procs` to write, so the refusal must
+    /// name the file and the cause instead of handing the child a path that
+    /// fails with a bare ENOENT after the fork.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn ensure_cgroup_refuses_a_directory_without_cgroup_procs() {
+        let dir = std::env::temp_dir().join(format!(
+            "zinit-cg-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let err = ensure_cgroup("svc", &dir.to_string_lossy())
+            .expect_err("no cgroup.procs to write inside");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains("cgroup.procs"),
+            "the aviso must name the missing file: {err}"
+        );
+        let _ = std::fs::remove_dir(&dir);
+    }
+
     #[test]
     fn resolves_nobody_to_the_platform_convention() {
         let (uid, gid) = resolve_user("nobody").expect("nobody must exist");
