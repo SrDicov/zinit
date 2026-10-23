@@ -63,3 +63,12 @@ directivas que no existen se rechazan con diagnóstico y span, no se ignoran.
 Issues en <https://github.com/SrDicov/zinit/issues> con la salida de
 `zinit check` y `zinit status`. Un fallo de arranque sin traza no es
 reproducible; con `RUST_BACKTRACE=1` sí.
+
+## Nota sobre este tag
+
+El árbol del tag lleva un test de integración,
+`the_visible_state_follows_the_plan`, que puede perder la carrera entre el
+pidfile del servicio y la publicación de `state=Running` en un runner lento
+(visto en `aarch64-glibc`). Está corregido en `main` (`2781c72`) con
+`wait_until`. No afecta a los binarios publicados: los tests no forman parte
+de ellos.
