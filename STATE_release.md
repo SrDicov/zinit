@@ -15,15 +15,15 @@ git status --short                            # limpio
 |---|---|---|
 | `crates/zservice/src/ready.rs` | **0 libres** | cerrado en `6585c32`: 0 timeout, 12 MISSED con `// equivalent` razonado |
 | `crates/zservice/src/log.rs` | **0 libres** | cerrado en `aa31e1e`: 0 timeout, 5 MISSED equivalentes razonados. OJO: el subagente necesitó `RUST_TEST_THREADS=1` (flake de fd 0 en paralelo, 4/15) — ver SPEC_T1_B18 |
-| `crates/zservice/src/identity.rs` | 10 | sin tocar |
-| **baratos** | **10** | 0 ready + 0 log + 10 identity. `SPEC_T1_B17.md` escrito y SIN despachar (límite de uso del subagente) |
+| `crates/zservice/src/identity.rs` | **11, todos documentados** | `9a8322a`: 1 matado, 10 ERANGE + 1 carrera sin camino de test (ver doc) |
+| **baratos** | **0** | ready 0, log 0, identity 11 (todos con causa verificada). T1 CERRADO |
 | `crates/zconfig/*` | 116 | documentar, no matar |
 | `crates/zservice/src/spawn.rs` | 152 | root-gated + documentar |
 | `crates/zservice/src/service.rs` | 27 | documentar |
 
 ## Criterio de tag (no es 0 % missed)
 
-Tag **sólo** si: 10 baratos muertos o equivalentes documentados, 268 caros
+Tag **sólo** si: 0 baratos libres, 268 caros
 documentados con causa, los 9 criterios de `STATE_alpha.md` verdes, CI verde
 salvo `riscv32gc`, y el release de GitHub creado. **Tag sin release = no tag.**
 
@@ -119,9 +119,12 @@ espera hardware).
 | T1-B15 | SUCCESS | `7b688d5` | 22 de 31 matados en `log.rs` |
 | T1-B16 | SUCCESS | `aa31e1e` | `log.rs` cerrado: 0 timeout, 5 equivalentes |
 | (flaky) | FIX | `0796e6b` | fd-0: mutex no bastaba (3/20 fallos) → fork aislado, **0/40** |
-| T1-B17 | **PENDIENTE** | — | `SPEC_T1_B17.md` escrito, sin despachar: límite de uso de subagentes |
+| T1-B17 | SUCCESS | `9a8322a` | identity: 1 matado, 10 documentados (ERANGE + carrera `AlreadyExists`) |
 
-Base actual: `cargo test -p zservice --lib` → **123 passed**, clippy 0, fmt limpio.
+Base actual: `cargo test -p zservice --lib` → **124 passed**, clippy 0, fmt limpio.
 
-Siguiente: despachar `SPEC_T1_B17.md` (identity.rs, 10 missed, 60 min), luego el
-flaky hunt no hace falta (ya está a 0/40).
+Siguiente: **T2** — documentar los caros (zconfig 116, spawn 152, service 27) en
+`docs/audit/`. Después T3 (acta), y sólo entonces T4-T6 seguidos.
+
+T1 cerrado: 0 baratos libres. Los 11 de identity tienen causa escrita, no
+"pendiente".
