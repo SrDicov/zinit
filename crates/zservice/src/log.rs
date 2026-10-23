@@ -396,7 +396,31 @@ fn write_all(fd: RawFd, mut buf: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    /// Runs `body` in a forked child. The runner's threads share one fd table,
+    /// so freeing fd 0 in the parent races every other test (and the runner's
+    /// stdin) — a mutex does not help, because unrelated tests keep opening
+    /// files and can steal the low slot. `body` must only touch paths computed
+    /// before the fork: it runs in a child of a multi-threaded process.
+    pub(crate) fn in_isolated_fd_table(body: impl FnOnce() -> bool) -> bool {
+        // SAFETY: plain fork; the child only opens/closes/dups stdio and _exits,
+        // and never allocates.
+        match unsafe { libc::fork() } {
+            -1 => panic!("fork: {}", io::Error::last_os_error()),
+            0 => {
+                let ok = body();
+                // SAFETY: leaving the child without running parent destructors.
+                unsafe { libc::_exit(if ok { 0 } else { 1 }) }
+            }
+            pid => {
+                let mut status = 0;
+                // SAFETY: waiting on the child pid we just created.
+                unsafe { libc::waitpid(pid, &mut status, 0) };
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+            }
+        }
+    }
+
     use super::*;
 
     fn tmpdir(name: &str) -> PathBuf {
@@ -689,29 +713,28 @@ mod tests {
     /// closed. (`fd <= 0` mutants would refuse fd 0 outright.)
     #[test]
     fn fd_zero_writes_normally() {
-        use std::os::fd::AsRawFd;
-        let null = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/null")
-            .expect("open /dev/null");
-        // SAFETY: dup of fd 0; we restore fd 0 before the test returns.
-        let saved = unsafe { libc::dup(0) };
-        assert!(saved >= 0, "dup: {}", io::Error::last_os_error());
-        // SAFETY: dup2 into fd 0; /dev/null accepts any write.
-        assert_eq!(unsafe { libc::dup2(null.as_raw_fd(), 0) }, 0, "dup2");
-        let mut h = LogHandle {
-            fd: 0,
-            path: None,
-            max_bytes: u64::MAX,
-            backups: 0,
-            datagram: false,
-        };
-        write_line(&mut h, b"into fd zero").expect("write on fd 0");
-        h.close(); // closes fd 0 (our /dev/null copy); must not leak or panic
-        // SAFETY: restore the runner's original fd 0 from the saved dup.
-        assert_eq!(unsafe { libc::dup2(saved, 0) }, 0, "restore fd 0");
-        // SAFETY: the dup is no longer needed once fd 0 is restored.
-        unsafe { libc::close(saved) };
+        assert!(
+            in_isolated_fd_table(|| {
+                // SAFETY: fd 0 is this child's alone.
+                let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
+                if null < 0 || unsafe { libc::dup2(null, 0) } != 0 {
+                    return false;
+                }
+                unsafe { libc::close(null) };
+                // SAFETY: fd 0 now is /dev/null in this child.
+                let mut h = LogHandle {
+                    fd: 0,
+                    path: None,
+                    max_bytes: u64::MAX,
+                    backups: 0,
+                    datagram: false,
+                };
+                let ok = write_line(&mut h, b"into fd zero").is_ok();
+                h.close();
+                ok
+            }),
+            "writing through fd 0 must behave like any other descriptor"
+        );
     }
 
     /// A file already at exactly `max_bytes` must rotate on the next line:
@@ -840,20 +863,20 @@ mod tests {
     /// that is a success, not `fd > 0` territory. Restores fd 0 on exit.
     #[test]
     fn open_append_accepts_fd_zero() {
-        let dir = tmpdir("fd0-open");
-        let path = dir.join("fresh.log");
-        // SAFETY: free fd 0 for the test, restore from the dup afterwards.
-        let saved = unsafe { libc::dup(0) };
-        assert!(saved >= 0, "dup: {}", io::Error::last_os_error());
-        unsafe { libc::close(0) };
-        let fd = open_append(&path).expect("open(2) may use fd 0");
-        assert_eq!(fd, 0, "fresh file claimed the freed low fd");
-        write_all(fd, b"hi").expect("write through fd 0");
-        assert_eq!(std::fs::read(&path).expect("read"), b"hi");
-        // SAFETY: fd 0 currently points at our own file; restore the saved.
-        assert_eq!(unsafe { libc::dup2(saved, 0) }, 0, "restore fd 0");
-        // SAFETY: the dup is no longer needed.
-        unsafe { libc::close(saved) };
+        let path = tmpdir("fd0-open").join("fresh.log");
+        assert!(
+            in_isolated_fd_table(|| {
+                // SAFETY: fd 0 is this child's alone.
+                unsafe { libc::close(0) };
+                let Ok(fd) = open_append(&path) else {
+                    return false;
+                };
+                fd == 0
+                    && write_all(fd, b"hi").is_ok()
+                    && std::fs::read(&path).is_ok_and(|b| b == b"hi")
+            }),
+            "a fresh file must claim the freed low fd 0"
+        );
     }
 
     /// Reopening an existing log must succeed, and two open handles must
@@ -970,17 +993,14 @@ mod tests {
     /// `open_append_accepts_fd_zero`.
     #[test]
     fn open_devnull_accepts_fd_zero() {
-        // SAFETY: free fd 0 for the test; restore from the saved dup after.
-        let saved = unsafe { libc::dup(0) };
-        assert!(saved >= 0, "dup: {}", io::Error::last_os_error());
-        unsafe { libc::close(0) };
-        let h = open_sink(&zcore::LogSink::None).expect("open(2) may use fd 0 for /dev/null");
-        assert_eq!(h.fd(), 0, "/dev/null kept the freed low fd");
-        drop(h); // closes *our* fd 0 (/dev/null), not the runner's stdin
-        // SAFETY: restore the runner's original fd 0 from the saved dup.
-        assert_eq!(unsafe { libc::dup2(saved, 0) }, 0, "restore fd 0");
-        // SAFETY: the dup is no longer needed once fd 0 is restored.
-        unsafe { libc::close(saved) };
+        assert!(
+            in_isolated_fd_table(|| {
+                // SAFETY: fd 0 is this child's alone.
+                unsafe { libc::close(0) };
+                open_sink(&zcore::LogSink::None).is_ok_and(|h| h.fd() == 0)
+            }),
+            "/dev/null must keep the freed low fd 0"
+        );
     }
 
     /// One rotation must terminate in microseconds. The sentinel waits 5 s
