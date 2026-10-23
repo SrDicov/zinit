@@ -626,6 +626,35 @@ mod tests {
     }
 
     #[test]
+    fn is_idle_is_true_only_when_there_is_nothing_to_wait_for() {
+        assert!(PollNeed::idle().is_idle());
+        // One reason to wait is enough to stop being idle. With `||` instead of
+        // `&&` the middle two would claim there is nothing to do and the
+        // reactor would never poll the fd or the timeout.
+        assert!(
+            !PollNeed {
+                fd: Some(3),
+                timeout_ms: None
+            }
+            .is_idle()
+        );
+        assert!(
+            !PollNeed {
+                fd: None,
+                timeout_ms: Some(10)
+            }
+            .is_idle()
+        );
+        assert!(
+            !PollNeed {
+                fd: Some(3),
+                timeout_ms: Some(10)
+            }
+            .is_idle()
+        );
+    }
+
+    #[test]
     fn from_ready_maps_every_variant() {
         assert!(matches!(
             ReadyWait::from_ready(&Ready::None, None, 0),
