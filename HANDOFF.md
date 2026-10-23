@@ -35,3 +35,17 @@ para arreglarlo; se anota aquí y se corrige el hábito.
   → `drop-capabilities = all`; una lista no vacía deja el fichero con la
   directiva verbatim para que `zinit check` lo rechace (E004) en vez de
   convertir en silencio un servicio con más privilegio.
+
+## Regla dura: nada de `git add -A`
+
+Tres commits de esta sesión llevaron ficheros que no eran suyos (`573a9e8`
+con cuatro cambios, `7f47ec7` con dos, `f8ac365` con `mutants.out/` dentro).
+La regla, desde ya:
+
+- `git add <archivo>` con nombre y apellido. Nunca `-A`, nunca `.`, nunca
+  `git commit -a`.
+- Un directorio se añade con `git add <dir>/*.rs`, no con el directorio.
+- Antes de cada commit, `git status --short` y leer la lista: si hay algo que
+  no se pretendía, se saca del índice antes de commitear.
+- Si el commit ya salió con basura, se arregla en un commit de limpieza (no se
+  reescribe historia) y se anota aquí.
