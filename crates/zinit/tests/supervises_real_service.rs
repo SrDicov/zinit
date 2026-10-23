@@ -1159,11 +1159,15 @@ fn the_visible_state_follows_the_plan() {
     let mut sup = Sup::start(&scratch);
     let _pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
 
-    // The state file exists and says the service is running.
-    let state = scratch.read("state/probe").expect("the state file");
+    // The state file is published on the transition, so the service's own
+    // pidfile can land a poll earlier. Wait for the state instead of sleeping:
+    // on a slow runner the gap is real, and a bare read is a race, not a test.
     assert!(
-        state.contains("state=Running"),
-        "the state file does not describe a running service: {state}"
+        wait_until(START_DEADLINE_MS, || scratch
+            .read("state/probe")
+            .is_some_and(|s| s.contains("state=Running"))),
+        "the state file never described a running service: {:?}",
+        scratch.read("state/probe")
     );
 
     // Remove the service and reload: its state file must go with it.
