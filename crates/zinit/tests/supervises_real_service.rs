@@ -1996,3 +1996,111 @@ fn a_private_tmp_covers_the_scratch_directories() {
     let _ = std::fs::remove_file(&control_marker);
     let _ = std::fs::remove_file(&marker);
 }
+
+/// The post-fork path — ids, capability drop, seccomp, `execve` — without
+/// real root.
+///
+/// Those steps live in the child (they never return to the caller), so a unit
+/// test cannot reach them and a mutation run found most of `spawn.rs` alive:
+/// nothing was executing it. A user namespace fixes the *privilege* half of
+/// that: inside `unshare -U -r` the caller is uid 0 with `CAP_SETPCAP` and
+/// `CAP_SYS_ADMIN` over a world that is its own, which is exactly what the
+/// child path needs and exactly what a CI runner will never grant.
+///
+/// The test re-executes itself inside the namespace: the outer run is the
+/// launcher, the inner run is the real assertion. That keeps the assertion
+/// identical to what an operator would get on a real machine, and it is what
+/// the existing root-gated tests would look like if they could run in CI.
+#[test]
+#[cfg(target_os = "linux")]
+fn the_child_path_runs_with_privileges_inside_a_user_namespace() {
+    if std::env::var("ZINIT_IN_USERNS").is_err() {
+        // Outer run: same test binary, one test, inside a user namespace with
+        // a pid namespace and a private /proc.
+        let exe = std::env::current_exe().expect("own test binary");
+        let status = std::process::Command::new("unshare")
+            .args([
+                "-U",
+                "-r",
+                "-p",
+                "-f",
+                "--mount-proc",
+                "--",
+                exe.to_str().expect("utf-8 path"),
+                "--exact",
+                "the_child_path_runs_with_privileges_inside_a_user_namespace",
+                "--nocapture",
+            ])
+            .env("ZINIT_IN_USERNS", "1")
+            .status()
+            .expect("unshare is in util-linux; every CI image has it");
+        assert!(
+            status.success(),
+            "the inner run failed (if the host forbids unprivileged user \
+             namespaces, this test cannot prove anything here)"
+        );
+        return;
+    }
+    // Inner run: a real supervisor, a real service, and the three directives
+    // that only mean something with privileges.
+    let _one = serial();
+    let scratch = Scratch::new("userns");
+    scratch.conf(
+        "rooted.conf",
+        &desc(
+            &format!(
+                // Two observable effects, not just "it started": the bounding
+                // set after `drop-capabilities = all`, and the refusal of a
+                // syscall the filter does not allow. A mutation that turns
+                // either step into a no-op changes what this file says.
+                "/bin/sh -c 'id -u > {out}; grep CapBnd /proc/self/status >> {out}; \
+                 unshare -m true 2>/dev/null; echo rc=$? >> {out}; exec /bin/sleep 30'",
+                out = scratch.at("uid")
+            ),
+            // A bounding-set drop plus a syscall filter: the two steps that
+            // need real privilege inside the child. No `user =` line on
+            // purpose — a user namespace forbids `setgroups` (writing "deny"
+            // to /proc/self/setgroups is how `unshare -r` works), so the id
+            // step cannot be exercised here without failing for a reason that
+            // has nothing to do with zinit.
+            "drop-capabilities = all\nsyscall-filter = errno\n",
+        ),
+    );
+    let mut sup = Sup::start(&scratch);
+    assert!(
+        wait_until(START_DEADLINE_MS, || scratch.read("uid").is_some()),
+        "the child path never completed: state={:?}\n{}",
+        scratch.read("state/rooted"),
+        scratch.tail("sup.log")
+    );
+    let report = scratch.read("uid").unwrap_or_default();
+    let lines: Vec<&str> = report.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("0"),
+        "the service must be uid 0 here"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("CapBnd:") && l.contains("0000000000000000")),
+        "the bounding set must be empty after drop-capabilities = all: {report}"
+    );
+    assert!(
+        lines.iter().any(|l| l.trim() == "rc=1"),
+        "a syscall outside the baseline must be refused (`unshare -m`): {report}"
+    );
+    // It must also have reached Running, which is only true if `execve` was
+    // reached with the filter installed.
+    assert!(
+        wait_until(START_DEADLINE_MS, || {
+            scratch
+                .read("state/rooted")
+                .is_some_and(|s| s.contains("state=Running"))
+        }),
+        "the service never reached Running: {:?}\n{}",
+        scratch.read("state/rooted"),
+        scratch.tail("sup.log")
+    );
+    let _ = sup;
+}
