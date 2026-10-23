@@ -49,3 +49,17 @@ infraestructura (drivers/cross), anotarlo y no taggear hasta verde.
   `git branch -f testing HEAD && git push origin testing`.
 - El CI compila tests con `-D warnings`: un `mut` de más tumba 20 jobs.
 - El release no se crea a mano si el workflow `release` ya corre con el tag.
+
+## Cierre alpha — 2026-10-23 (sesión final)
+
+- `d230fbb`: los 4 fallos de macOS eran 3 causas de plataforma, no un cuelgue
+  (`/bin/true` inexistente en Darwin, `listen` exacto vs `backlog+1`, y
+  `maxdgram` 2048). Arreglado/gateado con razón; CI `40002462937` verde salvo
+  `riscv32gc`.
+- `32c92d1`: acta con el run verde. Tag `v0.2.0-alpha` → ese commit.
+- `840f688`: merge `--no-ff` a `main`, pusheado. `git diff main testing` vacío.
+- Release `v0.2.0-rc1` marcado como pre-release (superseded); no se borró.
+- Workflow `release` corriendo sobre el tag (5 targets musl + install.sh +
+  sha256). Al terminar: `gh release edit v0.2.0-alpha --notes-file RELEASE_NOTES.md`.
+
+Punto de retorno si algo falla: `main` = `840f688`, tag = `32c92d1`.
