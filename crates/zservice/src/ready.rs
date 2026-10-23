@@ -870,6 +870,59 @@ mod tests {
         }
     }
 
+    /// The `envp` array must end in a null pointer and carry real entries: a
+    /// leaked dummy slice would hand `execve` a pointer to nothing.
+    #[test]
+    fn env_block_ends_with_a_null_pointer() {
+        let block = EnvBlock::capture().expect("environment is representable");
+        let ptrs = block.as_ptrs();
+        assert!(!ptrs.is_empty(), "an empty envp has no terminator");
+        assert_eq!(
+            *ptrs.last().expect("non-empty"),
+            core::ptr::null(),
+            "envp must be null-terminated"
+        );
+        assert!(
+            ptrs.len() > 1,
+            "PATH and friends are inherited: only the terminator means capture dropped everything"
+        );
+        for p in &ptrs[..ptrs.len() - 1] {
+            assert!(
+                !p.is_null(),
+                "every entry before the terminator is a real string"
+            );
+        }
+    }
+
+    /// The deadline is inclusive and the check must run once `now` is past it:
+    /// with `now_ms < next_due` inverted, a probe that is already due is
+    /// skipped and the service never becomes ready.
+    #[test]
+    fn ping_past_the_deadline_still_runs() {
+        let mut w = ReadyWait::Ping {
+            command: "/bin/true".to_string(),
+            next_due_ms: 1000,
+        };
+        assert!(
+            w.check(1001).expect("check runs"),
+            "past the deadline is due"
+        );
+        let mut t = ReadyWait::Tcp {
+            port: 1,
+            next_due_ms: 1000,
+        };
+        // Port 1 on loopback is refused: the point is that the probe runs at
+        // all, which the inverted comparison would skip.
+        assert!(!t.check(1001).expect("probe runs"));
+    }
+
+    /// The child half really reaches `execve` and its exit status comes back.
+    #[test]
+    fn run_check_child_execs_and_the_status_comes_back() {
+        assert!(!run_check("exit 7", 2000).expect("fork works"));
+        assert!(run_check("exit 0", 2000).expect("fork works"));
+    }
+
     #[test]
     fn notify_partial_line_survives_across_polls() {
         let (r, w) = zrt::sys::pipe2(true).expect("pipe");
