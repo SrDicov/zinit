@@ -221,11 +221,11 @@ fn resolve_cap_drops(service_name: &str, caps: &[String]) -> io::Result<Vec<u32>
         let mut out = Vec::with_capacity(caps.len());
         for cap in caps {
             if cap.eq_ignore_ascii_case("all") {
-                // Every number the table knows. A kernel older than the table
-                // answers `EINVAL` for the ones it does not implement, and the
-                // child tolerates that below: a capability the kernel does not
-                // have cannot be retained.
-                out.extend(0..=zconfig::MAX_CAPABILITY);
+                // Ask the kernel, not the name table: a kernel that grew a
+                // capability past the table's bound would keep it silently,
+                // and a drop that leaks is the one outcome confinement must
+                // never produce.
+                out.extend(every_capability_the_kernel_has());
                 continue;
             }
             match zconfig::parse_capability(cap) {
@@ -240,6 +240,33 @@ fn resolve_cap_drops(service_name: &str, caps: &[String]) -> io::Result<Vec<u32>
         }
         Ok(out)
     }
+}
+
+/// Every capability number the running kernel knows, asked of the kernel.
+///
+/// `PR_CAPBSET_READ` answers 1 or 0 for a number the kernel has and
+/// `EINVAL` for the first it does not, so walking up from zero stops exactly
+/// at the end of the kernel's own set — no `/proc`, no second table to keep
+/// in sync with the first.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn every_capability_the_kernel_has() -> Vec<u32> {
+    // `PR_CAPBSET_READ` is 23 (linux/prctl.h); spelled here so a missing
+    // binding cannot silently become a different call.
+    const PR_CAPBSET_READ: libc::c_int = 23;
+    let mut out = Vec::new();
+    for n in 0..=63u32 {
+        // SAFETY: `prctl` takes integers here and retains nothing.
+        if unsafe { libc::prctl(PR_CAPBSET_READ, n as libc::c_ulong, 0, 0, 0) } < 0 {
+            break;
+        }
+        out.push(n);
+    }
+    if out.is_empty() {
+        // A kernel that refuses even to read its own set: fall back to the
+        // table, which is the best knowledge this build has.
+        out.extend(0..=zconfig::MAX_CAPABILITY);
+    }
+    out
 }
 
 /// Assemble the seccomp filter for one spawn (Linux).
@@ -793,11 +820,17 @@ fn child_main(p: ChildPlan) -> ! {
     if !child_step_mount(p.private_tmp) {
         child_fail(p.exec_w, CHILD_STEP_MOUNT);
     }
-    if !child_step_ids(p) {
-        child_fail(p.exec_w, CHILD_STEP_IDS);
-    }
+    // The bounding set first, and that order is not cosmetic: dropping a
+    // capability from it needs `CAP_SETPCAP`, which a `user =` service has
+    // already thrown away by the time the uid drop returns. A service with
+    // both directives could therefore never start ("exec failed at capdrop:
+    // errno 1") — a combination the converter emits for any dinit service
+    // that had both `run-as` and `capabilities`.
     if !child_step_capdrop(p) {
         child_fail(p.exec_w, CHILD_STEP_CAPDROP);
+    }
+    if !child_step_ids(p) {
+        child_fail(p.exec_w, CHILD_STEP_IDS);
     }
     // NNP only after a real drop: without one it would neuter setuid for
     // the whole subtree (live: every ssh session lost `doas`, with no way
@@ -1328,6 +1361,8 @@ fn child_step_capdrop(p: ChildPlan) -> bool {
     {
         // `PR_CAPBSET_DROP` is 24 (linux/prctl.h); defined here so a missing
         // binding is impossible by construction, like the seccomp constants.
+        // It needs `CAP_SETPCAP`, which is why this step runs before the id
+        // drop rather than after it.
         const PR_CAPBSET_DROP: libc::c_int = 24;
         for i in 0..p.cap_len {
             // SAFETY: `cap_drops` points at `cap_len` parent-prepared numbers;
@@ -1681,9 +1716,18 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn dropping_all_capabilities_covers_the_whole_table() {
         let caps = resolve_cap_drops("probe", &[String::from("all")]).expect("resolves");
-        assert_eq!(caps.len(), zconfig::MAX_CAPABILITY as usize + 1);
+        // Contiguous from zero, and at least as far as the table: the exact
+        // end is the running kernel's business, which is the point.
         assert_eq!(caps.first(), Some(&0));
-        assert_eq!(caps.last(), Some(&zconfig::MAX_CAPABILITY));
+        assert_eq!(
+            caps,
+            (0..caps.len() as u32).collect::<Vec<u32>>(),
+            "the set must be contiguous from zero"
+        );
+        assert!(
+            caps.len() > zconfig::MAX_CAPABILITY as usize,
+            "asked the table instead of the kernel: {caps:?}"
+        );
         // A named drop still resolves to one number, and an unknown name is
         // still a refusal: `all` must not have loosened either.
         assert_eq!(

@@ -1325,7 +1325,7 @@ pub const MAX_CAPABILITY: u32 = 40;
 pub fn parse_capability(input: &str) -> Option<u32> {
     let lower = input.to_ascii_lowercase();
     let name = lower.strip_prefix("cap_").unwrap_or(&lower);
-    // The full set through CAP_CHECKPOINT_RESTORE (39). A name outside it is
+    // The full set through CAP_CHECKPOINT_RESTORE (40). A name outside it is
     // either a typo or a kernel newer than this table, and both are refusals
     // upstream — never a silently skipped drop.
     Some(match name {

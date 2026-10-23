@@ -141,6 +141,10 @@ impl Sup {
             .arg(&scratch.dir)
             .env("ZINIT_SOCKET", scratch.sock())
             .env("ZINIT_STATE_DIR", scratch.statedir())
+            // The suite runs from `target/`, which is neither an install
+            // directory nor root-owned: the supervisor's own directory is a
+            // trust root only behind this switch, so the tests turn it on.
+            .env("ZINIT_TRUST_SELF_DIR", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(log))

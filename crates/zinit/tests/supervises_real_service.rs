@@ -370,6 +370,10 @@ fn sup_command(scratch: &Scratch) -> Command {
     // the machine is a race nobody wants to debug.
     cmd.env("ZINIT_SOCKET", scratch.at("ctl"));
     cmd.env("ZINIT_STATE_DIR", scratch.at("state"));
+    // The suite runs from `target/`, which is neither an install directory
+    // nor root-owned: the supervisor's own directory is a trust root only
+    // behind this switch, so the tests turn it on.
+    cmd.env("ZINIT_TRUST_SELF_DIR", "1");
     cmd
 }
 

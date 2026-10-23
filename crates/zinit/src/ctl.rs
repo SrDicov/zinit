@@ -249,10 +249,24 @@ pub fn authorize(
         // and the supervisor announces the weaker check at startup.
         None => !cfg!(any(target_os = "linux", target_os = "android")),
         Some(exe) => {
-            let name = exe.file_name().map(|n| n.to_string_lossy().into_owned());
-            matches!(name.as_deref(), Some("zctl") | Some("zinit")) && trusted_executable(exe)
+            matches!(
+                executable_name(exe).as_deref(),
+                Some("zctl") | Some("zinit")
+            ) && trusted_executable(exe)
         }
     }
+}
+
+/// The file name of the executable the kernel resolved, without the marker a
+/// replaced binary carries.
+///
+/// A package upgrade unlinks the old inode while the running process keeps
+/// it, and `/proc/<pid>/exe` then reads `/usr/bin/zinit (deleted)`. That is
+/// still the init this machine booted: refusing the name would mean the
+/// machine cannot power off after any upgrade of itself.
+fn executable_name(exe: &Path) -> Option<String> {
+    let name = exe.file_name()?.to_string_lossy().into_owned();
+    Some(name.strip_suffix(" (deleted)").unwrap_or(&name).to_string())
 }
 
 /// Whether a peer executable sits where a `zctl`/`zinit` is installed.
@@ -277,6 +291,16 @@ fn trusted_executable(exe: &Path) -> bool {
     };
     if SYSTEM.iter().any(|d| dir == Path::new(d)) {
         return true;
+    }
+    // The supervisor's own directory is a trust root only when the operator
+    // says so. Trusting it by default was a hole: if the supervisor runs from
+    // a build tree, `/tmp`, or an initramfs (where its directory is `/`), then
+    // the one process the check exists to constrain — the owner of the
+    // account — can drop a file called `zctl` there and get the power verbs.
+    // `ZINIT_TRUST_SELF_DIR=1` covers a development install and the test
+    // suite, which run from `target/`; production uses the install dirs.
+    if std::env::var_os("ZINIT_TRUST_SELF_DIR").is_none() {
+        return false;
     }
     std::env::current_exe()
         .ok()
@@ -953,6 +977,18 @@ mod tests {
                 VerbClass::Power
             ),
             "an installed zctl is a client"
+        );
+        // A package upgrade unlinks the old binary; the running process keeps
+        // the inode and `/proc/<pid>/exe` says "(deleted)". Refusing that name
+        // would mean an upgraded machine could not power itself off.
+        assert!(
+            authorize(
+                Some(&owner),
+                Some(Path::new("/usr/bin/zinit (deleted)")),
+                1000,
+                VerbClass::Power
+            ),
+            "the running binary keeps its name after an upgrade"
         );
     }
 
