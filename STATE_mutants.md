@@ -58,3 +58,59 @@ dentro del userns en las tres variantes probadas
 `/proc/self/setgroups` en `deny`). Sin CAP_SETGID en el ns padre no hay
 forma de habilitarlo, así que el orden `capdrop` antes de `ids` sólo se
 puede verificar con root real.
+
+## Sesión 3 — T0 cerrado con evidencia y runs paralelos
+
+### ¿Reboot del host? No.
+
+`uptime -s` → `2026-10-22 19:54:56`, sesión de trabajo a las 04:29 del 23
+(8h34m de uptime). `last reboot` sólo muestra julio. **El host no se
+reinició**: lo que murió fue el servidor de la sesión de opencode, y el run
+colgaba de su árbol. tmux con `SID` propio lo resuelve y basta. No se usó
+cron: no hay reboot que sobrevivir.
+
+### Paralelo, no en serie
+
+Dos sesiones tmux, cada una con su `CARGO_TARGET_DIR` (el lock de `target/`
+era la única razón para serializar) y `-j 2`.
+
+```sh
+tmux new-session -d -s mut-zconfig  'cd /home/dicov/zinit && CARGO_TARGET_DIR=/tmp/mut-target-zconfig  cargo mutants -p zconfig  --timeout 30 --no-shuffle -j 2 > /tmp/opencode/mut-zconfig-full.log  2>&1; echo EXIT=$? >> /tmp/opencode/mut-zconfig-full.log'
+tmux new-session -d -s mut-zservice 'cd /home/dicov/zinit && CARGO_TARGET_DIR=/tmp/mut-target-zservice cargo mutants -p zservice --timeout 30 --no-shuffle -j 2 > /tmp/opencode/mut-zservice-full.log 2>&1; echo EXIT=$? >> /tmp/opencode/mut-zservice-full.log'
+```
+
+Ritmo medido (zservice): **103 evaluados en ~6 min** → 657 en ~40 min.
+Frente a las 11-13 h del run en serie con `--jobs` por defecto.
+
+`pkill -f "cargo mutants"` **se mata a sí mismo** (su propia línea de órdenes
+contiene el patrón) y tumbó el relanzamiento una vez. Para parar un run:
+`tmux kill-session -t mut-zconfig`.
+
+### Parseo y criterio
+
+```sh
+grep -m1 'mutants to test' /tmp/opencode/mut-<crate>-full.log
+grep -cE '^(MISSED|CAUGHT|TIMEOUT|UNVIABLE)' /tmp/opencode/mut-<crate>-full.log
+grep -c '^MISSED' /tmp/opencode/mut-<crate>-full.log
+grep '^MISSED' /tmp/opencode/mut-<crate>-full.log | sed 's/ in .*//'
+```
+
+### Siguiente trabajo (T1) — `ready.rs`, 46 missed ya listados
+
+Todos con `0s build + 0s test`: son funciones puras, se matan con `#[test]`
+normales. Los grupos, por línea del log:
+
+- `drain_notify` (238/229/234/253/262/265): guardas `Interrupted`/`WouldBlock`,
+  cotas del buffer, `+=` y negaciones. Un test por rama con un pipe real
+  (`pipe2`) y EOF/partial reads.
+- `poll_readable` (428/430/438/440/445): `Ok(true)`/`Ok(false)` fijos, `|`
+  contra `&`/`^` en las flags, `<` en el retorno de `poll`.
+- `new_probe_socket` (480/484/494/495) y `probe_tcp_connect` (565/567):
+  flags de socket y `SO_ERROR`.
+- `ReadyWait::check` (189) y `run_check_child` (356/357/361): cota de tiempo y
+  `waitpid` con `WNOHANG`.
+- `PollNeed::is_idle` (79) y `EnvBlock::as_ptrs` (417): dos ramas triviales.
+
+Criterio de T1: `cargo mutants -p zservice --file crates/zservice/src/ready.rs
+--timeout 30` → 0 missed, o cada superviviente con razón de equivalencia en
+`docs/audit/mutants-zservice.md`.
