@@ -824,36 +824,58 @@ fn a_stop_in_progress_does_not_resurrect_a_pending_restart() {
     );
 
     let mut sup = Sup::start(&scratch);
-    let pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
+    let first = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
 
     // Ask for the restart, through the real client: the control socket only
-    // lets a known client (`zctl`) touch the machine, so a test that wrote
-    // raw frames would be refused before it got anywhere.
+    // takes the command, `Desired` is what carries it.
     let out = zctl(&scratch, &["restart", "probe"]);
     assert!(
         out.status.success(),
-        "the restart was refused: {}",
-        String::from_utf8_lossy(&out.stdout)
+        "restart refused: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-
-    // Now the machine starts stopping. The service is still alive (it
-    // ignores SIGTERM), so this is the moment the pending restart and the
-    // stop overlap.
+    // ... and then tell the supervisor the machine is going down.
     signal(sup.pid(), libc::SIGTERM);
 
-    // The service dies (SIGKILL after the stop timeout) and, without the
-    // guard, comes straight back up.
+    // The invariant is convergence, and it is asserted that way on purpose:
+    // the service may legitimately be restarted if it dies *before* the stop
+    // is seen (the restart it was promised was requested while the machine
+    // was still up, and on a platform where the shell dies on the first
+    // `SIGTERM` that is a race the test cannot win). What must never happen
+    // is a restart owed to a machine that is stopping resurrecting the
+    // service *after* the stop was seen: then the state never converges to
+    // down, which is exactly what this waits for and what the missing guard
+    // produced.
+    let converged = |scratch: &Scratch| {
+        let state = scratch.read("state/probe").unwrap_or_default();
+        state.contains("state=Stopped") && state.contains("desired=Down")
+    };
     assert!(
-        wait_until(REAP_DEADLINE_MS, || pid_gone(pid)),
-        "the service never died: the stop did not escalate to SIGKILL\n{}",
+        wait_until(REAP_DEADLINE_MS, || converged(&scratch)),
+        "the machine never converged to a stopped service: {:?}\n{}",
+        scratch.read("state/probe"),
         scratch.tail("sup.log")
     );
-    sleep_ms(1500);
+    assert!(
+        wait_until(REAP_DEADLINE_MS, || pid_gone(first)),
+        "the first instance never died"
+    );
+
+    // And it stays down: a pending restart that fires now would write a new
+    // pid and turn the state back to running.
+    let settled = scratch.pid("svc.pid");
+    sleep_ms(1_500);
     assert_eq!(
         scratch.pid("svc.pid"),
-        Some(pid),
+        settled,
         "the service was restarted while the machine was stopping: the power \
-         epilogue waits for services to stay down, and this one came back"
+         epilogue waits for services to stay down, and this one came back\n{}",
+        scratch.tail("sup.log")
+    );
+    assert!(
+        converged(&scratch),
+        "the service came back after the stop converged: {:?}",
+        scratch.read("state/probe")
     );
     assert!(
         sup.exited().is_none(),
