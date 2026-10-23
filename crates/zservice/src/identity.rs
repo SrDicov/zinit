@@ -608,6 +608,21 @@ mod tests {
     /// twice sharing every fd, so it `_exit`s with the verdict.
     #[test]
     fn dropping_to_our_own_ids_is_either_clean_or_untouched() {
+        // `ZINIT_FLAKE_RUNS=N` hammers the same fork in one process, which is
+        // how a "it failed once on macOS" report becomes a rate instead of an
+        // anecdote. Unset (every CI run) means one iteration, exactly as
+        // before.
+        let runs = std::env::var("ZINIT_FLAKE_RUNS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(1);
+        for _ in 0..runs {
+            self_drop_once();
+        }
+    }
+
+    fn self_drop_once() {
         let (ruid, _, rgid, _) = current_ids();
         // SAFETY: `fork` takes no arguments; the child below `_exit`s with the verdict, never returning to the harness.
         match unsafe { libc::fork() } {
