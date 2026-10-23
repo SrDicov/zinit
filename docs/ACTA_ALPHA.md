@@ -1,13 +1,14 @@
 # Acta de alpha — `v0.2.0-alpha`
 
-Fecha: 2026-10-23. Base verificada: `9f3d017` (`testing`).
+Fecha: 2026-10-23. Base verificada: `d230fbb` (`testing`); el tag apunta al
+commit de este acta, cuyo padre es esa base.
 
 Este acta no repite lo que dicen otros documentos: cada fila apunta a la
 evidencia y dice qué se comprobó **en esta sesión**.
 
 | # | criterio | estado | evidencia |
 |---|---|---|---|
-| 1 | CI verde, salvo `riscv32gc` | en curso (run `39989519802`) | ver §1 |
+| 1 | CI verde, salvo `riscv32gc` | ✅ (run `40002462937`) | ver §1 |
 | 2 | mutantes `zcore` ≤ 20 % | ✅ 15,2 % | `docs/audit/mutants-zcore.md` (31/204) |
 | 3 | `zconfig`/`zservice`: baratos muertos, caros documentados | ✅ | §3, `docs/audit/mutants-{zconfig,zservice}.md` |
 | 4 | SA7: seccomp con argumentos | ✅ | `docs/SECCOMP.md` (`clone` con 7 namespaces, `ioctl(TIOCSTI)`) |
@@ -19,19 +20,29 @@ evidencia y dice qué se comprobó **en esta sesión**.
 
 ## 1. CI
 
-El CI de `574eea5` estaba **rojo** por dos fallos reales, no por flakes:
+El run `40002462937` (commit `d230fbb`) termina con **todos los jobs en
+success salvo `check riscv32gc-unknown-linux-gnu`**, que queda excluido
+porque Rust no tiene target con `std` (issue #19, `blocked-by-upstream`).
+`macos-aarch64` pasa: el run anterior (`39991917913`) fallaba con cuatro
+nombres de test y **tres** causas, todas de plataforma y todas arregladas en
+`d230fbb`:
 
-- `libc::tgkill` no existe en los bindings musl del crate `libc` → todos los
-  targets musl fallaban al compilar los tests. Arreglado en `3d308bd` con
-  `syscall(SYS_tgkill, ...)` (misma entrega dirigida a hilo, un solo camino).
-- `let mut sup` innecesario en `supervises_real_service.rs` → con
-  `-D warnings`, **todos** los targets morían en un lint. Arreglado en
-  `beb1898`.
+- `/bin/true` no existe en Darwin (`/usr/bin/true` sí): el modo `dueping`
+  usaba la ruta literal en vez de `testutil::true_bin()`.
+- Darwin encola exactamente `listen(backlog)`, no `backlog + 1`: el test de
+  backlog lleno con dos conexiones sólo tiene sentido en Linux, y queda
+  gateado con la razón escrita.
+- `net.local.dgram.maxdgram` es 2048 en Darwin: el framing de 4096 bytes no
+  es observable ahí, y el fallback a `/dev/log` disfrazaba el `EMSGSIZE` de
+  `ENOENT`. Gateado a Linux igual que el de backlog.
 
-Medido en local antes de taggear: `cargo test --workspace` verde,
-`cargo clippy --workspace --all-targets -- -D warnings` limpio,
-`cargo fmt --all --check` limpio, y `cargo check --target
-x86_64-unknown-linux-musl -p zservice --tests` compila.
+Los dos fallos de compilación anteriores (`libc::tgkill` ausente en los
+bindings musl, `let mut` que `-D warnings` rechaza) siguen arreglados en
+`3d308bd` y `beb1898`.
+
+Medido en local antes de taggear: `cargo test --workspace` verde (573 tests,
+1 ignorado), `cargo clippy --workspace --all-targets -- -D warnings` limpio,
+`cargo fmt --all --check` limpio.
 
 `riscv32gc-unknown-linux-gnu` sigue excluido: Rust no tiene target con `std`
 (issue #19, `blocked-by-upstream`).

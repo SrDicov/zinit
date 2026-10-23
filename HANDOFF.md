@@ -1,5 +1,21 @@
 # HANDOFF — lo que la siguiente sesión necesita saber
 
+## Post-release: `v0.2.0-alpha` (2026-10-23)
+
+- El release lo publica el workflow `release` al empujar el tag (5 targets musl
+  estáticos + `install.sh` + `.sha256`); no se crea a mano. Las notas humanas
+  se ponen después con `gh release edit v0.2.0-alpha --notes-file RELEASE_NOTES.md`.
+- `main` lleva el merge `--no-ff` de `testing`; el árbol de `main` y `testing`
+  es el mismo.
+- Trabajo post-alpha, por coste (el detalle está en `docs/audit/`):
+  1. `zconfig/value.rs`: tabla de capabilities — 30-45 min, mata 34 mutantes.
+  2. `zconfig/desc.rs` (30-45 min), `graph.rs` (1 h), `plan.rs` (1 h),
+     `parser.rs` (2-3 h).
+  3. `zservice/identity.rs`: extraer `grow_until_cap` — 45 min, mata 10.
+  4. `zservice/service.rs` (3-4 h) y `spawn.rs` (4-6 h con job privilegiado).
+- Beta **no** espera a los mutantes: espera hardware real
+  (`scripts/hw-verification.sh`, soak 24 h, `docs/HW-VERIFICATION.md`).
+
 ## Un commit con cuatro cambios: `573a9e8`
 
 `573a9e8` ("fix(ctl): a zctl where a zctl is installed…") contiene **cuatro
