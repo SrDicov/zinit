@@ -220,6 +220,14 @@ fn resolve_cap_drops(service_name: &str, caps: &[String]) -> io::Result<Vec<u32>
     {
         let mut out = Vec::with_capacity(caps.len());
         for cap in caps {
+            if cap.eq_ignore_ascii_case("all") {
+                // Every number the table knows. A kernel older than the table
+                // answers `EINVAL` for the ones it does not implement, and the
+                // child tolerates that below: a capability the kernel does not
+                // have cannot be retained.
+                out.extend(0..=zconfig::MAX_CAPABILITY);
+                continue;
+            }
             match zconfig::parse_capability(cap) {
                 Some(nr) => out.push(nr),
                 None => {
@@ -1326,7 +1334,14 @@ fn child_step_capdrop(p: ChildPlan) -> bool {
             // the loop bounds the reads. `prctl` retains nothing.
             let cap: u32 = unsafe { *p.cap_drops.add(i) };
             if unsafe { libc::prctl(PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) } != 0 {
-                return false;
+                // `EINVAL` is "this kernel has no capability by that number",
+                // which `all` produces on a kernel older than the name table.
+                // Nothing to drop is the goal already met. `EPERM` (or
+                // anything else) is a real refusal: the bounding set did not
+                // shrink, and the service must not run believing it did.
+                if io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL) {
+                    return false;
+                }
             }
         }
         true
@@ -1657,6 +1672,25 @@ mod tests {
             order_up: vec![0],
             order_down: vec![0],
         }
+    }
+
+    /// `all` expands to every number the name table knows, so the child drops
+    /// the whole bounding set instead of a hand-written list that a kernel
+    /// upgrade would silently outgrow.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn dropping_all_capabilities_covers_the_whole_table() {
+        let caps = resolve_cap_drops("probe", &[String::from("all")]).expect("resolves");
+        assert_eq!(caps.len(), zconfig::MAX_CAPABILITY as usize + 1);
+        assert_eq!(caps.first(), Some(&0));
+        assert_eq!(caps.last(), Some(&zconfig::MAX_CAPABILITY));
+        // A named drop still resolves to one number, and an unknown name is
+        // still a refusal: `all` must not have loosened either.
+        assert_eq!(
+            resolve_cap_drops("probe", &[String::from("sys_admin")]).expect("resolves"),
+            vec![21]
+        );
+        assert!(resolve_cap_drops("probe", &[String::from("nope")]).is_err());
     }
 
     fn process_plan(name: &str) -> Plan {

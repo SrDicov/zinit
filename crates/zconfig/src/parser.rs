@@ -801,11 +801,21 @@ pub fn parse_service_with_diagnostics(name: &str, text: &str) -> Result<ParsedSe
             Directive::DropCapabilities => {
                 let mut caps = Vec::new();
                 for word in value.split_whitespace() {
+                    if word.eq_ignore_ascii_case("all") {
+                        // "Drop everything" is one concept, not a list: it is
+                        // the only spelling that stays correct when the kernel
+                        // grows a capability, and writing 41 names by hand is
+                        // how one gets forgotten. Anything alongside it is
+                        // subsumed, so the canonical form is just `all`.
+                        caps.clear();
+                        caps.push(String::from("all"));
+                        break;
+                    }
                     if parse_capability(word).is_none() {
                         return Err(bad_value(
                             directive,
                             value_span,
-                            "write Linux capability names; `CAP_` prefix and case are ignored",
+                            "write Linux capability names or `all`; `CAP_` prefix and case are ignored",
                         ));
                     }
                     // Canonical spelling (lowercase, no prefix), so
@@ -3587,6 +3597,26 @@ mod lifecycle_directive_tests {
         assert_eq!(
             d.syscall_allow,
             vec![String::from("read"), String::from("write")]
+        );
+    }
+
+    /// `all` is a keyword, not a capability name, and it subsumes anything
+    /// written beside it.
+    #[test]
+    fn drop_every_capability_is_one_word() {
+        let base = "command = /bin/x\n";
+        assert_eq!(
+            parsed(&format!("{base}drop-capabilities = all\n")).drop_caps,
+            vec![String::from("all")]
+        );
+        assert_eq!(
+            parsed(&format!("{base}drop-capabilities = ALL\n")).drop_caps,
+            vec![String::from("all")]
+        );
+        assert_eq!(
+            parsed(&format!("{base}drop-capabilities = all sys_admin\n")).drop_caps,
+            vec![String::from("all")],
+            "`all` subsumes the names next to it"
         );
     }
 
