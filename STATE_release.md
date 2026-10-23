@@ -1,130 +1,51 @@
-# STATE — cierre de alpha (para sesión nueva)
+# STATE — cierre de alpha (`v0.2.0-alpha`)
 
-Leer esto y `STATE_alpha.md` antes de tocar nada. No re-explorar.
+Actualizado: 2026-10-23, sesión de cierre. Rama de trabajo:
+`agent/overnight-20261022-0332`; `testing` remoto = `9f3d017`.
 
-## Punto de partida verificado
+## Hecho en esta sesión
 
-```sh
-cargo test -p zservice --lib                 # 93 passed
-grep '^MISSED' /tmp/opencode/mut-ready2.log | wc -l  # 25
-git log --oneline -1                          # 7f2ebba o posterior
-git status --short                            # limpio
-```
-
-| archivo | missed | notas |
+| paso | commit | qué |
 |---|---|---|
-| `crates/zservice/src/ready.rs` | **0 libres** | cerrado en `6585c32`: 0 timeout, 12 MISSED con `// equivalent` razonado |
-| `crates/zservice/src/log.rs` | **0 libres** | cerrado en `aa31e1e`: 0 timeout, 5 MISSED equivalentes razonados. OJO: el subagente necesitó `RUST_TEST_THREADS=1` (flake de fd 0 en paralelo, 4/15) — ver SPEC_T1_B18 |
-| `crates/zservice/src/identity.rs` | **11, todos documentados** | `9a8322a`: 1 matado, 10 ERANGE + 1 carrera sin camino de test (ver doc) |
-| **baratos** | **0** | ready 0, log 0, identity 11 (todos con causa verificada). T1 CERRADO |
-| `crates/zconfig/*` | 116 | documentar, no matar |
-| `crates/zservice/src/spawn.rs` | 152 | root-gated + documentar |
-| `crates/zservice/src/service.rs` | 27 | documentar |
+| T2 | `79a3fca` | `child_step_drop_ids_as_root` (`#[ignore]`, root real) |
+| T2 | `852d3ec` | `docs/audit/mutants-{zconfig,zservice}.md`: los 268, por archivo, con coste |
+| CI | `3d308bd` | `tgkill` por `syscall(SYS_tgkill)` (musl no lo declara en el crate) |
+| CI | `beb1898` | `mut` innecesario que `-D warnings` rechazaba en toda la matriz |
+| T4 | `9f3d017` | versión `0.2.0-alpha` (workspace + `zinit` + lock) |
+| T3 | sin commit | `docs/ACTA_ALPHA.md` (criterio 1 pendiente del CI) |
+| T7 | sin commit | `README.md` (badge + estado), `CHANGELOG.md` (`v0.2.0-alpha`), `RELEASE_NOTES.md` |
 
-## Criterio de tag (no es 0 % missed)
+Local: `cargo test --workspace` 573 tests, 0 fallos, 1 ignorado;
+`clippy -D warnings` y `fmt --check` limpios; `check --target musl` OK.
 
-Tag **sólo** si: 0 baratos libres, 268 caros
-documentados con causa, los 9 criterios de `STATE_alpha.md` verdes, CI verde
-salvo `riscv32gc`, y el release de GitHub creado. **Tag sin release = no tag.**
+## Punto exacto
 
-## T1 — los 75, en batches de 10-12
+Esperando el run `39989519802` (`ci`) de `9f3d017`. **12 jobs en failure**
+(msrv, aarch64-glibc, macos, x86_64-{glibc,musl}, i686-musl, aarch64-musl,
+nightly, drivers, riscv32gc) y el run sigue en progreso: `gh` no da los logs
+hasta que termina. `alpine-e2e`, `fuzz`, `property-tests` y
+`security-advisories`: **success**.
 
-Ritmo medido: 15 muertos por 3 comandos. Plantilla por batch:
+Si el fallo es real y compartido por todos los que ejecutan tests, hay que
+leer el log de `x86_64-musl` y arreglarlo antes de nada. Si es de
+infraestructura (drivers/cross), anotarlo y no taggear hasta verde.
 
-1. `cargo mutants -p zservice --file crates/zservice/src/<f>.rs --list`
-2. Leer las líneas de cada mutante, escribir un test por frontera
-   (un test suele matar 2-3 mutantes del mismo `&&`/`<`/`+=`).
-3. Verificar por mutación — no hay `--mutant` en esta versión:
+## Después, en orden
 
-```sh
-F=crates/zservice/src/ready.rs; cp $F /tmp/opencode/bak
-python3 -c "import sys;p='$F';t=open(p).read();open(p,'w').write(t.replace(sys.argv[1],sys.argv[2],1))" 'OLD' 'NEW'
-cargo test -q -p zservice --lib <filtro>   # DEBE fallar
-cp /tmp/opencode/bak $F
-```
+1. Leer logs del run `39989519802`; arreglar lo real; esperar verde.
+2. Cerrar el criterio 1 del acta (run id + estado).
+3. Tag `v0.2.0-alpha` + push **del tag** → el workflow `release` publica
+   5 targets musl estáticos + `install.sh` + `.sha256`. **No** `gh release
+   create` a mano: el workflow ya lo crea con `--generate-notes`; después
+   `gh release edit v0.2.0-alpha --notes-file RELEASE_NOTES.md`.
+4. Merge `--no-ff` a `main` + push; verificar CI de `main`.
+5. `HANDOFF.md` post-release y `STATE_final.md`.
+6. T8: `git diff main testing --stat` vacío, `gh release view`, runs de `main`.
 
-4. Commit: `test(<archivo>): kill N mutants in <archivo>`.
+## Trampas ya pagadas
 
-Pendientes concretos ya vistos en `ready.rs`: `drain_notify` 234/238/239/262/265
-(timeouts: `EINTR`/`WouldBlock` piden forzar la señal; si no sale en 30 min,
-`#[ignore]` con motivo), `poll_readable` 438/440/445, `probe_tcp_connect`
-565/567 (`SO_ERROR`), `run_check_child` 356/357/361 (fd leaks: contar
-`/proc/self/fd` antes y después del fork).
-
-## T2 — documentar, no matar
-
-- `docs/audit/mutants-zconfig.md`: por archivo, cada MISSED con causa
-  (parsing de valores, grafo, plan) y coste post-alpha.
-- `docs/audit/mutants-zservice.md`: `spawn.rs` (152) con la cobertura userns ya
-  probada + lo que pide root; `service.rs` (27) clasificado.
-- Test root-gated del paso de ids:
-
-```rust
-#[test]
-#[ignore = "setgroups is denied inside a user namespace; needs real root"]
-fn child_step_drop_ids_as_root() { /* user = nobody + drop-capabilities = all */ }
-```
-
-## T3-T6 — tag, merge, release
-
-```sh
-# 1. versión
-grep '^version' Cargo.toml            # 0.1.0 -> 0.2.0-alpha en los 6 crates + workspace
-
-# 2. tag (tras CI verde)
-git tag -a v0.2.0-alpha -m "v0.2.0-alpha: usable con limitaciones documentadas"
-git push origin testing --tags
-
-# 3. merge a main (--no-ff, historia intacta)
-git checkout main && git pull --ff-only && git merge --no-ff testing -m "release: v0.2.0-alpha"
-git push origin main
-
-# 4. binarios
-cargo build --release                       # nativo; musl si hay target instalado
-cargo build --release --target x86_64-unknown-linux-musl
-sha256sum target/release/zinit target/release/zctl > SHA256SUMS
-stat -c '%s %n' target/release/zinit        # ≤ 1 MiB, presupuesto del proyecto
-
-# 5. release
-gh release create v0.2.0-alpha --title "v0.2.0-alpha" \
-  --notes-file RELEASE_NOTES.md \
-  target/release/zinit target/release/zctl SHA256SUMS
-```
-
-`RELEASE_NOTES.md`: qué es, estado alpha con enlace a `KNOWN_ISSUES.md`,
-instalación, migración (`MIGRATING.md`), "verificado en VM y contenedores;
-hardware real pendiente de soak", y cómo reportar.
-
-## T7 — docs
-
-`README.md` (badge + estado alpha + instalación), `CHANGELOG.md` (sección
-`v0.2.0-alpha`: seccomp con argumentos, power verbs autorizados, señales BSD,
-capdrop antes del uid, private-tmp en tres dirs, generador de capabilities,
-mutantes zcore 15,2 % y 17 baratos muertos), `HANDOFF.md` (post-alpha, beta
-espera hardware).
-
-## Lo que NO se hace aquí
-
-- 0 % de missed: es release, no alpha.
-- Tocar `spawn.rs` sin root real (el test userns ya cubre capdrop y filtro).
-- `git add -A`, `git add .`, `git commit -a`.
-
-## Bitácora (modo dispatcher, sesión de cierre)
-
-| SPEC | estado | commit | resultado |
-|---|---|---|---|
-| T1-B12 | SUCCESS | `10ea488` | 5 timeouts de `drain_notify` muertos (sentinel + EINTR/WouldBlock reales) |
-| T1-B13 | SUCCESS | `1470377` | 11 de 24 matados; 12 equivalentes razonados |
-| T1-B14 | SUCCESS | `6585c32` | `ready.rs` cerrado: 0 timeout, 12 MISSED con `// equivalent` |
-| T1-B15 | SUCCESS | `7b688d5` | 22 de 31 matados en `log.rs` |
-| T1-B16 | SUCCESS | `aa31e1e` | `log.rs` cerrado: 0 timeout, 5 equivalentes |
-| (flaky) | FIX | `0796e6b` | fd-0: mutex no bastaba (3/20 fallos) → fork aislado, **0/40** |
-| T1-B17 | SUCCESS | `9a8322a` | identity: 1 matado, 10 documentados (ERANGE + carrera `AlreadyExists`) |
-
-Base actual: `cargo test -p zservice --lib` → **124 passed**, clippy 0, fmt limpio.
-
-Siguiente: **T2** — documentar los caros (zconfig 116, spawn 152, service 27) en
-`docs/audit/`. Después T3 (acta), y sólo entonces T4-T6 seguidos.
-
-T1 cerrado: 0 baratos libres. Los 11 de identity tienen causa escrita, no
-"pendiente".
+- `git push origin testing` empuja la **ref local `testing`**, no HEAD: con
+  la sesión en otra rama, el push "OK" no movió nada. Usar
+  `git branch -f testing HEAD && git push origin testing`.
+- El CI compila tests con `-D warnings`: un `mut` de más tumba 20 jobs.
+- El release no se crea a mano si el workflow `release` ya corre con el tag.
