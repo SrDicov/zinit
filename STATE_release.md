@@ -6,24 +6,24 @@ Leer esto y `STATE_alpha.md` antes de tocar nada. No re-explorar.
 
 ```sh
 cargo test -p zservice --lib                 # 93 passed
-grep '^MISSED' /tmp/opencode/mut-ready.log | wc -l   # 31
+grep '^MISSED' /tmp/opencode/mut-ready2.log | wc -l  # 25
 git log --oneline -1                          # 7f2ebba o posterior
 git status --short                            # limpio
 ```
 
 | archivo | missed | notas |
 |---|---|---|
-| `crates/zservice/src/ready.rs` | 31 | 16 matados esta sesión |
+| `crates/zservice/src/ready.rs` | **25** | 22 matados en total (medido: 101 mutantes, 25 missed, 67 caught, 5 timeouts) |
 | `crates/zservice/src/log.rs` | 34 | sin tocar |
 | `crates/zservice/src/identity.rs` | 10 | sin tocar |
-| **baratos** | **75** | |
+| **baratos** | **69** | 25 + 34 + 10, medidos |
 | `crates/zconfig/*` | 116 | documentar, no matar |
 | `crates/zservice/src/spawn.rs` | 152 | root-gated + documentar |
 | `crates/zservice/src/service.rs` | 27 | documentar |
 
 ## Criterio de tag (no es 0 % missed)
 
-Tag **sólo** si: 75 baratos muertos o equivalentes documentados, 268 caros
+Tag **sólo** si: 69 baratos muertos o equivalentes documentados, 268 caros
 documentados con causa, los 9 criterios de `STATE_alpha.md` verdes, CI verde
 salvo `riscv32gc`, y el release de GitHub creado. **Tag sin release = no tag.**
 

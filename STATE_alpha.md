@@ -17,7 +17,7 @@
 Matar los mutantes **críticos** de `zconfig` y `zservice` (no hace falta 0 %).
 Orden por coste, ya medido:
 
-1. `zservice/ready.rs` 47 y `log.rs` 34 — unitarios, sin root. **Empezar aquí.**
+1. `zservice/ready.rs` **25** y `log.rs` 34 — unitarios, sin root. **Empezar aquí.**
 2. `zservice/identity.rs` 10, `service.rs` 27 — unitario/integración.
 3. `zconfig/value.rs` 48, `parser.rs` 23, `graph.rs` 21, `desc.rs` 12, `plan.rs` 12.
 4. `zservice/spawn.rs` 152 — sólo con root (job privilegiado), salvo lo cubierto
