@@ -596,6 +596,8 @@ fn probe_tcp_connect(fd: RawFd, port: u16) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     fn tcp_closed_port() -> u16 {
         let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -737,9 +739,6 @@ mod tests {
         let _ = zrt::sys::close(w);
     }
 
-    /// A line split across two polls still parses as one line: the trailing
-    /// partial stays buffered instead of tripping the legacy rule.
-    #[test]
     /// A CRLF line is a framed line, not an unknown one: stripping the `\r` is
     /// what keeps `WATCHDOG=1\r\n` a check-in instead of a readiness byte.
     #[test]
@@ -1028,5 +1027,89 @@ mod tests {
             next_due_ms: 5_000,
         };
         assert!(!w.check(0).expect("not due"));
+    }
+
+    /// At the 5s deadline, crash instead of hanging: the mutants that turn an
+    /// error branch back into a retry loop (`Interrupted`/`WouldBlock` asked,
+    /// any error given) never return, so only an explicit crash fails their
+    /// run inside the mutator's budget. A correct drain returns in
+    /// microseconds; these tests wait at most ~1.5s on their own timers.
+    fn hang_sentinel() -> (&'static AtomicBool, std::thread::JoinHandle<()>) {
+        let done: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let guard = std::thread::spawn(move || {
+            for _ in 0..50 {
+                if done.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            // crashes the whole test binary: that is the point — a hung mutant
+            // must fail fast, and the sentinel only fires on a hang.
+            std::process::abort()
+        });
+        (done, guard)
+    }
+
+    /// An empty-but-open nonblocking pipe answers `WouldBlock`, which is
+    /// "nothing yet", not an error: `(false, false)` and the caller keeps its
+    /// state. Without the sentinel's crash a mutated error branch would spin
+    /// on `EAGAIN` forever.
+    #[test]
+    fn drain_notify_returns_wouldblock() {
+        let (r, w) = zrt::sys::pipe2(true).expect("pipe");
+        zrt::sys::set_nonblocking(r, true).expect("nonblock");
+        let mut pending = Vec::new();
+        let (done, guard) = hang_sentinel();
+        let drained = drain_notify(r, &mut pending);
+        done.store(true, Ordering::Relaxed);
+        guard.join().expect("sentinel finishes");
+        assert!(
+            matches!(drained, Ok((false, false))),
+            "WouldBlock is 'nothing yet'"
+        );
+        let _ = zrt::sys::close(r);
+        let _ = zrt::sys::close(w);
+    }
+
+    /// `EINTR` mid-read must retry, not surface: `alarm(1)` lands while the
+    /// read is parked on a *blocking* pipe, and the writer only speaks after
+    /// the signal, so both the `Interrupted => continue` retry and the next
+    /// read are exercised. The payload leads with an empty line (`rel = 0` in
+    /// the parse loop), which is what makes additive-arithmetic mutants off
+    /// the `start +=` line fail instead of passing.
+    #[test]
+    fn drain_notify_retries_on_eintr() {
+        unsafe extern "C" fn on_sigalrm(_: libc::c_int) {}
+        let (r, w) = zrt::sys::pipe2(true).expect("pipe");
+        let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+        action.sa_sigaction = on_sigalrm as *const () as usize;
+        // No SA_RESTART: the parked read() must wake up with EINTR.
+        action.sa_flags = 0;
+        let mut old: libc::sigaction = unsafe { core::mem::zeroed() };
+        // SAFETY: registering this test's own no-op handler for SIGALRM while
+        // its alarm is pending; the previous action is restored at the end.
+        // Nothing else in the test binary arms SIGALRM.
+        let rc = unsafe { libc::sigaction(libc::SIGALRM, &raw const action, &raw mut old) };
+        assert_eq!(rc, 0, "sigaction(SIGALRM) runs");
+        unsafe { libc::alarm(1) };
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            zrt::sys::write(w, b"\nREADY=1\n").expect("notify");
+        });
+        let mut pending = Vec::new();
+        let (done, guard) = hang_sentinel();
+        let drained = drain_notify(r, &mut pending);
+        done.store(true, Ordering::Relaxed);
+        guard.join().expect("sentinel finishes");
+        writer.join().expect("writer finishes");
+        assert!(
+            matches!(drained, Ok((true, false))),
+            "EINTR must retry the read, not surface"
+        );
+        unsafe { libc::alarm(0) };
+        // SAFETY: `old` came from the registering `sigaction` above and the
+        // alarm is disarmed before it is restored.
+        unsafe { libc::sigaction(libc::SIGALRM, &raw const old, std::ptr::null_mut()) };
+        let _ = zrt::sys::close(r);
     }
 }
