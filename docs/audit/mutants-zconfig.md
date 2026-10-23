@@ -1,56 +1,35 @@
-# Mutantes de `zconfig` — tasa completa (2026-10-23)
+# Mutantes de `zconfig` — los 116, documentados por archivo
 
 ```
 cargo mutants -p zconfig --timeout 30 --no-shuffle -j 2
 776 mutants tested in 33m: 116 missed, 607 caught, 41 unviable, 12 timeouts
 ```
 
-**Tasa de supervivencia: 116/776 = 14,9 %.** La tasa completa está medida; es
-la primera mitad del criterio 3 de alpha y la única que se puede afirmar sin
-haber matado nada todavía.
+**Tasa: 116/776 = 14,9 %.** Medida completa, no una muestra.
 
-## Desglose por archivo
+| archivo | missed | qué muta | razón para no matarlo en alpha | post-alpha |
+|---|---|---|---|---|
+| `value.rs` | 48 | 34 brazos de `parse_capability` (nombre → bit), texto de `ValueError`, dos `From<RestartSpec>` con `Default` | es una tabla de datos: el test que la cubre recorre los 41 nombres, no 41 casos sueltos | 30-45 min |
+| `parser.rs` | 23 (+8 timeouts) | límites de longitud y línea en `parse_service_with_diagnostics`, spans de `split_list_spans`, booleanos de `parse_depends`, índices de `quote`, `unknown_key_error` | grammar y spans: matarlos exige un corpus de ficheros inválidos con span esperado y casos de borde de índice | 2-3 h |
+| `graph.rs` | 21 (+2 timeouts) | `Display`/`span` de `GraphError`, texto de `render_cycle`, `is_empty`, umbrales de `suggest` | diagnósticos (comparar strings exactos) y heurística de sugerencia (tabla de nombres parecidos) | 1 h |
+| `desc.rs` | 12 | 10 en `overlay_onto` (precedencia "lo explícito gana"), 2 en `budget`/`restart_policy` devolviendo `Default` | unitario puro, pero exige pares base+drop-in construidos a mano | 30-45 min |
+| `plan.rs` | 12 (+2 timeouts) | DFS de `find_cycle`, `check_order_acyclic`, `service_plan` | grafos con ciclo y orden explícito construidos en el test | 1 h |
 
-| archivo | MISSED |
-|---|---|
-| `crates/zconfig/src/value.rs` | 48 |
-| `crates/zconfig/src/parser.rs` | 23 |
-| `crates/zconfig/src/graph.rs` | 21 |
-| `crates/zconfig/src/desc.rs` | 12 |
-| `crates/zconfig/src/plan.rs` | 12 |
+Los cinco son camino crítico: `value.rs` y `parser.rs` deciden qué significa un
+fichero, `graph.rs` el orden, `desc.rs` y `plan.rs` qué se ejecuta. El coste es
+el único motivo para dejarlos en esta fase; el más barato (la tabla de
+capabilities) es el primer candidato post-alpha.
 
-Los cinco son camino crítico: `value.rs` y `parser.rs` deciden qué significa
-un fichero, `graph.rs` decide el orden, `desc.rs` y `plan.rs` deciden qué se
-ejecuta. No hay cosméticos aquí.
+## Timeouts (12)
 
-## Timeouts (12) — sospechosos por definición
+Un timeout con el mutante aplicado es un test que espera algo que el mutante
+rompió, no un flake. Los 12 caen en cuatro bucles de índice que, mutados, dejan
+de avanzar: `graph.rs:603 lookup`, `parser.rs:1212/1223 substitute_instance`,
+`parser.rs:1271/1272 comment_offset`, `plan.rs:465/466 check_order_acyclic`. Se
+resuelven en el mismo lote que su archivo, no en un trabajo aparte.
 
-Un timeout con `--timeout 30` significa que el test **no termina** con el
-mutante aplicado. Eso no es "el mutante es equivalente": es un test que espera
-un resultado que el mutante impide. Hay que mirarlos uno a uno antes de
-llamarlos flake.
+## Criterio de alpha en este crate
 
-```
-crates/zconfig/src/graph.rs:603:5 — replace lookup -> Option<Idx> with None
-crates/zconfig/src/graph.rs:603:5 — replace lookup -> Option<Idx> with Some(Default::default())
-crates/zconfig/src/parser.rs:1212:32 — replace + with -
-crates/zconfig/src/parser.rs:1212:32 — replace + with *
-crates/zconfig/src/parser.rs:1223:32 — replace + with -
-crates/zconfig/src/parser.rs:1223:32 — replace + with *
-crates/zconfig/src/parser.rs:1271:36 — replace + with *
-crates/zconfig/src/parser.rs:1272:23 — replace += with -=
-```
-
-## Lo que falta para cerrar el criterio 3 en este crate
-
-1. Un test de regresión por MISSED en `value.rs` (48) y `parser.rs` (23).
-2. Lo mismo en `graph.rs` (21), `desc.rs` (12), `plan.rs` (12).
-3. Aquellos que resulten **equivalentes** (dos formas del mismo cálculo) van a
-   exclusión en `Cargo.toml`/`.cargo-mutants.toml` con el motivo escrito.
-4. Los 12 timeouts, resueltos o justificados con la traza.
-
-Comando de trabajo, un archivo cada vez:
-
-```sh
-cargo mutants -p zconfig --file crates/zconfig/src/value.rs --timeout 30
-```
+Medido (hecho) + caros documentados con causa (arriba). No hay baratos aquí:
+el mínimo son 30-45 min. Ningún mutante se declara equivalente sin prueba;
+"equivalente" sin prueba es una excusa.

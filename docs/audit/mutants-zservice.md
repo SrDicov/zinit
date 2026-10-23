@@ -1,98 +1,71 @@
-# Mutantes de `zservice` — tasa completa (2026-10-23)
+# Mutantes de `zservice` — estado tras T1
 
 ```
 cargo mutants -p zservice --timeout 30 --no-shuffle -j 2
 657 mutants tested in 16m: 270 missed, 343 caught, 18 unviable, 24 timeouts
 ```
 
-**Tasa de supervivencia: 270/657 = 41,1 %.** Medida completa. Es alta, y el
-desglose dice por qué.
+Tasa inicial: 270/657 = 41,1 %. Lo que cambió tras la caza de T1 (`574eea5`,
+más el fix de musl `3d308bd`):
 
-## Desglose por archivo
+| archivo | missed al medir | estado actual | dónde |
+|---|---|---|---|
+| `ready.rs` | 47 | **0 libres**, 0 timeouts | 12 `// equivalent` razonados en el código |
+| `log.rs` | 34 | **0 libres**, 0 timeouts | 5 equivalentes razonados (`RUST_TEST_THREADS=1` por el fd 0) |
+| `identity.rs` | 10 | **10 documentados** | sección al final de este fichero |
+| `service.rs` | 27 | documentado | tabla de abajo |
+| `spawn.rs` | 152 | documentado | párrafo siguiente |
 
-| archivo | MISSED |
-|---|---|
-| `crates/zservice/src/spawn.rs` | 152 |
-| `crates/zservice/src/ready.rs` | 47 |
-| `crates/zservice/src/log.rs` | 34 |
-| `crates/zservice/src/service.rs` | 27 |
-| `crates/zservice/src/identity.rs` | 10 |
+## spawn.rs — 152 (camino del hijo, root-gated)
 
-**Corrección de una nota anterior.** Con la muestra parcial (99 evaluados) el
-desglose no mostraba `spawn.rs` y escribí que el problema era `ready.rs` y
-`log.rs`. Con el run completo `spawn.rs` es **152 de 270 (56 %)**: la muestra
-no era representativa porque los mutantes de `spawn.rs` tardan más y quedaron
-al final. Ambas correcciones, en direcciones opuestas, tienen la misma lección:
-una muestra no es una tasa.
+Lo probado por mutación: `supervises_real_service::the_child_path_runs_with_privileges_inside_a_user_namespace`
+corre bajo `unshare -U -r -p -f --mount-proc` y comprueba `CapBnd` a cero y el
+rechazo de `unshare -m`; anular `child_step_capdrop` lo rompe. Paso de ids: su
+test existe ya, `child_step_drop_ids_as_root` (`#[ignore]`, root real,
+`--test-threads=1`), porque `setgroups` devuelve EPERM dentro del userns.
 
-## Qué hay ya con red, y qué no
+Los 152, por paso medido: `child_step_fds` 40, `child_step_cgroup` 14,
+`child_step_name` 12, `child_step_ids` 12, `spawn` 9, `child_step_mount` 9,
+`child_step_ctty` 7 (103 de 152 en esos siete); el resto en entorno,
+`pid_ascii`, `child_main` y capdrop. El orden de llamadas del hijo no se puede
+verificar con unit tests: pide un job privilegiado que ejecute el camino
+completo y compare fds, ids y mounts. Post-alpha, 4-6 h.
 
-`spawn.rs` (152): el camino del hijo corre tras `fork` y no vuelve al
-llamante. Tiene red parcial real —
-`crates/zinit/tests/supervises_real_service.rs::
-the_child_path_runs_with_privileges_inside_a_user_namespace` ejecuta bajo
-`unshare -U -r -p -f --mount-proc` y comprueba `CapBnd` a cero y el rechazo de
-`unshare -m`; probado por mutación (con `child_step_capdrop` anulado el test
-falla con `CapBnd: 000001ffffffffff`). El resto pide root real: `setgroups`
-devuelve EPERM dentro del userns en las tres variantes de `unshare` probadas,
-porque `unshare -r` deja `/proc/self/setgroups` en `deny`.
+## service.rs — 27 (máquina de estados)
 
-`ready.rs` (47) y `log.rs` (34): funciones puras. **Testables aquí y ahora**,
-sin root, sin fork, sin supervisor. Es el trabajo barato y el que más baja la
-tasa.
+| grupo | missed | razón | post-alpha |
+|---|---|---|---|
+| `ensure_listeners` | 8 | reutilización de fds heredados: exige un supervisor real con listenfds | 1 h |
+| `poll_exec` + `poll_ready` | 5 | carrera exec-error/`WouldBlock`: necesita el par padre-hijo vivo | 1 h |
+| `poll_forking_adopt` + `poll_forking_unstick` + `on_waitpid` | 8 | adopción de huérfanos y `waitpid` reales | 1 h |
+| `stop_signal`, `cleanup`, `adopt`, `pid`, `adopted`, `group_is_signallable` | 6 | estado tras `fork`/`kill`: sólo con procesos vivos | 30-45 min |
 
-`service.rs` (27): máquina de estados del servicio, alcanzable con los tests
-de integración del supervisor.
+Es integración, nunca unitario puro: por eso no entró en el lote barato.
+De los 24 timeouts iniciales, los de `ready.rs` y `log.rs` se resolvieron en
+T1; los de `service.rs` y `spawn.rs` se leen con su archivo.
 
-`identity.rs` (10): comparación de credenciales, unitario.
-
-## Timeouts (24)
-
-Casi todos en `log.rs` (rotación). Un timeout con el mutante aplicado es un
-test que espera algo que el mutante rompió: hay que leer la traza antes de
-llamarlo flake.
-
-```
-crates/zservice/src/log.rs:304:11 — replace -= with +=
-crates/zservice/src/log.rs:304:11 — replace -= with /=
-crates/zservice/src/log.rs:360:11 — replace < with <=
-crates/zservice/src/log.rs:372:5 — replace write_all -> io::Result<()> with Ok(())
-crates/zservice/src/log.rs:372:11 — delete !
-crates/zservice/src/ready.rs:238:23 — replace match guard e.kind() == io::ErrorKind::Interrupted with true
-```
-
-## Orden de ataque (coste creciente)
-
-1. `ready.rs` 47 y `log.rs` 34 — unitarios, sin privilegios.
-2. `identity.rs` 10 — unitario.
-3. `service.rs` 27 — integración del supervisor.
-4. `spawn.rs` 152 — sólo con root (job privilegiado), salvo lo ya cubierto.
-
-Comando por archivo:
-
-```sh
-cargo mutants -p zservice --file crates/zservice/src/ready.rs --timeout 30
-```
-
-## identity.rs — 11 missed, medidos (`mut-identity.log`, 38 mutantes)
+## identity.rs — 10 missed, una sola causa (medido)
 
 `cargo mutants -p zservice --file crates/zservice/src/identity.rs --timeout 60 -j 2`
 → `38 tested: 11 missed, 26 caught, 1 unviable`, 66 s, **0 timeouts**.
-Matado en esta pasada: `319:5` (`ensure_cgroup -> Ok(Default::default())`), con
+Matado en T1: `319:5` (`ensure_cgroup -> Ok(Default::default())`), con
 `ensure_cgroup_refuses_a_directory_without_cgroup_procs` (verificado por
-mutación: el mutante la rompe).
+mutación).
 
-Los 11 restantes son **una sola causa, no once**:
+Los 10 restantes son **una causa, no diez**:
 
 | líneas | mutante | por qué no muere en un unit test |
 |---|---|---|
 | `97:26`, `97:34`×2, `103:34`×2 | `resolve_user`: el `>= 1024*1024` y el `buf.len()*2` del reintento `ERANGE` | sólo se ejecutan si `getpwnam_r` devuelve `ERANGE`, es decir si la entrada de `/etc/passwd` no cabe en el buffer inicial. No hay forma de fabricar esa entrada desde un test sin escribir en `/etc/passwd` ni montar NSS falso |
 | `147:26`, `147:34`×2, `153:34`×2 | idéntico en `resolve_group` (`getgrnam_r`) | ídem con `/etc/group` |
-| `342:25` | `ensure_cgroup`: `!= AlreadyExists` → `==` | `create_dir_all` devuelve `Ok` cuando el directorio ya existe; `AlreadyExists` sólo aparece en una carrera real entre dos supervisores. No reproducible a voluntad |
 
 **Camino de salida (post-alpha, ~45 min):** extraer el bucle de reintento a un
 helper genérico `fn grow_until_cap(len: usize, cap: usize) -> Option<usize>` y
 probar sus tres ramas (`*2`, `>= cap`, `None` al pasarse) sin invocar NSS. Eso
-mata 10 de los 11. El `342:25` es equivalente de facto: exige dos supervisores
-corriendo a la vez sobre el mismo slice, y en ese caso el resultado correcto
-(seguir adelante) es el mismo que produce el mutante.
+mata los 10 de golpe.
+
+## Timeouts: la regla
+
+Un timeout con el mutante aplicado **no es un flake**: es un test que espera un
+resultado que el mutante impide. Se lee la traza antes de llamarlo flake, y si
+es un bucle que no avanza se añade el caso de borde que lo corta.
