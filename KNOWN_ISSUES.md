@@ -244,3 +244,23 @@ es un chequeo **más débil**: ahora el supervisor lo anuncia al arrancar en
 vez de que lo descubra un informe de bug. Rechazarlo (fail-closed) se probó y
 se descartó porque rompía `zctl hibernate`/`poweroff` legítimos en macOS: un
 `zctl` que deja de funcionar es peor que una guarda floja y anunciada.
+
+## Inestabilidad observada en macOS: drop de identidad en un hijo forkeado (abierto)
+
+`identity::dropping_to_our_own_ids_is_either_clean_or_untouched` falló **una
+vez** en el job `macos-aarch64` (run `39890730246`) y pasó en los demás,
+incluida la repetición del mismo commit (`a5c8508`, dos pasadas verdes).
+
+- Qué hace el test: `fork`, en el hijo ejecuta el `drop_privileges` real
+  contra nuestros propios ids, y el padre exige "o baja y verifica, o falla
+  sin tocar nada".
+- Por qué no está cerrado: el mensaje original no distinguía "veredicto
+  falso" de "el hijo murió por una señal", así que la primera vez no quedó
+  evidencia. Ya devuelve un código por desenlace (verificado / intacto / ok
+  pero ids equivocados / err y cambió) y, si hubo señal, su número.
+- Hipótesis principal, sin confirmar: `fork()` desde un proceso de tests
+  multihilo en macOS (el hijo hereda sólo el hilo que llamó y el estado del
+  arnés), que es justo el motivo por el que el test `_exit`a en vez de volver.
+- Siguiente paso si vuelve: el mensaje nuevo dice el desenlace exacto; con
+  eso se decide entre endurecer el hijo (preparar todo antes del `fork`) o
+  gatear el test a Linux, donde vive el camino de producción (`setresuid`).
