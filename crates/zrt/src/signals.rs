@@ -1149,11 +1149,51 @@ mod tests {
     fn a_signal_source_reports_what_it_watches() {
         block(SignalSet::with(Signal::Usr2)).expect("block SIGUSR2");
         let mut src = new_signal_source(SignalSet::with(Signal::Usr2)).expect("source");
-        raise_to_self(Signal::Usr2).expect("raise SIGUSR2");
+        // Process-directed, like an operator's `kill`: `pthread_kill` sends to
+        // one thread, and the BSD kevent filters are attached to the process,
+        // so a thread-directed signal is a different (and useless) question.
+        crate::sys::kill_process(std::process::id() as i32, Signal::Usr2).expect("send SIGUSR2");
         let seen = src.drain().expect("drain");
+        // On a backend this test cannot exercise anywhere else, a bare `[]` is
+        // not enough evidence to tell "the filter is wrong" from "the event
+        // says something we did not expect", so the message carries the raw
+        // kevent the kqueue still holds, if any.
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let detail = {
+            // SAFETY: all zeros is a valid empty event array; the kernel fills
+            // what it returns and `n` says how much of it is meaningful.
+            let mut buf: [libc::kevent; 4] = unsafe { core::mem::zeroed() };
+            let ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `buf` is a live array of four `kevent`s; a null
+            // changelist of length zero means "no changes".
+            let n = unsafe {
+                libc::kevent(
+                    src.fds()[0],
+                    core::ptr::null(),
+                    0,
+                    buf.as_mut_ptr(),
+                    4,
+                    &raw const ts,
+                )
+            };
+            format!(
+                "kind={} raw_n={} ident={} filter={} data={} fflags={}",
+                src.kind().name(),
+                n,
+                buf[0].ident,
+                buf[0].filter,
+                buf[0].data,
+                buf[0].fflags
+            )
+        };
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let detail = String::new();
         assert!(
             seen.contains(&Signal::Usr2),
-            "the signal source did not report the signal it watches: {seen:?}"
+            "the signal source did not report the signal it watches: {seen:?} {detail}"
         );
     }
 
