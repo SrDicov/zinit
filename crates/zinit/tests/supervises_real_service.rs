@@ -923,11 +923,18 @@ fn the_control_socket_refuses_a_mutation_from_an_unknown_peer() {
     // Powering the machine off does not: that verb takes the known client
     // or root. (Managing services is the socket's own job and stays open
     // to its owner, or the C4 contract would mean nothing.)
-    let refused = ask("C 1 poweroff\n");
-    assert!(
-        refused.starts_with("E 1 6"),
-        "a power verb from an unknown peer must be refused with code 6: {refused:?}"
-    );
+    // Only where the supervisor can name the peer's executable: without
+    // `/proc` the check cannot tell the client from any other process of the
+    // same user, and the supervisor announces that weaker check at startup
+    // instead of pretending. The refusal is asserted where the evidence is.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let refused = ask("C 1 poweroff\n");
+        assert!(
+            refused.starts_with("E 1 6"),
+            "a power verb from an unknown peer must be refused with code 6: {refused:?}"
+        );
+    }
 
     // And the service is still running: the refusal happened before the
     // command became an action.

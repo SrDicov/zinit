@@ -231,14 +231,14 @@ pub fn authorize(
     // everybody, so it takes the known client (`zctl`/`zinit`) or root. Root
     // was handled above, so an operator with root is never blocked by this.
     //
-    // A platform that cannot name the peer's executable (no `/proc`, e.g. the
-    // BSDs) gets a **refusal**, not the benefit of the doubt: a socket at
-    // `0600` is a guard against an accident, and "any process of my own user
-    // may power the machine off" is a wider door than the design intends.
-    // Silently accepting `None` here was a fail-open that only showed on
-    // macOS, where a non-root `zctl poweroff` still worked from any process.
+    // `None` means the platform cannot name the peer's executable (no
+    // `/proc`, e.g. the BSDs). There the only boundary left is the socket's
+    // own `0600`: any process of the owner's user may ask. That is the
+    // documented threat model — a guard against an accident, not against the
+    // owner's own code — but it is a *weaker* check, so the supervisor says so
+    // at startup instead of letting a bug report discover it.
     match peer_exe {
-        None => false,
+        None => true,
         Some(exe) => {
             let name = exe.file_name().map(|n| n.to_string_lossy().into_owned());
             matches!(name.as_deref(), Some("zctl") | Some("zinit"))
@@ -887,13 +887,12 @@ mod tests {
         // say who is calling gets the strict answer.
         assert!(!authorize(None, None, 1000, VerbClass::Mutate));
         assert!(!authorize(None, None, 1000, VerbClass::Power));
-        // A peer whose binary could not be named loses the power verb: the
-        // verb takes the known client, and "we could not tell" is not it.
-        // (Root was allowed above, before the executable is ever consulted.)
-        assert!(
-            !authorize(Some(&owner), None, 1000, VerbClass::Power),
-            "an unnamed binary must not be allowed to power the machine off"
-        );
+        // A peer whose binary could not be named falls back to the uid: on a
+        // platform without `/proc` there is no way to tell the client from
+        // any other process of the same user, and a `zctl poweroff` that
+        // silently stopped working would be the worse failure. The supervisor
+        // announces the weaker check at startup.
+        assert!(authorize(Some(&owner), None, 1000, VerbClass::Power));
     }
 
     /// The three classes of verb, spelled out.

@@ -409,6 +409,17 @@ impl Sup {
             children.kind().name()
         ));
 
+        // Where `/proc` cannot name a peer's executable, the power verbs are
+        // only separated from the rest of the owner's processes by the
+        // socket's own `0600`. That is the documented threat model, but a
+        // degraded check nobody mentions is how a bug report ends up saying
+        // "the auth does nothing": say it once, here.
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        announce_degradation(
+            "no /proc: the control socket cannot name a client's executable, so power verbs \
+             are open to any process of the socket's owner",
+        );
+
         // The control socket (contract C4). Bound before the loop so a client
         // that connects during the first pass is accepted, not refused. A
         // failure degrades to "no control socket": the loop below checks the
