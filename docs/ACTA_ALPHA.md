@@ -40,7 +40,7 @@ Los dos fallos de compilación anteriores (`libc::tgkill` ausente en los
 bindings musl, `let mut` que `-D warnings` rechaza) siguen arreglados en
 `3d308bd` y `beb1898`.
 
-Medido en local antes de taggear: `cargo test --workspace` verde (573 tests,
+Medido en local antes de taggear: `cargo test --workspace` verde (633 tests,
 1 ignorado), `cargo clippy --workspace --all-targets -- -D warnings` limpio,
 `cargo fmt --all --check` limpio.
 

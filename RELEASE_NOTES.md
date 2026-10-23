@@ -8,7 +8,7 @@ grafos mutables en runtime.
 
 **Alpha.** Usable y con límites escritos, no con límites supuestos.
 
-- **573 tests** en el workspace, 0 fallos, 1 ignorado (`child_step_drop_ids_as_root`,
+- **633 tests** en el workspace, 0 fallos, 1 ignorado (`child_step_drop_ids_as_root`,
   sólo con root real).
 - Mutantes medidos, no estimados: `zcore` 15,2 % de supervivientes (31/204),
   `zconfig` 14,9 % (116/776), `zservice` con los baratos a cero y los caros

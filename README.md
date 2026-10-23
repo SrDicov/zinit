@@ -7,7 +7,7 @@
 > Sin shell para la lógica, sin grafos mutables en runtime, sin acuses que falten.
 
 **Estado**: alpha `v0.2.0-alpha` — usable, con los límites escritos en
-[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md). **573 tests, 0 fallos, clippy 0,
+[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md). **633 tests, 0 fallos, clippy 0,
 `cargo doc` limpio.**
 
 | Crate | Qué es | Estado | Tests |

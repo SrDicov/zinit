@@ -4,7 +4,7 @@
 
 ## [v0.2.0-alpha] - 2026-10-23
 ### Cierre de alpha
-- `573 tests` en el workspace, 0 fallos; `clippy` y `fmt` limpios;
+- `633 tests` en el workspace, 0 fallos; `clippy` y `fmt` limpios;
   `check` y `tests` compilan para musl (`x86_64`).
 - Mutantes medidos, no estimados: `zcore` 15,2 % (31/204), `zconfig` 14,9 %
   (116/776). En `zservice` los baratos quedan a cero (`ready.rs` y `log.rs`
