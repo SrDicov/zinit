@@ -1311,7 +1311,7 @@ mod tests {
             }
             "dueping" => {
                 let mut w = ReadyWait::Ping {
-                    command: "/bin/true".to_string(),
+                    command: crate::testutil::true_bin().to_string(),
                     next_due_ms: 1000,
                 };
                 w.check(1001).unwrap_or(false)
@@ -1430,7 +1430,13 @@ mod tests {
     /// mutants pretending `0` is an error verdict turn that silent delay
     /// into a hard failure (or, on a stale `EINTR`, into a spin — which is
     /// why this runs in a watchdogged probe child).
+    ///
+    /// Linux only: `listen(fd, 1)` queues `backlog + 1`, so two connects fit
+    /// and the third parks. Darwin queues exactly `backlog`, so the second
+    /// connect itself blocks until `connect_timeout` and the premise (a full
+    /// queue with a non-blocking probe after it) never holds.
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn probe_tcp_reports_a_full_backlog_as_not_ready() {
         assert!(
             probe_child("stuff").success(),

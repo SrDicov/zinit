@@ -652,7 +652,13 @@ pub(crate) mod tests {
 
     /// The datagram path shares the same 4096 framing; the boundary line must
     /// still go out complete (and must not index past the stack buffer).
+    ///
+    /// Linux only: Darwin's `net.local.dgram.maxdgram` defaults to 2048, so a
+    /// 4096-byte `send` fails with `EMSGSIZE` before any of this framing is
+    /// observable. The fallback then redials `/dev/log`, which is not what the
+    /// test bound, and the failure surfaces as a misleading `ENOENT`.
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn datagram_carries_boundary_line() {
         let dir = tmpdir("dgram-boundary");
         let path = dir.join("dev-log.sock");
