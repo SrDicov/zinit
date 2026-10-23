@@ -132,6 +132,10 @@ struct Sup {
 impl Sup {
     fn start(scratch: &Scratch) -> Sup {
         use std::os::unix::process::CommandExt;
+        // The supervisor's own words go to a file, not to `/dev/null`: when a
+        // reply does not arrive, the log is the only thing that can say
+        // whether it was busy, wedged or dead.
+        let log = std::fs::File::create(scratch.dir.join("sup.log")).expect("create sup.log");
         let child = Command::new(env!("CARGO_BIN_EXE_zinit"))
             .arg("--sup")
             .arg(&scratch.dir)
@@ -139,7 +143,7 @@ impl Sup {
             .env("ZINIT_STATE_DIR", scratch.statedir())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(log))
             .process_group(0)
             .spawn()
             .expect("cannot spawn `zinit --sup`");
@@ -222,6 +226,31 @@ impl Ctl {
         assert!(!line.is_empty(), "control connection closed mid-test");
         line.trim_end().to_string()
     }
+}
+
+/// Ask the control socket, but give up after `deadline` and hand back the
+/// reason instead of panicking inside the shared helper.
+///
+/// The shared `Ctl::ask` panics without context, which is fine for a reply
+/// that is immediate and useless for one that is not: the question here is
+/// *why* the supervisor went quiet, and its own log is the answer.
+fn try_ask(scratch: &Scratch, frame: &str, deadline: Duration) -> std::io::Result<String> {
+    use std::io::{BufRead, BufReader, Write};
+    let stream = UnixStream::connect(scratch.sock())?;
+    stream.set_read_timeout(Some(deadline))?;
+    stream.set_write_timeout(Some(deadline))?;
+    let mut reader = BufReader::new(stream);
+    reader.get_mut().write_all(frame.as_bytes())?;
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    Ok(line.trim_end().to_string())
+}
+
+/// The last lines of a file in the scratch directory.
+fn tail_of(scratch: &Scratch, name: &str) -> String {
+    let text = std::fs::read_to_string(scratch.dir.join(name)).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().rev().take(12).collect();
+    lines.into_iter().rev().collect::<Vec<&str>>().join("\n")
 }
 
 /// The `pid=` field of a `status` payload, when it names a live process.
@@ -499,7 +528,6 @@ fn reload_all_keeps_a_notified_service_ready() {
         ),
     );
     let mut sup = Sup::start(&scratch);
-    let mut ctl = Ctl::connect(&scratch.sock());
     assert!(
         wait_until(START_DEADLINE_MS, || {
             scratch
@@ -512,7 +540,12 @@ fn reload_all_keeps_a_notified_service_ready() {
     let before = pidfile_pid(&pidfile).expect("pidfile has a pid");
     sup.services.push(before);
 
-    let reply = ctl.ask("C 1 reload-all\n");
+    let reply = try_ask(&scratch, "C 1 reload-all\n", IO_TIMEOUT).unwrap_or_else(|e| {
+        panic!(
+            "the reload never answered ({e}); the supervisor said:\n{}",
+            tail_of(&scratch, "sup.log")
+        )
+    });
     assert_eq!(reply, "R 1 0 1 services", "reload reply: {reply}");
 
     // Longer than `start-timeout`: a reload that forgot the handshake has
