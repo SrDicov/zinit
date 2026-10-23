@@ -1,56 +1,75 @@
-# Mutantes de `zservice` — medición parcial y plan
+# Mutantes de `zservice` — tasa completa (2026-10-23)
 
-Run: `cargo mutants -p zservice --timeout 60 --no-shuffle` (657 mutantes según
-`--list`). Interrumpido con **89 MISSED de 99 evaluados**: la tasa completa
-sigue sin medirse, y 89/99 no se extrapola a 657.
+```
+cargo mutants -p zservice --timeout 30 --no-shuffle -j 2
+657 mutants tested in 16m: 270 missed, 343 caught, 18 unviable, 24 timeouts
+```
 
-## Desglose por archivo (lo evaluado)
+**Tasa de supervivencia: 270/657 = 41,1 %.** Medida completa. Es alta, y el
+desglose dice por qué.
+
+## Desglose por archivo
 
 | archivo | MISSED |
 |---|---|
-| `crates/zservice/src/ready.rs` | 46 |
-| `crates/zservice/src/log.rs` | 31 |
-| `crates/zservice/src/identity.rs` | 11 |
-| resto | 1 |
+| `crates/zservice/src/spawn.rs` | 152 |
+| `crates/zservice/src/ready.rs` | 47 |
+| `crates/zservice/src/log.rs` | 34 |
+| `crates/zservice/src/service.rs` | 27 |
+| `crates/zservice/src/identity.rs` | 10 |
 
-**Corrección.** Una nota anterior atribuía el grueso a `spawn.rs`. El desglose
-del log dice otra cosa: `spawn.rs` no aparece en la lista. `ready.rs` y `log.rs`
-son funciones con entrada y salida normales — se testean sin root, sin fork y
-sin supervisor. El diagnóstico cómodo era el equivocado.
+**Corrección de una nota anterior.** Con la muestra parcial (99 evaluados) el
+desglose no mostraba `spawn.rs` y escribí que el problema era `ready.rs` y
+`log.rs`. Con el run completo `spawn.rs` es **152 de 270 (56 %)**: la muestra
+no era representativa porque los mutantes de `spawn.rs` tardan más y quedaron
+al final. Ambas correcciones, en direcciones opuestas, tienen la misma lección:
+una muestra no es una tasa.
 
-## `spawn.rs`: lo que sí tiene red
+## Qué hay ya con red, y qué no
 
+`spawn.rs` (152): el camino del hijo corre tras `fork` y no vuelve al
+llamante. Tiene red parcial real —
 `crates/zinit/tests/supervises_real_service.rs::
-the_child_path_runs_with_privileges_inside_a_user_namespace` re-ejecuta el
-test bajo `unshare -U -r -p -f --mount-proc` y verifica dos efectos
-observables: `CapBnd` a cero tras `drop-capabilities = all`, y `unshare -m`
-rechazado por el filtro. Probado por mutación: anulando `child_step_capdrop`
-el test falla con `CapBnd: 000001ffffffffff`.
+the_child_path_runs_with_privileges_inside_a_user_namespace` ejecuta bajo
+`unshare -U -r -p -f --mount-proc` y comprueba `CapBnd` a cero y el rechazo de
+`unshare -m`; probado por mutación (con `child_step_capdrop` anulado el test
+falla con `CapBnd: 000001ffffffffff`). El resto pide root real: `setgroups`
+devuelve EPERM dentro del userns en las tres variantes de `unshare` probadas,
+porque `unshare -r` deja `/proc/self/setgroups` en `deny`.
 
-## Lo que no es testeable sin root, con evidencia
+`ready.rs` (47) y `log.rs` (34): funciones puras. **Testables aquí y ahora**,
+sin root, sin fork, sin supervisor. Es el trabajo barato y el que más baja la
+tasa.
 
-El paso de ids (`setgroups`) y el orden `capdrop` antes de `ids` exigen root
-real. Tres invocaciones probadas el 2026-10-23:
+`service.rs` (27): máquina de estados del servicio, alcanzable con los tests
+de integración del supervisor.
 
-| invocación | uid/gid dentro | `setgroups` |
-|---|---|---|
-| `-U -r --map-groups=0:0:1` | el kernel rechaza el rango | n/a |
-| `-U --map-users=0:1000:1 --map-groups=0:1000:1` | 0/0 | **-1 (EPERM)** |
-| `-U --map-groups=0:1000:1` | 65534/0 | **-1 (EPERM)** |
+`identity.rs` (10): comparación de credenciales, unitario.
 
-`unshare -r` deja `/proc/self/setgroups` en `deny`; habilitarlo exige
-`CAP_SETGID` en el namespace *padre*, que es lo que un runner no tiene. No es
-una limitación de zinit.
+## Timeouts (24)
 
-Plan: test root-gated (patrón de `private-tmp`) con `user = nobody` +
-`drop-capabilities = all`, que exige `Running` con `CapBnd=0` y uid 65534 —
-invertir el orden lo mata con EPERM —, cableado al job que corre como root
-(podman `--privileged`), nunca al job no-root. Hasta entonces no se declara
-cubierto: un test que no se puede ejecutar aquí no es evidencia.
+Casi todos en `log.rs` (rotación). Un timeout con el mutante aplicado es un
+test que espera algo que el mutante rompió: hay que leer la traza antes de
+llamarlo flake.
 
-## Siguiente paso, en orden de coste
+```
+crates/zservice/src/log.rs:304:11 — replace -= with +=
+crates/zservice/src/log.rs:304:11 — replace -= with /=
+crates/zservice/src/log.rs:360:11 — replace < with <=
+crates/zservice/src/log.rs:372:5 — replace write_all -> io::Result<()> with Ok(())
+crates/zservice/src/log.rs:372:11 — delete !
+crates/zservice/src/ready.rs:238:23 — replace match guard e.kind() == io::ErrorKind::Interrupted with true
+```
 
-1. `ready.rs` (46): funciones puras; un test por rama. El más barato de los tres.
-2. `log.rs` (31): rotación/line-splitting; unitario.
-3. `identity.rs` (11): comparación de credenciales; unitario.
-4. `spawn.rs`: sólo con root, como queda dicho.
+## Orden de ataque (coste creciente)
+
+1. `ready.rs` 47 y `log.rs` 34 — unitarios, sin privilegios.
+2. `identity.rs` 10 — unitario.
+3. `service.rs` 27 — integración del supervisor.
+4. `spawn.rs` 152 — sólo con root (job privilegiado), salvo lo ya cubierto.
+
+Comando por archivo:
+
+```sh
+cargo mutants -p zservice --file crates/zservice/src/ready.rs --timeout 30
+```
