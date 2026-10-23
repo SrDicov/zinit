@@ -87,3 +87,11 @@ Punto de retorno si algo falla: `main` = `840f688`, tag = `32c92d1`.
 4. `riscv32gc`: bloqueado por upstream (sin `std`).
 5. El árbol del tag dice "573 tests"; el real es 633. El tag no se reescribe;
    `main` y las notas del release llevan 633.
+
+- CI del HEAD documental `24d5bcc`: verde salvo `riscv32gc` (run `40023312149`).
+- El tag `32c92d1` incluye el flaky de `the_visible_state_follows_the_plan`;
+  los binarios no contienen tests y las notas del release lo dicen.
+- `distro` no está verde en `main`: cada leg excede `timeout-minutes: 45`
+  (7 distros, sin caché, compilando el workspace entero). Es preexistente al
+  tag y no forma parte del gate `ci`. Arreglo probable: subir el timeout o
+  cachear; no se tocó en el cierre.
