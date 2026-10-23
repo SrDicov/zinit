@@ -614,20 +614,40 @@ mod tests {
             -1 => panic!("fork failed"),
             0 => {
                 let before = current_ids();
-                let verdict = match drop_privileges(ruid, rgid) {
-                    Ok(()) => current_ids() == (ruid, ruid, rgid, rgid),
-                    Err(_) => current_ids() == before,
+                // One exit code per outcome so the parent can say *which* one
+                // happened: "the verdict was false" and "the child died" are
+                // different failures, and the old single bit could not tell
+                // them apart (macOS produced one of them intermittently).
+                let code = match drop_privileges(ruid, rgid) {
+                    Ok(()) if current_ids() == (ruid, ruid, rgid, rgid) => 0,
+                    Ok(()) => 3,
+                    Err(_) if current_ids() == before => 2,
+                    Err(_) => 4,
                 };
                 // SAFETY: `_exit` never returns and takes only an int.
-                unsafe { libc::_exit(if verdict { 0 } else { 1 }) };
+                unsafe { libc::_exit(code) };
             }
             pid => {
                 let mut status = 0;
                 // SAFETY: `status` is a live `c_int`; blocking wait on our own child.
                 assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid);
+                let outcome = if libc::WIFSIGNALED(status) {
+                    format!("the child was killed by signal {}", libc::WTERMSIG(status))
+                } else if libc::WIFEXITED(status) {
+                    match libc::WEXITSTATUS(status) {
+                        0 => "ok-and-verified".to_string(),
+                        2 => "err-and-untouched".to_string(),
+                        3 => "ok but the ids are not the ones that were asked for".to_string(),
+                        4 => "err and the ids changed anyway".to_string(),
+                        other => format!("exited with an unexpected code {other}"),
+                    }
+                } else {
+                    format!("an unknown wait status {status}")
+                };
                 assert!(
-                    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-                    "self-drop must succeed-and-verify or fail-untouched"
+                    matches!(libc::WEXITSTATUS(status), 0 | 2) && libc::WIFEXITED(status),
+                    "self-drop must succeed-and-verify or fail-untouched: {outcome} \
+                     (our ids: {ruid}/{rgid})"
                 );
             }
         }
