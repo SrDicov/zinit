@@ -63,3 +63,27 @@ infraestructura (drivers/cross), anotarlo y no taggear hasta verde.
   sha256). Al terminar: `gh release edit v0.2.0-alpha --notes-file RELEASE_NOTES.md`.
 
 Punto de retorno si algo falla: `main` = `840f688`, tag = `32c92d1`.
+
+## CERRADO — 2026-10-23
+
+- `main` = `2781c72` (merge + 3 fixes de CI + docs). CI `40015410128` verde
+  salvo `riscv32gc`. `distro` se verifica aparte. `git diff main testing` = 0.
+- Tag `v0.2.0-alpha` → `32c92d1`. Release publicado por el workflow `release`:
+  5 targets musl + `install.sh` en cada tarball + `.sha256` (10 assets).
+  Notas editadas con `--notes-file RELEASE_NOTES.md`.
+- `v0.2.0-rc1` queda como **pre-release** histórico, no se borró.
+- Flaky real encontrado y arreglado: `the_visible_state_follows_the_plan`
+  leía el state file antes de que el supervisor publicara `state=Running`
+  (perdido en aarch64). Ahora usa `wait_until`.
+- `driver clang` falló una vez y pasó al relanzar: no se reprodujo, no se
+  tocó. Si vuelve, mirar el step `Test` completo, no `--log-failed`.
+
+### Abierto (post-alpha, por coste)
+
+1. Hardware real: `scripts/hw-verification.sh deploy|soak 24|power-test`.
+2. `identity.rs`: `grow_until_cap` (~45 min, mata 10).
+3. `zconfig` 116 (2-3 h + corpus), `spawn.rs` 152 (4-6 h, job privilegiado),
+   `service.rs` 27 (~2 h, hijo/reloj inyectable).
+4. `riscv32gc`: bloqueado por upstream (sin `std`).
+5. El árbol del tag dice "573 tests"; el real es 633. El tag no se reescribe;
+   `main` y las notas del release llevan 633.
