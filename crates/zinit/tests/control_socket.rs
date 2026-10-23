@@ -29,7 +29,14 @@ use std::time::{Duration, Instant};
 const POLL_MS: u64 = 25;
 const START_DEADLINE_MS: u64 = 10_000;
 const EXIT_DEADLINE_MS: u64 = 10_000;
-const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a control reply may take.
+///
+/// A reply is immediate — the supervisor answers on the pass that reads the
+/// frame — so this exists to fail a hung supervisor instead of hanging the
+/// suite, not to accommodate a slow one. It is generous on purpose: the ARM
+/// runners have been seen to starve a process for several seconds under a
+/// parallel `cargo test`, and a false red costs more than a slow one.
+const IO_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn sleep_ms(ms: u64) {
     std::thread::sleep(Duration::from_millis(ms));
