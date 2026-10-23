@@ -1209,8 +1209,11 @@ mod tests {
         let (pid, tid) = unsafe { (libc::getpid(), libc::gettid()) };
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(delay_ms));
-            // SAFETY: tgkill is the documented thread-targeted delivery.
-            unsafe { libc::tgkill(pid, tid, libc::SIGALRM) };
+            // SAFETY: tgkill is the documented thread-targeted delivery. The
+            // musl bindings of the `libc` crate do not declare `tgkill` (the
+            // symbol exists in musl; the declaration is missing), so the raw
+            // syscall is used instead of a cfg fork: same call, one code path.
+            unsafe { libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGALRM) };
         })
     }
 
