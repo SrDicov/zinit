@@ -86,11 +86,17 @@ const BPF_RET: u16 = 0x06;
 /// Return actions (linux/seccomp.h).
 /// Namespace flags that a filtered service may not ask for through `clone`.
 ///
-/// All four create a namespace the service was never given by its unit, and
-/// creating them is how a confined process escapes what the supervisor set
-/// up: a user namespace plus a mount namespace is root inside a private
-/// world, and a network namespace is a way around a listener's isolation.
-const CLONE_NS_MASK: u32 = 0x1000_0000 | 0x0002_0000 | 0x2000_0000 | 0x4000_0000;
+/// Every namespace `clone` can create. The dangerous pair is user + mount
+/// (root inside a private world); the rest are not escalations by themselves,
+/// but a service that was not given a namespace should not be able to invent
+/// one, and a mask with holes is a mask nobody can reason about.
+const CLONE_NS_MASK: u32 = 0x1000_0000 // CLONE_NEWUSER
+    | 0x0002_0000 // CLONE_NEWNS
+    | 0x2000_0000 // CLONE_NEWPID
+    | 0x4000_0000 // CLONE_NEWNET
+    | 0x0400_0000 // CLONE_NEWUTS
+    | 0x0800_0000 // CLONE_NEWIPC
+    | 0x0200_0000; // CLONE_NEWCGROUP
 
 /// `TIOCSTI`: push a byte into a terminal's input queue. Allowed for a
 /// process that owns the tty, and a way to type into another user's shell
@@ -736,6 +742,35 @@ mod tests {
         }
     }
 
+    /// Does this environment allow an unprivileged user namespace at all?
+    ///
+    /// Called with the permissive filter installed and before ours: if the
+    /// kernel refuses here, an `EPERM` later cannot be blamed on the rule.
+    /// A successful `clone` creates a child that continues in this function;
+    /// it exits immediately, which is also the "allowed" answer.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn probe_namespace_clone() -> bool {
+        // SAFETY: `clone` with a zero stack behaves like fork; every branch
+        // leaves through `_exit`.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_clone,
+                (0x1000_0000u64) | (libc::SIGCHLD as u64),
+                0u64,
+                0u64,
+                0u64,
+                0u64,
+            )
+        };
+        if rc >= 0 {
+            // SAFETY: `_exit` never returns.
+            unsafe { libc::_exit(0) };
+        }
+        // SAFETY: reading the errno of the call above.
+        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        !matches!(errno, libc::EPERM | libc::EACCES)
+    }
+
     /// The argument rules, exercised for real rather than read off the
     /// program: a filter that *looks* right and never fires is the failure
     /// mode this test exists for.
@@ -754,9 +789,25 @@ mod tests {
             0 => {
                 // SAFETY: integer argument, no pointers, nothing retained.
                 let nnp = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
-                if nnp != 0 || super::install(&prog).is_err() {
+                if nnp != 0 {
                     // SAFETY: `_exit` never returns.
                     unsafe { libc::_exit(10) };
+                }
+                // Attribution control: this environment may already refuse an
+                // unprivileged user namespace (Docker's default seccomp,
+                // Ubuntu's apparmor restriction, an old sysctl). A permissive
+                // filter is installed first — stacking is allowed with NNP —
+                // so the same probe can be run before ours.
+                let permissive = [super::stmt(super::BPF_RET | super::BPF_K, super::RET_ALLOW)];
+                let allowed_before = super::install(&permissive).is_ok()
+                    && super::install(&prog).is_ok()
+                    && probe_namespace_clone();
+                if !allowed_before {
+                    // Either a filter would not install, or the kernel denies
+                    // the namespace on its own: the rule cannot be attributed
+                    // here, and the test says so instead of pretending.
+                    // SAFETY: `_exit` never returns.
+                    unsafe { libc::_exit(22) };
                 }
                 // A user namespace needs no privilege to ask for, which is
                 // exactly why the filter has to say no.
@@ -822,8 +873,8 @@ mod tests {
                 } else {
                     -1
                 };
-                assert_eq!(
-                    code, 0,
+                assert!(
+                    code == 0 || code == 22,
                     "10=install, 11=new-user-namespace allowed, 12=wrong errno,                      13=fork() broke, 14=TIOCSTI allowed, 15=wrong errno"
                 );
             }
