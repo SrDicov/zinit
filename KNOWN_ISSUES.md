@@ -342,3 +342,21 @@ dispositivos, que arranca servicios cuando aparece hardware (USB, drm, etc.).
 - v0.3: `listen = device:` en zinit (issue abierto en el repo). Hasta
   entonces la migración es "zinit es PID 1, dinit-base sigue instalado por
   su demonio", y eso hay que decirlo así en cualquier README de la máquina.
+
+## Dos límites del verbo de potencia (encontrados por cross-auditoría)
+
+- **Instalaciones fuera de los seis directorios**: `zctl` en `/opt/...` o en
+  `~/.cargo/bin` puede gestionar servicios (clase Mutate) pero **no** apagar
+  la máquina: sólo cuentan `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`,
+  `/usr/local/{bin,sbin}`, y el directorio del propio supervisor **si** el
+  operador pone `ZINIT_TRUST_SELF_DIR=1`. Es deliberado: ese último
+  directorio es escribible por el mismo usuario al que el chequeo quiere
+  limitar. Un instalador propio debe poner el binario en `/usr/local/bin` o
+  exportar la variable en la unidad del supervisor.
+- **Reutilización de pid**: el pid del peer llega por `SO_PEERCRED` y el
+  `/proc/<pid>/exe` se lee en el mismo pase del bucle, pero el kernel no
+  congela la identidad del proceso. Un peer que muere y cuyo pid se reusa por
+  un `zctl` legítimo antes de esa lectura sería aceptado. La ventana es de
+  microsegundos y exige control del reciclado de pids; se documenta en vez de
+  fingir que no existe. Cerrarla del todo pide comparar la identidad del
+  proceso (starttime) en el mismo `open`/`readlink`, no un chequeo posterior.
