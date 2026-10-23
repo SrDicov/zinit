@@ -740,6 +740,103 @@ mod tests {
     /// A line split across two polls still parses as one line: the trailing
     /// partial stays buffered instead of tripping the legacy rule.
     #[test]
+    /// A CRLF line is a framed line, not an unknown one: stripping the `\r` is
+    /// what keeps `WATCHDOG=1\r\n` a check-in instead of a readiness byte.
+    #[test]
+    fn notify_crlf_watchdog_is_a_check_in_not_readiness() {
+        let (r, w) = zrt::sys::pipe2(true).expect("pipe");
+        zrt::sys::set_nonblocking(r, true).expect("nonblock");
+        let mut pending = Vec::new();
+        zrt::sys::write(w, b"WATCHDOG=1\r\n").expect("ping");
+        assert_eq!(
+            drain_notify(r, &mut pending).expect("drain"),
+            (false, true),
+            "CRLF must be stripped before the line is classified"
+        );
+        let _ = zrt::sys::close(r);
+        let _ = zrt::sys::close(w);
+    }
+
+    /// A read that fills the chunk must not be taken for the end of the data:
+    /// the ready line sits behind a full buffer of spaces.
+    #[test]
+    fn notify_full_chunk_keeps_reading_for_the_line_behind_it() {
+        let (r, w) = zrt::sys::pipe2(true).expect("pipe");
+        zrt::sys::set_nonblocking(r, true).expect("nonblock");
+        let mut pending = Vec::new();
+        let mut blob = vec![b' '; 512];
+        blob.extend_from_slice(b"READY=1\n");
+        zrt::sys::write(w, &blob).expect("write");
+        assert_eq!(drain_notify(r, &mut pending).expect("drain"), (true, false));
+        let _ = zrt::sys::close(r);
+        let _ = zrt::sys::close(w);
+    }
+
+    /// Over the cap the buffer fails open *and* starts clean: a chatty service
+    /// must not pin memory, and half a line must not be replayed forever.
+    #[test]
+    fn notify_over_the_cap_fails_open_and_clears_the_buffer() {
+        let (r, w) = zrt::sys::pipe2(true).expect("pipe");
+        zrt::sys::set_nonblocking(r, true).expect("nonblock");
+        let mut pending = Vec::new();
+        zrt::sys::write(w, &vec![b'a'; NOTIFY_BUFFER_MAX + 1]).expect("write");
+        assert_eq!(drain_notify(r, &mut pending).expect("drain"), (true, false));
+        assert!(pending.is_empty(), "the over-cap path starts clean");
+        let _ = zrt::sys::close(r);
+        let _ = zrt::sys::close(w);
+    }
+
+    /// Two framed lines in one read: both are consumed and the buffer is left
+    /// empty, so the next call does not replay them.
+    #[test]
+    fn notify_two_lines_in_one_read_are_both_consumed() {
+        let (r, w) = zrt::sys::pipe2(true).expect("pipe");
+        zrt::sys::set_nonblocking(r, true).expect("nonblock");
+        let mut pending = Vec::new();
+        zrt::sys::write(w, b"READY=1\nWATCHDOG=1\n").expect("write");
+        assert_eq!(drain_notify(r, &mut pending).expect("drain"), (true, true));
+        assert!(
+            pending.is_empty(),
+            "consumed lines are drained, not replayed"
+        );
+        let _ = zrt::sys::close(r);
+        let _ = zrt::sys::close(w);
+    }
+
+    /// Exactly at the cap is still buffered: the limit is a ceiling, not a
+    /// threshold, and `>=` would drop a full buffer that fits.
+    #[test]
+    fn notify_exactly_at_the_cap_is_kept() {
+        let (r, w) = zrt::sys::pipe2(true).expect("pipe");
+        zrt::sys::set_nonblocking(r, true).expect("nonblock");
+        let mut pending = Vec::new();
+        zrt::sys::write(w, &vec![b'a'; NOTIFY_BUFFER_MAX]).expect("write");
+        assert_eq!(drain_notify(r, &mut pending).expect("drain"), (true, false));
+        assert_eq!(
+            pending.len(),
+            NOTIFY_BUFFER_MAX,
+            "a buffer at the cap is kept, not cleared"
+        );
+        let _ = zrt::sys::close(r);
+        let _ = zrt::sys::close(w);
+    }
+
+    /// A whitespace-only line is not a readiness byte.
+    #[test]
+    fn notify_whitespace_only_line_is_not_readiness() {
+        let (r, w) = zrt::sys::pipe2(true).expect("pipe");
+        zrt::sys::set_nonblocking(r, true).expect("nonblock");
+        let mut pending = Vec::new();
+        zrt::sys::write(w, b"   \n").expect("write");
+        assert_eq!(
+            drain_notify(r, &mut pending).expect("drain"),
+            (false, false)
+        );
+        let _ = zrt::sys::close(r);
+        let _ = zrt::sys::close(w);
+    }
+
+    #[test]
     fn notify_partial_line_survives_across_polls() {
         let (r, w) = zrt::sys::pipe2(true).expect("pipe");
         zrt::sys::set_nonblocking(r, true).expect("nonblock");
