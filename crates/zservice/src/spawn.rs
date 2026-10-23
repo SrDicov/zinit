@@ -2184,4 +2184,30 @@ mod tests {
         let _ = zrt::sys::kill_process(s.pid, zrt::signals::Signal::Kill);
         let _ = reap(&s);
     }
+
+    /// The id step is the part of the child path a user namespace cannot
+    /// exercise: `setgroups` returns EPERM inside it (see the userns test),
+    /// so only real root can prove the order — groups, then gid, then uid.
+    /// Run alone, as root:
+    ///
+    ///     sudo cargo test -p zservice --lib child_step_drop_ids_as_root \
+    ///         -- --ignored --test-threads=1
+    ///
+    /// Ignored by default because it permanently drops this test process's
+    /// own privileges, which would poison every other test in the binary.
+    #[test]
+    #[ignore = "setgroups is denied inside a user namespace; needs real root"]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn child_step_drop_ids_as_root() {
+        assert_eq!(unsafe { libc::geteuid() }, 0, "must run as real root");
+        // Every field is plain data (raw pointers, integers, bools), so the
+        // zeroed plan is valid; `child_step_ids` only reads these three.
+        let mut plan: ChildPlan = unsafe { core::mem::zeroed() };
+        plan.drop_ids = true;
+        plan.uid = 43210;
+        plan.gid = 43210;
+        assert!(child_step_ids(plan), "root can setgroups and drop ids");
+        assert_eq!(unsafe { libc::geteuid() }, 43210);
+        assert_eq!(unsafe { libc::getegid() }, 43210);
+    }
 }
