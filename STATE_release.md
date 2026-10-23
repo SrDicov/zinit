@@ -13,17 +13,17 @@ git status --short                            # limpio
 
 | archivo | missed | notas |
 |---|---|---|
-| `crates/zservice/src/ready.rs` | **25** | 22 matados en total (medido: 101 mutantes, 25 missed, 67 caught, 5 timeouts) |
-| `crates/zservice/src/log.rs` | 34 | sin tocar |
+| `crates/zservice/src/ready.rs` | **0 libres** | cerrado en `6585c32`: 0 timeout, 12 MISSED con `// equivalent` razonado |
+| `crates/zservice/src/log.rs` | **0 libres** | cerrado en `aa31e1e`: 0 timeout, 5 MISSED equivalentes razonados. OJO: el subagente necesitó `RUST_TEST_THREADS=1` (flake de fd 0 en paralelo, 4/15) — ver SPEC_T1_B18 |
 | `crates/zservice/src/identity.rs` | 10 | sin tocar |
-| **baratos** | **69** | 25 + 34 + 10, medidos |
+| **baratos** | **10** | 0 ready + 0 log + 10 identity. `SPEC_T1_B17.md` escrito y SIN despachar (límite de uso del subagente) |
 | `crates/zconfig/*` | 116 | documentar, no matar |
 | `crates/zservice/src/spawn.rs` | 152 | root-gated + documentar |
 | `crates/zservice/src/service.rs` | 27 | documentar |
 
 ## Criterio de tag (no es 0 % missed)
 
-Tag **sólo** si: 69 baratos muertos o equivalentes documentados, 268 caros
+Tag **sólo** si: 10 baratos muertos o equivalentes documentados, 268 caros
 documentados con causa, los 9 criterios de `STATE_alpha.md` verdes, CI verde
 salvo `riscv32gc`, y el release de GitHub creado. **Tag sin release = no tag.**
 
@@ -108,3 +108,20 @@ espera hardware).
 - 0 % de missed: es release, no alpha.
 - Tocar `spawn.rs` sin root real (el test userns ya cubre capdrop y filtro).
 - `git add -A`, `git add .`, `git commit -a`.
+
+## Bitácora (modo dispatcher, sesión de cierre)
+
+| SPEC | estado | commit | resultado |
+|---|---|---|---|
+| T1-B12 | SUCCESS | `10ea488` | 5 timeouts de `drain_notify` muertos (sentinel + EINTR/WouldBlock reales) |
+| T1-B13 | SUCCESS | `1470377` | 11 de 24 matados; 12 equivalentes razonados |
+| T1-B14 | SUCCESS | `6585c32` | `ready.rs` cerrado: 0 timeout, 12 MISSED con `// equivalent` |
+| T1-B15 | SUCCESS | `7b688d5` | 22 de 31 matados en `log.rs` |
+| T1-B16 | SUCCESS | `aa31e1e` | `log.rs` cerrado: 0 timeout, 5 equivalentes |
+| (flaky) | FIX | `0796e6b` | fd-0: mutex no bastaba (3/20 fallos) → fork aislado, **0/40** |
+| T1-B17 | **PENDIENTE** | — | `SPEC_T1_B17.md` escrito, sin despachar: límite de uso de subagentes |
+
+Base actual: `cargo test -p zservice --lib` → **123 passed**, clippy 0, fmt limpio.
+
+Siguiente: despachar `SPEC_T1_B17.md` (identity.rs, 10 missed, 60 min), luego el
+flaky hunt no hace falta (ya está a 0/40).
