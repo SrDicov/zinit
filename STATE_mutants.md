@@ -1,65 +1,60 @@
-# STATE — mutantes (T1/T2)
+# STATE — mutantes (T0→T4)
 
-## Qué se está midiendo
+## T0 — persistencia (resuelto y verificado)
 
-Dos runs en segundo plano, con `--no-shuffle` y `--timeout 60`:
+El fallo no era el host: era que el run colgaba del árbol de la sesión de
+opencode, y al reiniciarse el **servidor de la sesión** se llevó el proceso.
+En este host no hay systemd (`systemctl` no existe), así que la opción es tmux
+con sesión propia y loop de reintento:
 
 ```sh
-cargo mutants -p zconfig --timeout 60 --no-shuffle > /tmp/opencode/mut-zconfig.log 2>&1
-cargo mutants -p zservice --timeout 60 --no-shuffle > /tmp/opencode/mut-zservice.log 2>&1
+tmux kill-session -t mutants 2>/dev/null
+tmux new-session -d -s mutants 'cd /home/dicov/zinit && for p in zconfig zservice; do log=/tmp/opencode/mut-$p-full.log; n=0; while [ $n -lt 5 ]; do n=$((n+1)); cargo mutants -p $p --timeout 60 --no-shuffle > $log 2>&1; grep -q "mutants tested" $log && break; sleep 60; done; done; touch /tmp/opencode/mutants.done'
 ```
 
-## Cómo retomar
+Verificación: el pane tiene `sid` propio (21198) distinto del shell que lo
+lanzó (21193), y el servidor tmux se desacopla del padre. Comprobado el
+2026-10-23 03:57 con `Found 776 mutants to test` y baseline `ok`.
 
-1. `grep -E "^[0-9]+ mutants tested" /tmp/opencode/mut-*.log`
-2. `grep "^MISSED" /tmp/opencode/mut-zconfig.log | sed 's/ in .*//'`
-3. Por cada MISSED: test o exclusión justificada; documentar en
-   `docs/audit/mutants-zconfig.md` / `mutants-zservice.md`.
-4. `cargo mutants -p zconfig --list` da el inventario sin ejecutar.
+Sobrevive a la muerte de la sesión de opencode, que es el fallo real y
+repetido. **No** sobrevive a un reboot del kernel: en este host no hay
+servicio de arranque donde engancharlo (sin systemd) y no se toca el crontab
+del usuario. Si el host se reinicia, se relanza: el loop lo detecta porque
+el log no termina en `mutants tested`.
 
-## Estado al escribir esto
+Los dos crates van **en serie** a propósito: `cargo mutants` comparte
+`target/` y dos runs a la vez se pelean por el lock.
 
-- `zcore`: 31/204 viables (15,2 %), 15 muertos esta sesión, doc en
-  `docs/audit/mutants-zcore.md`.
-- `zconfig`: 22 MISSED contados en un run anterior interrumpido; este
-  run lo completa.
-- `zservice`: sin medida previa.
+## Parseo
 
-## Criterio de éxito de alpha
+```sh
+grep -E '^[0-9]+ mutants tested' /tmp/opencode/mut-zconfig-full.log
+grep '^MISSED' /tmp/opencode/mut-zconfig-full.log | sed 's/ in .*//'
+grep -c '^TIMEOUT' /tmp/opencode/mut-zconfig-full.log
+ls /tmp/opencode/mutants.done
+```
 
-Número real medido y documentado para los dos crates. No hace falta
-llegar a <10 %: hace falta no fingir que se midió.
+## Lo medido hasta ahora
 
-## Actualización 2026-10-23 (sesión 2)
-
-Los runs lanzados con `timeout 5400` murieron con el reinicio del servidor;
-`zconfig` no llegó a escribir nada. Números vistos antes del corte:
-
-- `zservice`: **89 MISSED de 99 evaluados** (657 mutantes totales según
-  `--list`). El grueso es `spawn.rs`, camino del hijo.
-- `zconfig`: 0 líneas útiles; el run anterior sí contó **22 MISSED** antes
-  de cortarse. 776 mutantes totales.
 - `zcore`: 31/204 = 15,2 % (cerrado, `docs/audit/mutants-zcore.md`).
+- `zservice`: 89 MISSED de 99 evaluados en el run cortado. El grueso es
+  `spawn.rs`.
+- `zconfig`: 22 MISSED del run anterior; el de esta sesión arrancó con 776.
 
-Test nuevo que ya cubre parte de `spawn.rs` sin root:
+## Cobertura de `spawn.rs` sin root
+
 `crates/zinit/tests/supervises_real_service.rs::
-the_child_path_runs_with_privileges_inside_a_user_namespace`
-(re-exec bajo `unshare -U -r -p -f --mount-proc`; comprueba `CapBnd` a cero
-y `unshare -m` rechazado). Los runs de mutantes **no** lo incluyen porque
-arrancaron antes.
+the_child_path_runs_with_privileges_inside_a_user_namespace` re-ejecuta el
+test bajo `unshare -U -r -p -f --mount-proc` y comprueba dos efectos
+observables: `CapBnd` a cero tras `drop-capabilities = all` y `unshare -m`
+rechazado por el filtro. Probado por mutación: con `child_step_capdrop`
+anulado el test falla con `CapBnd: 000001ffffffffff`.
 
-### Retomar
-
-```sh
-cd /home/dicov/zinit
-git checkout agent/overnight-20261022-0332
-nohup cargo mutants -p zconfig  --timeout 60 --no-shuffle > /tmp/opencode/mut-zconfig-full.log 2>&1 &
-nohup cargo mutants -p zservice --timeout 60 --no-shuffle > /tmp/opencode/mut-zservice-full.log 2>&1 &
-```
-
-`nohup` + `&` sobrevive al cierre del shell; el reinicio del servidor mata
-igual el proceso, así que relanzar y comprobar con
-`grep -c '^MISSED'` cada vez que se retome la sesión.
-
-Criterio de tag alpha: tasa completa de los dos crates medida y los
-mutantes críticos de `spawn.rs` muertos. Los no críticos, documentados.
+**El paso de ids no es testeable así, comprobado**: `setgroups` devuelve -1
+dentro del userns en las tres variantes probadas
+(`--map-groups=0:0:1` → el kernel rechaza el rango;
+`--map-users=0:1000:1 --map-groups=0:1000:1` y `--map-groups=0:1000:1` →
+`uid=0 gid=0` pero `setgroups -1`, porque `unshare -r` deja
+`/proc/self/setgroups` en `deny`). Sin CAP_SETGID en el ns padre no hay
+forma de habilitarlo, así que el orden `capdrop` antes de `ids` sólo se
+puede verificar con root real.
