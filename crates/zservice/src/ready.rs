@@ -837,6 +837,40 @@ mod tests {
     }
 
     #[test]
+    fn poll_readable_sees_data_and_hangup() {
+        let (r, w) = zrt::sys::pipe2(true).expect("pipe");
+        // Nothing yet: the timeout is the answer, not an error.
+        assert!(!poll_readable(r, 5).expect("poll runs"));
+        // Data on the read end is readable. With `&` instead of `|` the event
+        // mask is empty and a pipe with data looks idle.
+        zrt::sys::write(w, b"x").expect("write");
+        assert!(poll_readable(r, 5).expect("poll runs"));
+        // A closed writer must wake the reader so it can see EOF.
+        let _ = zrt::sys::close(w);
+        assert!(poll_readable(r, 5).expect("poll runs"));
+        let _ = zrt::sys::close(r);
+    }
+
+    #[test]
+    fn probe_socket_is_nonblocking_and_close_on_exec() {
+        let fd = new_probe_socket().expect("socket");
+        // SAFETY: `fd` is ours and `fcntl` only reads flags.
+        unsafe {
+            let fl = libc::fcntl(fd, libc::F_GETFL);
+            let fdfl = libc::fcntl(fd, libc::F_GETFD);
+            libc::close(fd);
+            assert!(
+                fl >= 0 && fl & libc::O_NONBLOCK != 0,
+                "the probe socket must be nonblocking: a blocking connect would hang the supervisor"
+            );
+            assert!(
+                fdfl >= 0 && fdfl & libc::FD_CLOEXEC != 0,
+                "the probe socket must be close-on-exec, or a child inherits it"
+            );
+        }
+    }
+
+    #[test]
     fn notify_partial_line_survives_across_polls() {
         let (r, w) = zrt::sys::pipe2(true).expect("pipe");
         zrt::sys::set_nonblocking(r, true).expect("nonblock");
