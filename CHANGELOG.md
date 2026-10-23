@@ -1,6 +1,21 @@
 # Changelog
 
 ## [Unreleased]
+
+## [v0.2.0-alpha] - 2026-10-23
+### Cierre de alpha
+- `573 tests` en el workspace, 0 fallos; `clippy` y `fmt` limpios;
+  `check` y `tests` compilan para musl (`x86_64`).
+- Mutantes medidos, no estimados: `zcore` 15,2 % (31/204), `zconfig` 14,9 %
+  (116/776). En `zservice` los baratos quedan a cero (`ready.rs` y `log.rs`
+  sin supervivientes libres, con los equivalentes razonados en el código) y
+  los caros (268) documentados por archivo y con coste en `docs/audit/`.
+- Dos fallos reales de portabilidad que el CI destapó y se arreglaron:
+  `libc::tgkill` no está en los bindings musl del crate `libc` (se usa
+  `syscall(SYS_tgkill, ...)`) y un `mut` innecesario que `-D warnings`
+  convertía en error en toda la matriz.
+- Acta con los 9 criterios: [`docs/ACTA_ALPHA.md`](docs/ACTA_ALPHA.md).
+
 ### Demand-start (2026-10-16)
 - A boot-disabled (`enabled = no`) dependency now becomes `Wanted::Up` the moment a
   service that declares it `required` is actually running: dinit's `depends-on`
