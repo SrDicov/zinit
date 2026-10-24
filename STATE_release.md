@@ -91,7 +91,44 @@ Punto de retorno si algo falla: `main` = `840f688`, tag = `32c92d1`.
 - CI del HEAD documental `24d5bcc`: verde salvo `riscv32gc` (run `40023312149`).
 - El tag `32c92d1` incluye el flaky de `the_visible_state_follows_the_plan`;
   los binarios no contienen tests y las notas del release lo dicen.
-- `distro` no está verde en `main`: cada leg excede `timeout-minutes: 45`
-  (7 distros, sin caché, compilando el workspace entero). Es preexistente al
-  tag y no forma parte del gate `ci`. Arreglo probable: subir el timeout o
-  cachear; no se tocó en el cierre.
+- `distro` no está verde en `main` todavía: el 2026-10-23 los 7 legs agotaron
+  `timeout-minutes: 45`. **La causa no era caché ni lentitud**: cuatro tests se
+  colgaban para siempre y el `Mutex` serial arrastraba a tres más. Arreglado en
+  la rama de cierre (ver abajo); falta el run de `main`.
+
+## Sesión 2026-10-24 — cierre pre-beta (sin hardware)
+
+Rama `agent/overnight-20261024-0050`, base `fb6ca1c` (`main` == `testing`).
+Contrato en `AUDIT.md` (sección final).
+
+| commit | qué |
+|---|---|
+| `3dc2966` | `connect_deadline` + `zctl` con deadline + `Scratch::read` ignora fichero vacío (flake real) |
+| `2040769` | skips con razón (mount ns, cgroup RO) y peer `nobody` capaz de conectar |
+| `1ec8a47` | `distro`: 25 min, `cargo build --workspace` (no `--all-targets`), `docs/CI.md` |
+| `795fb4e` | `KNOWN_ISSUES.md`: el flaky del tag y el contrato de deadlines |
+| `3032877` | `docs/audit/mutants-costs.md` |
+| `b9f05c9` | `hw-verification.sh full` / `kill-term-1` / `after-reboot` / `dinit-removal-check` |
+| `16746be` | `docs/BETA.md` + `docs/HW-VERIFICATION.md` al día |
+
+Evidencia local: `cargo test -p zinit --test supervises_real_service` 27/27
+(11,6 s), clippy `-D warnings` 0, `cargo fmt --all --check` limpio. En Alpine
+(podman) los cuatro tests que fallaban pasan (tres como skip con razón).
+
+### Lo único que falta para beta
+
+1. Push de esta rama + run verde de `distro` en `main` (el fix es de tests).
+2. Hardware: `sudo ./scripts/hw-verification.sh full <artefacto> --sha256 <hash>`
+   y, tras el arranque, `after-reboot`. Eso cubre soak 24 h, los dos caminos de
+   apagado y el chequeo de dinit.
+3. Tag `v0.2.0-beta` según `docs/BETA.md`. **Nada de tag antes del paso 2.**
+
+### Trampas nuevas
+
+- `cargo test --workspace` **no** construye el binario `zctl`; sin
+  `cargo build --workspace` previo, los tests de socket se saltan solos.
+- Un test que falla porque el contenedor no tiene `CAP_SYS_ADMIN` o el cgroup
+  es de solo lectura no prueba nada: skip con la razón escrita, nunca un
+  `#[allow]` ni un `unwrap` defensivo.
+- El socket es `0600`: para probar el chequeo de credenciales el test abre el
+  modo (`0666`) antes de que el peer `nobody` conecte. Es test-only.

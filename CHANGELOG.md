@@ -1,6 +1,19 @@
 # Changelog
 
 ## [Unreleased]
+### Cierre pre-beta (sin hardware)
+- El `distro` de los 7 legs ya no se cuelga: cuatro tests esperaban sin
+  deadline (`connect(2)` con el backlog lleno, `zctl` sin timeout) y el
+  `Mutex` serial arrastraba a tres más. Ahora toda espera tiene deadline y el
+  fallo dice el errno. Timeout del job 45 → 25 min.
+- Tres fallos de contenedor pasan a skip con razón escrita (falta de mount
+  namespace, cgroup de solo lectura) y el peer `nobody` puede conectar: el
+  socket `0600` impedía probar el chequeo de credenciales.
+- `scripts/hw-verification.sh full` + `after-reboot`: la noche entera en dos
+  comandos, con `kill-term-1` separado del verbo del operador y
+  `dinit-removal-check` de solo lectura.
+- `docs/BETA.md` (5 pre-requisitos y proceso de tag), `docs/CI.md` (qué es
+  gate y qué es red) y `docs/audit/mutants-costs.md` (coste por mutante).
 
 ## [v0.2.0-alpha] - 2026-10-23
 ### Cierre de alpha
