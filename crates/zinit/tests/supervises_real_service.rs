@@ -78,6 +78,22 @@ fn sleep_ms(ms: u64) {
     std::thread::sleep(Duration::from_millis(ms));
 }
 
+/// Can this machine create a mount namespace at all?
+///
+/// The container-based distro legs run as root **without** `CAP_SYS_ADMIN`, so
+/// `unshare -m` fails with EPERM before zinit is involved. Two tests need that
+/// capability to mean anything (private-tmp and the sandbox): without it the
+/// unconfined baseline fails too, and a "failure" would say nothing about
+/// zinit's own confinement.
+fn can_unshare_mount() -> bool {
+    Command::new("unshare")
+        .args(["-m", "true"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 fn last_errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
@@ -375,6 +391,17 @@ fn ask_as_nobody(socket: &str, frame: &str) -> String {
     // unprivileged.
     const NOBODY: u32 = 65534;
 
+    // The socket is created `0600` on purpose (only its owner connects), so a
+    // peer that dropped to `nobody` cannot even reach it — and a read that
+    // never reached the server says nothing about the server's peer check.
+    // Opening the mode for the duration of the test is what makes the check
+    // observable; it changes nothing in the supervisor, which is the side
+    // under test.
+    if unsafe { libc::geteuid() } == 0 {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666));
+    }
+
     // A socket pair is the channel: the child writes its answer on one end,
     // the parent reads it on the other. (`std::io::pipe` would be shorter
     // but it is newer than this workspace's MSRV.)
@@ -397,7 +424,12 @@ fn ask_as_nobody(socket: &str, frame: &str) -> String {
             }
             let mut stream = match connect_deadline(socket, 5_000) {
                 Ok(s) => s,
-                Err(_) => std::process::exit(1),
+                Err(e) => {
+                    // The parent's assertion must say *why* the peer is
+                    // silent, not just that it is.
+                    let _ = child_end.write_all(format!("connect: {e}\n").as_bytes());
+                    std::process::exit(1);
+                }
             };
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
             let _ = stream.write_all(frame.as_bytes());
@@ -583,7 +615,8 @@ impl<'a> Sup<'a> {
             assert!(
                 start.elapsed() < Duration::from_millis(deadline_ms),
                 "no live pid in {file} after {deadline_ms}ms: `zinit --sup` was pointed at a \
-                 directory with a service in it, and no real process ever appeared"
+                 directory with a service in it, and no real process ever appeared\n{}",
+                self.scratch.tail("sup.log")
             );
             sleep_ms(POLL_MS);
         }
@@ -1528,6 +1561,13 @@ fn the_sandbox_really_confines() {
         let _ = std::fs::write(scratch.at("skipped"), "no unshare binary\n");
         return;
     }
+    if !can_unshare_mount() {
+        let _ = std::fs::write(
+            scratch.at("skipped"),
+            "no mount namespace in this container\n",
+        );
+        return;
+    }
     // The command under test: it needs a namespace, and it says whether it
     // got one. Each service writes **its own** answer — a shared file would be
     // overwritten by whichever finished last, which is exactly the kind of
@@ -1748,6 +1788,15 @@ fn a_service_with_a_cgroup_lands_in_it() {
         let _ = std::fs::write(scratch.at("skipped"), "needs root and cgroup2\n");
         return;
     }
+    // "Mounted" is not "writable": a container with /sys/fs/cgroup bind-mounted
+    // read-only has the hierarchy and still refuses the mkdir the supervisor
+    // needs. Ask the question the supervisor will ask.
+    let probe_dir = "/sys/fs/cgroup/zinit-test-writable";
+    if std::fs::create_dir(probe_dir).is_err() {
+        let _ = std::fs::write(scratch.at("skipped"), "cgroup hierarchy is read-only\n");
+        return;
+    }
+    let _ = std::fs::remove_dir(probe_dir);
     scratch.conf(
         "probe.conf",
         &desc(
@@ -2092,6 +2141,13 @@ fn a_private_tmp_covers_the_scratch_directories() {
     let scratch = Scratch::new("privtmp");
     if unsafe { libc::geteuid() } != 0 {
         let _ = std::fs::write(scratch.at("skipped"), "needs root\n");
+        return;
+    }
+    if !can_unshare_mount() {
+        let _ = std::fs::write(
+            scratch.at("skipped"),
+            "no mount namespace in this container\n",
+        );
         return;
     }
     let tag = format!("zinit-priv-{}", std::process::id());
