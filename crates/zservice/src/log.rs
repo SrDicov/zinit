@@ -774,6 +774,16 @@ pub(crate) mod tests {
         write_line(&mut h, b"aaaa").expect("first");
         write_line(&mut h, b"bbbb").expect("second");
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555));
+        // A directory mode is advisory to uid 0: root writes anyway, so the
+        // rotation this test needs to fail would succeed and the assertion
+        // would report a bug that does not exist. Ask the sink's own question
+        // instead of assuming the chmod took effect; the same test still runs
+        // for every non-root runner (macOS CI, a normal user).
+        if std::fs::write(dir.join(".writable"), b"x").is_ok() {
+            let _ = std::fs::remove_file(dir.join(".writable"));
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+            return;
+        }
         write_line(&mut h, b"cc").expect_err("rotation must fail on read-only dir");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
         write_line(&mut h, b"dd").expect("recovery must have left a usable fd");
