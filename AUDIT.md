@@ -108,3 +108,67 @@ trabajo del día. Lo que ya está arreglado y verificado **no** se repite.
 - [x] **C12** Un log que no se puede abrir es rechazo ruidoso, no servicio
   sin logs: test con `ENOTDIR` y aserción de que el servicio no corre y el
   supervisor sobrevive.
+
+---
+
+# AUDIT — noche 2026-10-24 (post-alpha, pre-beta)
+
+Contrato de esta sesión: todo lo que se puede cerrar **sin hardware**. Rama
+`agent/overnight-20261024-0050`, base `fb6ca1c` (`main` == `testing`). Nada de
+beta sin soak + power-test: eso es hardware, no código.
+
+## Estado de partida
+
+- `ci` de `main` verde salvo `riscv32gc` (run `40026936480`).
+- `distro` cancelado por timeout en los 7 legs (run `40026936449`, job alpine
+  `120665476036`): **no es lentitud de caché**. A los 3 minutos ya había tests
+  corriendo y 4 de ellos se colgaron para siempre.
+
+## Ítems
+
+- [x] **A1** Tests de `crates/zinit/tests/` colgados sin deadline:
+  `connect()` bloqueante con el backlog lleno y `zctl()` con
+  `Command::output()` sin timeout; el `Mutex` serial arrastraba a 3 tests más.
+  Fix: `connect_deadline` (socket no bloqueante + `poll`) y `zctl` con
+  deadline de 10 s. Evidencia: log del job alpine, «running for over 60
+  seconds» a los 3 min, cancelación a los 45.
+- [x] **A6** `a_root_service_keeps_setuid_working` era un flaky real:
+  `wait_until(... is_some())` aceptaba el fichero vacío que `>` crea antes de
+  que `grep` escriba. Raíz: `Scratch::read` ahora devuelve `None` para un
+  fichero vacío.
+- [x] **A2** `a_private_tmp_covers_the_scratch_directories` FAILED en Alpine.
+- [x] **A3** `a_service_with_a_cgroup_lands_in_it` FAILED en Alpine (contenedor
+  sin cgroup escribible): decidir skip con razón o fix real.
+- [x] **A4** Workflow: quitar el `cargo build --all-targets` redundante,
+  ajustar timeout y decidir matriz con números, no por intuición. Documentar
+  en `docs/CI.md` por qué **no** se cachea (una sola dependencia: `libc`).
+- [x] **A7** `the_control_socket_refuses_a_mutation_from_an_unknown_peer` leía
+  `""` en Alpine: el socket es `0600` y el peer `nobody` ni conectaba. El test
+  abre el modo (`0666`, solo durante el test) y un `connect` fallido escribe su
+  errno en vez de silencio. 4/4 en podman Alpine.
+- [ ] **A5** `distro` verde en `main` o cada leg rojo documentado como externo.
+  (Bloqueado por el push: el fix está probado en Alpine, falta el run.)
+
+- [x] **B1** `docs/audit/mutants-costs.md`: tabla Archivo | Missed | Tipo |
+  Coste | Prioridad, con los números ya medidos.
+
+- [x] **C1** `KNOWN_ISSUES.md`: el flaky del state congelado en el tag, y que
+  los binarios no llevan tests.
+- [x] **C2** `docs/BETA.md`: los 5 pre-requisitos y el proceso de tag.
+
+- [x] **D1** `scripts/hw-verification.sh full` (deploy → soak → report →
+  kill-term-1), `power-test` por el verbo del operador, `kill-term-1` por
+  señal, `after-reboot` y `dinit-removal-check`; `--help` y `--dry-run`.
+- [x] **D2** `docs/HW-VERIFICATION.md` al día con el comando único.
+
+- [x] **E1** Punto de retorno documentado en `STATE_release.md` (sección
+  «Sesión 2026-10-24»). `AGENTS.md` prohíbe un STATE nuevo: el único STATE es
+  `STATE_release.md` (+ `alpha`/`mutants`), así que no se creó `STATE_final.md`.
+- [x] **E2** README / CHANGELOG / HANDOFF coherentes con alpha publicado.
+- [ ] **E3** Gate final: build + clippy + fmt + tests + `git diff main` revisado.
+
+## Reglas de la noche
+
+- Un ítem, un commit, un gate. Nada de `git add -A`.
+- Si un ítem destapa otro, se añade aquí; no se persigue en caliente.
+- 3 intentos fallidos en el mismo bug → hard stop + `STATUS.md`.
