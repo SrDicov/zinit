@@ -39,6 +39,7 @@
 //! * **Silent.** No `println!`: CI greps all of `crates/`. Failures explain
 //!   themselves in `assert!` messages instead.
 
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Mutex, MutexGuard};
@@ -75,6 +76,26 @@ fn serial() -> MutexGuard<'static, ()> {
 
 fn sleep_ms(ms: u64) {
     std::thread::sleep(Duration::from_millis(ms));
+}
+
+/// Can this machine create a mount namespace at all?
+///
+/// The container-based distro legs run as root **without** `CAP_SYS_ADMIN`, so
+/// `unshare -m` fails with EPERM before zinit is involved. Two tests need that
+/// capability to mean anything (private-tmp and the sandbox): without it the
+/// unconfined baseline fails too, and a "failure" would say nothing about
+/// zinit's own confinement.
+///
+/// Linux-only because both callers are: on macOS/BMP there is no `unshare`
+/// to call and `-D warnings` turns the dead function into a build failure.
+#[cfg(target_os = "linux")]
+fn can_unshare_mount() -> bool {
+    Command::new("unshare")
+        .args(["-m", "true"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 fn last_errno() -> i32 {
@@ -120,6 +141,110 @@ fn wait_until(deadline_ms: u64, mut f: impl FnMut() -> bool) -> bool {
             return false;
         }
         sleep_ms(POLL_MS);
+    }
+}
+
+/// Connect to a unix socket with a deadline.
+///
+/// `UnixStream::connect` blocks inside `connect(2)` for as long as the
+/// listener's backlog is full. This suite hit exactly that on musl: a
+/// saturated control socket turned one test into a 45-minute CI hang, and the
+/// shared `Mutex` dragged three more tests down with it. A non-blocking
+/// connect reports `EINPROGRESS` instead, which `poll` can bound. The stream
+/// comes back in blocking mode, because callers read from it.
+fn connect_deadline(path: &str, deadline_ms: u64) -> std::io::Result<UnixStream> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::net::UnixStream;
+
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_bytes();
+    assert!(
+        bytes.len() < addr.sun_path.len(),
+        "socket path does not fit in sockaddr_un: {path}"
+    );
+    for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    let len = (std::mem::size_of::<libc::sockaddr_un>() - addr.sun_path.len() + bytes.len() + 1)
+        as libc::socklen_t;
+
+    // SAFETY: a fresh non-blocking socket, owned by this function until it is
+    // wrapped below; no other pointer or thread can see the fd.
+    //
+    // Plain `SOCK_STREAM` and a portable `set_nonblocking` on purpose: the
+    // `SOCK_NONBLOCK`/`SOCK_CLOEXEC` flags are Linux-only in `libc`, and this
+    // file builds on macOS runners too (`E0425: cannot find value
+    // SOCK_NONBLOCK`). Nothing here execs, so close-on-exec buys nothing.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a socket created one line above and handed to nobody else.
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    stream.set_nonblocking(true)?;
+
+    // SAFETY: `addr` is a valid sockaddr_un initialised for exactly `len` bytes.
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            len,
+        )
+    };
+    if rc == 0 {
+        stream.set_nonblocking(false)?;
+        return Ok(stream);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::EINPROGRESS) {
+        return Err(err);
+    }
+
+    let start = Instant::now();
+    loop {
+        let left = deadline_ms.saturating_sub(start.elapsed().as_millis() as u64);
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: one pollfd this function owns; the timeout is bounded.
+        let ready = unsafe { libc::poll(&mut pfd, 1, left as libc::c_int) };
+        if ready == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "connect did not complete before the deadline (backlog full?)",
+            ));
+        }
+        if ready < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(e);
+        }
+        // `poll` reports writable on failure too: the pending error decides.
+        let mut so_error: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: SO_ERROR writes one int into `so_error`, sized as passed.
+        let got = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut so_error as *mut libc::c_int as *mut libc::c_void,
+                &mut size,
+            )
+        };
+        if got < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if so_error != 0 {
+            return Err(std::io::Error::from_raw_os_error(so_error));
+        }
+        stream.set_nonblocking(false)?;
+        return Ok(stream);
     }
 }
 
@@ -207,7 +332,12 @@ impl Scratch {
     }
 
     fn read(&self, name: &str) -> Option<String> {
-        std::fs::read_to_string(self.dir.join(name)).ok()
+        // An empty file is not an answer: `> file` creates it a moment before
+        // the writer writes, and a wait that accepted the empty file would
+        // read "" and call it a result.
+        std::fs::read_to_string(self.dir.join(name))
+            .ok()
+            .filter(|s| !s.is_empty())
     }
 
     /// The pid written in `name`, if it is there and could be one.
@@ -265,10 +395,24 @@ fn ask_as_nobody(socket: &str, frame: &str) -> String {
     // unprivileged.
     const NOBODY: u32 = 65534;
 
+    // The socket is created `0600` on purpose (only its owner connects), so a
+    // peer that dropped to `nobody` cannot even reach it — and a read that
+    // never reached the server says nothing about the server's peer check.
+    // Opening the mode for the duration of the test is what makes the check
+    // observable; it changes nothing in the supervisor, which is the side
+    // under test.
+    if unsafe { libc::geteuid() } == 0 {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666));
+    }
+
     // A socket pair is the channel: the child writes its answer on one end,
     // the parent reads it on the other. (`std::io::pipe` would be shorter
     // but it is newer than this workspace's MSRV.)
     let (mut parent_end, mut child_end) = UnixStream::pair().expect("socket pair");
+    parent_end
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("bound the answer read");
     // SAFETY: a fork whose child does nothing but async-signal-safe work:
     // it drops its privileges, connects, writes, reads and exits. The
     // parent only reads the pipe.
@@ -282,10 +426,16 @@ fn ask_as_nobody(socket: &str, frame: &str) -> String {
                 libc::setgid(NOBODY);
                 libc::setuid(NOBODY);
             }
-            let mut stream = match UnixStream::connect(socket) {
+            let mut stream = match connect_deadline(socket, 5_000) {
                 Ok(s) => s,
-                Err(_) => std::process::exit(1),
+                Err(e) => {
+                    // The parent's assertion must say *why* the peer is
+                    // silent, not just that it is.
+                    let _ = child_end.write_all(format!("connect: {e}\n").as_bytes());
+                    std::process::exit(1);
+                }
             };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
             let _ = stream.write_all(frame.as_bytes());
             let mut line = String::new();
             let _ = BufReader::new(&stream).read_line(&mut line);
@@ -314,11 +464,37 @@ fn ask_as_nobody(socket: &str, frame: &str) -> String {
 /// same binary an operator uses.
 fn zctl(scratch: &Scratch, args: &[&str]) -> std::process::Output {
     let bin = zctl_path().expect("the zctl binary was not built");
-    Command::new(bin)
+    let mut child = Command::new(bin)
         .args(args)
         .env("ZINIT_SOCKET", scratch.at("ctl"))
-        .output()
-        .expect("cannot run zctl")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("cannot run zctl");
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .expect("cannot collect zctl output");
+            }
+            Ok(None) => {}
+            Err(e) => panic!("waiting on zctl failed: {e}"),
+        }
+        if start.elapsed() >= Duration::from_secs(10) {
+            let _ = child.kill();
+            let out = child
+                .wait_with_output()
+                .expect("cannot collect zctl output");
+            panic!(
+                "zctl {args:?} did not answer within 10s against {}: stderr={}",
+                scratch.at("ctl"),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        sleep_ms(20);
+    }
 }
 
 /// A service description with the boilerplate every test here needs.
@@ -443,7 +619,8 @@ impl<'a> Sup<'a> {
             assert!(
                 start.elapsed() < Duration::from_millis(deadline_ms),
                 "no live pid in {file} after {deadline_ms}ms: `zinit --sup` was pointed at a \
-                 directory with a service in it, and no real process ever appeared"
+                 directory with a service in it, and no real process ever appeared\n{}",
+                self.scratch.tail("sup.log")
             );
             sleep_ms(POLL_MS);
         }
@@ -1080,8 +1257,6 @@ fn a_broken_configuration_starts_in_emergency_mode() {
 /// the cap the connection is closed before it is registered.
 #[test]
 fn the_control_socket_refuses_more_clients_than_it_can_hold() {
-    use std::os::unix::net::UnixStream;
-
     let _one = serial();
     let scratch = Scratch::new("clientcap");
     scratch.conf(
@@ -1094,10 +1269,13 @@ fn the_control_socket_refuses_more_clients_than_it_can_hold() {
     let mut sup = Sup::start(&scratch);
     let _pid = sup.await_live_pid("svc.pid", START_DEADLINE_MS);
 
-    // More connections than the cap, all of them held open.
+    // More connections than the cap, all of them held open. `connect` is
+    // bounded: once the backlog is full the kernel stops completing new
+    // connections, and a blocking connect would wait there forever (which is
+    // how this test used to hang musl CI for the full job timeout).
     let mut held = Vec::new();
     for _ in 0..(crate_cap() + 8) {
-        match UnixStream::connect(scratch.at("ctl")) {
+        match connect_deadline(&scratch.at("ctl"), 2_000) {
             Ok(s) => held.push(s),
             Err(_) => break,
         }
@@ -1387,6 +1565,13 @@ fn the_sandbox_really_confines() {
         let _ = std::fs::write(scratch.at("skipped"), "no unshare binary\n");
         return;
     }
+    if !can_unshare_mount() {
+        let _ = std::fs::write(
+            scratch.at("skipped"),
+            "no mount namespace in this container\n",
+        );
+        return;
+    }
     // The command under test: it needs a namespace, and it says whether it
     // got one. Each service writes **its own** answer — a shared file would be
     // overwritten by whichever finished last, which is exactly the kind of
@@ -1607,6 +1792,15 @@ fn a_service_with_a_cgroup_lands_in_it() {
         let _ = std::fs::write(scratch.at("skipped"), "needs root and cgroup2\n");
         return;
     }
+    // "Mounted" is not "writable": a container with /sys/fs/cgroup bind-mounted
+    // read-only has the hierarchy and still refuses the mkdir the supervisor
+    // needs. Ask the question the supervisor will ask.
+    let probe_dir = "/sys/fs/cgroup/zinit-test-writable";
+    if std::fs::create_dir(probe_dir).is_err() {
+        let _ = std::fs::write(scratch.at("skipped"), "cgroup hierarchy is read-only\n");
+        return;
+    }
+    let _ = std::fs::remove_dir(probe_dir);
     scratch.conf(
         "probe.conf",
         &desc(
@@ -1951,6 +2145,13 @@ fn a_private_tmp_covers_the_scratch_directories() {
     let scratch = Scratch::new("privtmp");
     if unsafe { libc::geteuid() } != 0 {
         let _ = std::fs::write(scratch.at("skipped"), "needs root\n");
+        return;
+    }
+    if !can_unshare_mount() {
+        let _ = std::fs::write(
+            scratch.at("skipped"),
+            "no mount namespace in this container\n",
+        );
         return;
     }
     let tag = format!("zinit-priv-{}", std::process::id());

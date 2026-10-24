@@ -360,3 +360,21 @@ dispositivos, que arranca servicios cuando aparece hardware (USB, drm, etc.).
   microsegundos y exige control del reciclado de pids; se documenta en vez de
   fingir que no existe. Cerrarla del todo pide comparar la identidad del
   proceso (starttime) en el mismo `open`/`readlink`, no un chequeo posterior.
+
+## El tag `v0.2.0-alpha` lleva un test flaky, a propósito
+
+`v0.2.0-alpha` (`32c92d1`) es anterior a `2781c72`. En ese tag,
+`the_visible_state_follows_the_plan` puede leer el fichero de estado antes de
+que el supervisor publique `state=Running` y fallar en un runner lento (visto
+una vez en aarch64). **El tag no se reescribe**: está publicado, los assets
+del release son binarios y ningún binario lleva tests dentro.
+
+Consecuencia exacta: si haces `git checkout v0.2.0-alpha && cargo test`,
+puedes ver ese fallo. Si quieres el fix, usa `main`. No es un bug del
+supervisor ni del binario que se instala.
+
+El contrato del suite es "toda espera tiene deadline". El 2026-10-23 los legs
+musl de `distro` agotaron los 45 minutos del job porque dos esperas no lo
+cumplían (`connect(2)` bloqueado con el backlog lleno, y `zctl` sin timeout);
+arreglado en `3dc2966` (rama de cierre, merge a `main` en la misma sesión). Un cuelgue de test es un
+fallo, nunca una razón para subir el timeout del job.

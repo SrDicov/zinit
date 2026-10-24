@@ -8,7 +8,8 @@
 
 **Estado**: alpha `v0.2.0-alpha` — usable, con los límites escritos en
 [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md). **633 tests, 0 fallos, clippy 0,
-`cargo doc` limpio.**
+`cargo doc` limpio.** Lo que falta para beta es hardware, no código:
+[`docs/BETA.md`](docs/BETA.md).
 
 | Crate | Qué es | Estado | Tests |
 |---|---|---|---|

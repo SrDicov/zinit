@@ -2185,6 +2185,91 @@ mod tests {
         }
     }
 
+    /// Every failure that carries advice, with the exact sentence it carries.
+    ///
+    /// `help` is what the operator reads after the rejection; an arm that falls
+    /// through to `None` leaves them with "that value is wrong" and no way
+    /// forward. The text is pinned because the test's claim is not "some help
+    /// exists" but "this failure gets *this* instruction".
+    #[test]
+    fn help_says_what_to_write_instead() {
+        let rows: [(&str, ValueError<'_>, &str); 9] = [
+            (
+                "a number with a decimal point",
+                parse_duration("1.5s").unwrap_err().into(),
+                "write a plain decimal number, e.g. `30s`",
+            ),
+            (
+                "an unknown unit",
+                parse_duration("10q").unwrap_err().into(),
+                "units are `ms`, `s`, `m`, `h`, `d`; a number with no unit is seconds",
+            ),
+            (
+                "a duration that cannot be stored",
+                parse_duration("18446744073709551615s").unwrap_err().into(),
+                "pick a smaller duration or a coarser unit (`h`, `d`)",
+            ),
+            (
+                "an empty ready probe",
+                ReadySpec::parse("").unwrap_err().into(),
+                "`ready = none` if the service has no handshake; that is always allowed",
+            ),
+            (
+                "ready = tcp:0",
+                ReadySpec::parse("tcp:0").unwrap_err().into(),
+                "if the port comes from the environment, there is no `ready` probe that works before the service binds it",
+            ),
+            (
+                "ready = tcp:65536",
+                ReadySpec::parse("tcp:65536").unwrap_err().into(),
+                "a TCP port is 1-65535",
+            ),
+            (
+                "log = syslog:x",
+                LogSpec::parse("syslog:x").unwrap_err().into(),
+                "`log = none` and `log = syslog` take nothing after the colon",
+            ),
+            (
+                "listen = tcp:0",
+                parse_listen("tcp:0").unwrap_err().into(),
+                "if the port comes from the environment, no probe can work yet",
+            ),
+            (
+                "listen = tcp:65536",
+                parse_listen("tcp:65536").unwrap_err().into(),
+                "a TCP port is 1-65535",
+            ),
+        ];
+        for (label, err, advice) in rows {
+            assert_eq!(err.help().as_deref(), Some(advice), "{label}");
+        }
+        // The other direction: a failure with nothing useful to add must not
+        // invent advice — a generic sentence on every error trains operators
+        // to ignore the field.
+        let empty: ValueError<'_> = parse_duration("").unwrap_err().into();
+        assert_eq!(empty.help(), None);
+    }
+
+    /// `From<RestartSpec>` for the two halves must hand over the real spec.
+    ///
+    /// Both impls exist so a call site can write `spec.into()`; a default value
+    /// there would silently disable restarts (policy `never`) or set a budget
+    /// of zero, and neither shows up in a parse test.
+    #[test]
+    fn restart_spec_converts_to_its_two_halves() {
+        // Non-default values on purpose: `Default::default()` behind either
+        // `From` would pass a comparison against the default.
+        let always = RestartSpec::parse("always").expect("fixture must parse");
+        assert_eq!(Restart::from(always), zcore::Restart::Always);
+        let budget = RestartSpec::parse("7 restarts per 90s").expect("fixture must parse");
+        assert_eq!(Budget::from(budget), budget.budget);
+        assert_eq!(Budget::from(budget).capacity, 7);
+        let split: Budget = budget.into();
+        assert_eq!(split, budget.budget);
+        let policy: Restart = always.into();
+        assert_eq!(policy, zcore::Restart::Always);
+    }
+
     /// One representative of every *kind* of failure, and the guarantee that a
     /// machine-readable code identifies exactly one of them. Two failures
     /// sharing a code would break any tooling that groups or suppresses by
@@ -2613,6 +2698,9 @@ mod tests {
         // separator: splitting it would silently bind somewhere else.
         let d = parse_listen("unix:/run/we:ird.sock").unwrap();
         assert_eq!(d.spec, ListenSpec::UnixPath("/run/we:ird.sock".to_string()));
+        // 65535 is the last legal port: the bound is `> u16::MAX`, not `>=`.
+        let e = parse_listen("tcp:65535").unwrap();
+        assert_eq!(e.spec, ListenSpec::TcpPort(65535));
     }
 
     #[test]
@@ -2642,21 +2730,62 @@ mod tests {
 
     #[test]
     fn capability_numbers_are_pinned() {
-        // Spot-checked against `capsh --decode` on the running kernel (every
-        // entry was verified that way when the table landed). A move here is
-        // a dropped wrong privilege, not a typo.
-        for (name, nr) in [
+        // Checked against `capsh --decode` on the running kernel when the
+        // table landed. A move here is a dropped wrong privilege, not a typo,
+        // so the table is complete: every arm of `parse_capability` appears
+        // once, and the numbers are asserted to be exactly 0..=40 (a
+        // duplicated number would leave one capability unreachable while the
+        // other is dropped twice).
+        let all: [(&str, u32); 41] = [
             ("chown", 0),
+            ("dac_override", 1),
+            ("dac_read_search", 2),
+            ("fowner", 3),
+            ("fsetid", 4),
+            ("kill", 5),
+            ("setgid", 6),
+            ("setuid", 7),
+            ("setpcap", 8),
+            ("linux_immutable", 9),
             ("net_bind_service", 10),
             ("net_broadcast", 11),
+            ("net_admin", 12),
+            ("net_raw", 13),
+            ("ipc_lock", 14),
+            ("ipc_owner", 15),
+            ("sys_module", 16),
+            ("sys_rawio", 17),
+            ("sys_chroot", 18),
+            ("sys_ptrace", 19),
+            ("sys_pacct", 20),
             ("sys_admin", 21),
+            ("sys_boot", 22),
+            ("sys_nice", 23),
+            ("sys_resource", 24),
+            ("sys_time", 25),
+            ("sys_tty_config", 26),
+            ("mknod", 27),
+            ("lease", 28),
+            ("audit_write", 29),
+            ("audit_control", 30),
             ("setfcap", 31),
             ("mac_override", 32),
+            ("mac_admin", 33),
+            ("syslog", 34),
+            ("wake_alarm", 35),
+            ("block_suspend", 36),
+            ("audit_read", 37),
+            ("perfmon", 38),
             ("bpf", 39),
             ("checkpoint_restore", 40),
-        ] {
+        ];
+        for (name, nr) in all {
             assert_eq!(parse_capability(name), Some(nr), "{name} moved?");
         }
+        assert_eq!(MAX_CAPABILITY, 40);
+        let mut numbers: Vec<u32> = all.iter().map(|&(_, nr)| nr).collect();
+        numbers.sort_unstable();
+        assert_eq!(numbers, (0..=MAX_CAPABILITY).collect::<Vec<u32>>());
     }
 
     #[test]
