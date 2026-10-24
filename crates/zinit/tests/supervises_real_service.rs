@@ -85,6 +85,10 @@ fn sleep_ms(ms: u64) {
 /// capability to mean anything (private-tmp and the sandbox): without it the
 /// unconfined baseline fails too, and a "failure" would say nothing about
 /// zinit's own confinement.
+///
+/// Linux-only because both callers are: on macOS/BMP there is no `unshare`
+/// to call and `-D warnings` turns the dead function into a build failure.
+#[cfg(target_os = "linux")]
 fn can_unshare_mount() -> bool {
     Command::new("unshare")
         .args(["-m", "true"])
