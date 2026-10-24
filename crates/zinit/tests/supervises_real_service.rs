@@ -167,18 +167,18 @@ fn connect_deadline(path: &str, deadline_ms: u64) -> std::io::Result<UnixStream>
 
     // SAFETY: a fresh non-blocking socket, owned by this function until it is
     // wrapped below; no other pointer or thread can see the fd.
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
+    //
+    // Plain `SOCK_STREAM` and a portable `set_nonblocking` on purpose: the
+    // `SOCK_NONBLOCK`/`SOCK_CLOEXEC` flags are Linux-only in `libc`, and this
+    // file builds on macOS runners too (`E0425: cannot find value
+    // SOCK_NONBLOCK`). Nothing here execs, so close-on-exec buys nothing.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: `fd` is a socket created one line above and handed to nobody else.
     let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    stream.set_nonblocking(true)?;
 
     // SAFETY: `addr` is a valid sockaddr_un initialised for exactly `len` bytes.
     let rc = unsafe {
