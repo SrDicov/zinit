@@ -111,9 +111,29 @@ Contrato en `AUDIT.md` (sección final).
 | `b9f05c9` | `hw-verification.sh full` / `kill-term-1` / `after-reboot` / `dinit-removal-check` |
 | `16746be` | `docs/BETA.md` + `docs/HW-VERIFICATION.md` al día |
 
-Evidencia local: `cargo test -p zinit --test supervises_real_service` 27/27
-(11,6 s), clippy `-D warnings` 0, `cargo fmt --all --check` limpio. En Alpine
-(podman) los cuatro tests que fallaban pasan (tres como skip con razón).
+Evidencia local: `cargo test --workspace` **639 passed, 0 failed, 1 ignored**;
+`cargo build --workspace --release`, clippy `-D warnings`, `fmt --check` y
+`cargo doc` con `-D warnings` limpios. En Alpine (podman) los cuatro tests que
+fallaban pasan (tres como skip con razón).
+
+Mutantes cerrados esta noche, medidos por archivo con
+`cargo mutants --file`:
+
+| archivo | antes | después | mide |
+|---|---|---|---|
+| `zconfig/src/value.rs` | 48 | **0** | 208 mutantes: 200 caídos, 8 no viables |
+| `zconfig/src/desc.rs` | 12 | **0** | 77 mutantes, 77 caídos |
+
+`zconfig` queda en 56 missed (parser 23, graph 21, plan 12). La trampa que
+costó una vuelta: un fixture `5 restarts per 1m` **es** el `Default`, así que
+`From<RestartSpec>` mutado a `Default::default()` pasaba; hay que usar valores
+que no coincidan con el default.
+
+Dos fallos de CI que solo aparecieron al correr los legs de verdad (no en el
+contenedor local): `macos-aarch64` no tiene `SOCK_NONBLOCK` en `libc` (connect
+portable ahora) y los legs corren como root, donde un `chmod 0555` no niega la
+escritura (el test de rotación pregunta si el modo tomó efecto antes de
+afirmar).
 
 ### Lo único que falta para beta
 

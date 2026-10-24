@@ -151,6 +151,9 @@ beta sin soak + power-test: eso es hardware, no código.
 
 - [x] **B1** `docs/audit/mutants-costs.md`: tabla Archivo | Missed | Tipo |
   Coste | Prioridad, con los números ya medidos.
+- [x] **B2** Los dos «pre-beta» de `zconfig` cerrados a 0, medidos por archivo:
+  `value.rs` 48 → 0 (208 mutantes) y `desc.rs` 12 → 0 (77). `zconfig` baja de
+  116 a 56. El resto (parser, graph, plan) sigue con coste en la tabla.
 
 - [x] **C1** `KNOWN_ISSUES.md`: el flaky del state congelado en el tag, y que
   los binarios no llevan tests.

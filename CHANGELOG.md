@@ -14,6 +14,11 @@
   `dinit-removal-check` de solo lectura.
 - `docs/BETA.md` (5 pre-requisitos y proceso de tag), `docs/CI.md` (qué es
   gate y qué es red) y `docs/audit/mutants-costs.md` (coste por mutante).
+- Mutantes de `zconfig` que eran «pre-beta, unitario puro», cerrados a 0:
+  `value.rs` 48 → 0 (tabla completa de 41 capabilities, los nueve `help`
+  fijados, los dos `From<RestartSpec>` con fixtures no-default, borde
+  `tcp:65535`) y `desc.rs` 12 → 0 (overlay silencioso con todos los campos,
+  dedup de directivas acumulativas, accesos de aristas). `zconfig` baja a 56.
 
 ## [v0.2.0-alpha] - 2026-10-23
 ### Cierre de alpha
