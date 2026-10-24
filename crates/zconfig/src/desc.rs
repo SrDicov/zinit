@@ -1212,4 +1212,134 @@ mod overlay_tests {
         assert_eq!(base.source, "base.conf + base.d/10.conf");
         assert_eq!(base.command, "/bin/b");
     }
+
+    /// Repeating a line in a drop-in must be a no-op, not a second socket.
+    ///
+    /// A base file and a drop-in that both say `listen = tcp:80` are one
+    /// socket; two copies would bind twice (the supervisor's second bind is a
+    /// re-check, not a second listener) and, worse, make the descriptor count
+    /// depend on how many layers repeated the line.
+    #[test]
+    fn repeating_an_accumulating_directive_does_not_duplicate_it() {
+        let body = "command = /bin/a\n\
+                    listen = tcp:80\n\
+                    drop-capabilities = net_raw\n\
+                    syscall-filter = errno\n\
+                    syscall-allow = kill\n\
+                    depends = net, opt:db, after:disks\n\
+                    env = A=1\n\
+                    rlimit-nofile = 1024\n";
+        let mut base = parsed("svc", body);
+        let before = (
+            base.listens.len(),
+            base.drop_caps.len(),
+            base.syscall_allow.len(),
+            base.depends_len(),
+            base.env.len(),
+            base.rlimits.len(),
+        );
+        base.overlay_onto(parsed("svc", body));
+        assert_eq!(
+            (
+                base.listens.len(),
+                base.drop_caps.len(),
+                base.syscall_allow.len(),
+                base.depends_len(),
+                base.env.len(),
+                base.rlimits.len(),
+            ),
+            before,
+            "a repeated line became a second entry"
+        );
+    }
+
+    /// `${VAR}` in any layer makes the whole description need expansion.
+    ///
+    /// The flag is a bit that can only be set: a drop-in that introduces an
+    /// expansion must not be forgotten because the base had none.
+    #[test]
+    fn env_expansion_need_is_sticky_across_an_overlay() {
+        let mut base = parsed("svc", "command = /bin/a\n");
+        assert!(!base.needs_env_expansion);
+        let over = parsed("svc", "command = /bin/a\nenv = B=${X}\n");
+        assert!(
+            over.needs_env_expansion,
+            "the fixture must carry an expansion"
+        );
+        base.overlay_onto(over);
+        assert!(base.needs_env_expansion, "the overlay forgot the expansion");
+    }
+
+    /// The three edge accessors read all three lists, not just the first.
+    #[test]
+    fn edge_accessors_see_every_list() {
+        let d = parsed("svc", "command = /bin/a\ndepends = a, opt:b, after:c\n");
+        assert_eq!(d.depends_len(), 3);
+        assert!(d.depends_on("a") && d.depends_on("b") && d.depends_on("c"));
+        assert!(!d.depends_on("zzz"));
+        assert!(d.requires("a"));
+        assert!(!d.requires("b"), "opt: is not a required edge");
+        // Non-default policy: `Default::default()` behind the accessor would
+        // report whatever the enum's default is.
+        let always = parsed("svc", "command = /bin/a\nrestart = always\n");
+        assert_eq!(always.restart_policy(), zcore::Restart::Always);
+    }
+
+    /// Every directive `overlay_onto` handles, set on the base to a value that
+    /// differs from its default, then a drop-in that says only `command`.
+    ///
+    /// One comparison kills the whole class of "forgot to ask `is_explicit`"
+    /// bugs: the overlay's parser-filled defaults would clobber every field
+    /// whose guard was dropped, and the base is a single clone away from what
+    /// the result must be. Written as a table-free fixture on purpose — the
+    /// directive list is the parser's, and a fixture that silently omitted one
+    /// would be the same bug it is testing for.
+    #[test]
+    fn a_silent_overlay_touches_exactly_one_field() {
+        // `type = console` so `tty` is legal; the `forking` half (pid-file) is
+        // the second fixture below, because a description cannot be both.
+        let mut base = parsed(
+            "svc",
+            "command = /bin/a\n\
+             type = console\n\
+             tty = /dev/tty3\n\
+             restart = always\n\
+             restart-budget = 3 restarts per 10s\n\
+             restart-delay = 2s\n\
+             on-fatal = halt\n\
+             ready = notify\n\
+             ready-timeout = 7s\n\
+             stop-timeout = 20s\n\
+             start-timeout = 30s\n\
+             user = nobody\n\
+             log = file:/tmp/x.log\n\
+             critical = yes\n\
+             enabled = no\n\
+             on-demand = yes\n\
+             private-tmp = yes\n\
+             cgroup = probe\n\
+             watchdog-sec = 5\n\
+             drop-capabilities = net_raw\n\
+             syscall-filter = enforce\n\
+             syscall-allow = kill\n\
+             depends = after:db\n\
+             env = A=1\n\
+             rlimit-nofile = 4096\n",
+        );
+        let over = parsed("svc", "command = /bin/b\n");
+        let mut expected = base.clone();
+        expected.command = "/bin/b".into();
+        base.overlay_onto(over);
+        assert_eq!(base, expected);
+
+        let mut forking = parsed(
+            "svc",
+            "command = /bin/a\ntype = forking\npid-file = /run/a.pid\n",
+        );
+        let quiet = parsed("svc", "command = /bin/b\n");
+        let mut expected = forking.clone();
+        expected.command = "/bin/b".into();
+        forking.overlay_onto(quiet);
+        assert_eq!(forking, expected, "a silent drop-in dropped the pid file");
+    }
 }
