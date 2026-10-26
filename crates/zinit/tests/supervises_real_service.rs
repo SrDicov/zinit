@@ -294,6 +294,7 @@ impl Scratch {
     /// file in one of those directories: the write lands in the private
     /// tmpfs, the read sees nothing, and the failure looks like a service
     /// that never ran. The manifest's `target/` is outside all three.
+    #[cfg(target_os = "linux")]
     fn new_outside_tmp(tag: &str) -> Scratch {
         let pid = std::process::id();
         let mut candidates: Vec<PathBuf> = Vec::new();
