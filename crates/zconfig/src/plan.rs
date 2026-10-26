@@ -1525,6 +1525,55 @@ mod tests {
         assert_eq!(heap_pop(&mut Vec::new()), None);
     }
 
+    /// Deep enough to exercise the index arithmetic in both directions.
+    ///
+    /// The small cases above never reach the third level of the tree, so
+    /// `parent * 2 + 1`, `left + 1`, `(child - 1) / 2` and the bounds checks
+    /// could all be wrong and still sort five elements. Sixteen values with
+    /// duplicates also prove the tie-break neither loops nor drops one.
+    #[test]
+    fn the_heap_sorts_a_deep_slice_with_duplicates() {
+        let mut pushed: Vec<Idx> = Vec::new();
+        for v in [11usize, 3, 7, 0, 15, 2, 2, 9, 14, 1, 8, 3, 12, 5, 10, 6] {
+            heap_push(&mut pushed, v);
+            // The invariant after *every* push, not just at the end: a push
+            // that leaves the root wrong but a pop-repairing heap would still
+            // sort correctly when everything is popped.
+            assert_eq!(pushed[0], *pushed.iter().min().expect("not empty"));
+        }
+        let mut out = Vec::new();
+        while let Some(v) = heap_pop(&mut pushed) {
+            out.push(v);
+        }
+        let mut want = vec![11usize, 3, 7, 0, 15, 2, 2, 9, 14, 1, 8, 3, 12, 5, 10, 6];
+        want.sort_unstable();
+        assert_eq!(out, want);
+
+        // Odd length: `heapify`'s bottom-up start (`div_ceil(2)`) must cover
+        // the last parent with a single child.
+        let mut heap: Vec<Idx> = vec![16, 1, 9, 3, 12, 5, 7, 0, 14, 2, 11, 6, 8, 4, 15, 10, 13];
+        heapify(&mut heap);
+        let mut out = Vec::new();
+        while let Some(v) = heap_pop(&mut heap) {
+            out.push(v);
+        }
+        assert_eq!(out, (0..=16).collect::<Vec<Idx>>());
+    }
+
+    /// The reported cycle is the loop, not the route into it, and a dead-end
+    /// dependency before the loop must be walked and left behind.
+    ///
+    /// `a` needs `x` (a leaf, placed by Kahn) and then `b`; `b -> c -> a`.
+    /// The walk has to step past `x` before it closes the loop, which is what
+    /// the step counter and the stack trim are for.
+    #[test]
+    fn the_cycle_path_skips_the_route_into_the_loop() {
+        match cycle_error(&[("a", &["x", "b"]), ("x", &[]), ("b", &["c"]), ("c", &["a"])]) {
+            GraphError::Cycle { path } => assert_eq!(path, ["a", "b", "c", "a"]),
+            other => panic!("expected Cycle, got {other:?}"),
+        }
+    }
+
     /// The reverse CSR the sort walks, checked against the obvious O(V^2)
     /// formulation. They have to agree, because one of them is only ever
     /// inspected by tests.

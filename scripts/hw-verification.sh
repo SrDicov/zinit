@@ -4,15 +4,21 @@
 # Everything that needs the box is one command here, because every one of
 # these steps has already been done wrong once by hand.
 #
-#   hw-verification.sh deploy <artifact-dir> [--sha256 HASH]
+#   hw-verification.sh full [hours] [<artifact-dir>] [--sha256 HASH] [--dry-run]
+#   hw-verification.sh deploy <artifact-dir> [--sha256 HASH] [--dry-run]
 #   hw-verification.sh verify
 #   hw-verification.sh soak [hours]
 #   hw-verification.sh soak-report
 #   hw-verification.sh power-test
+#   hw-verification.sh kill-term-1
 #   hw-verification.sh verify-power
+#   hw-verification.sh dinit-removal-check
+#   hw-verification.sh after-reboot
 #
-# `deploy` and `verify` are safe. `soak` leaves a background loop running.
-# `power-test` POWERS THE MACHINE OFF: that is what the test is.
+# `deploy`, `verify`, `soak-report`, `dinit-removal-check` are safe.
+# `soak` is a blocking loop. `power-test` and `kill-term-1` POWER THE MACHINE
+# OFF: that is what they test. `full` chains deploy -> soak -> the shutdown
+# test, so `after-reboot` is the second half, run once the machine is back.
 set -eu
 
 ZINIT_BIN=${ZINIT_BIN:-/usr/bin/zinit}
@@ -72,6 +78,10 @@ cmd_deploy() {
     fi
 
     say "installing (rename, never overwrite a running binary)"
+    if [ "$DRY_RUN" = "1" ]; then
+        printf '   dry run: would install %s and %s (hash ok, nothing touched)\n' "$ZINIT_BIN" "$ZCTL"
+        return
+    fi
     $SUDO install -m 0755 "$dir/zinit" "$ZINIT_BIN.new"
     $SUDO install -m 0755 "$dir/zctl" "$ZCTL.new"
     $SUDO mv "$ZINIT_BIN.new" "$ZINIT_BIN"
@@ -161,20 +171,46 @@ cmd_soak_report() {
     { printf 'soak report\n'; cat "$SOAK_TSV"; } >> "$SOAK_LOG"
 }
 
-cmd_power_test() {
-    [ "$(cat /proc/1/comm 2>/dev/null)" = "zinit" ] || die "PID 1 is not zinit: this test is about the init path"
-    printf '\n'; printf '  SIGTERM to PID 1 powers the machine OFF. Everything unsaved is lost.\n'
+# Both shutdown tests destroy the running system, so the confirmation is one
+# function: the words are the operator's proof that the machine was meant to go
+# down, and the breadcrumb is written and synced *before* the trigger.
+confirm_power() {
+    printf '\n'; printf '  %s\n' "$1"
+    printf '  Everything unsaved is lost.\n'
     printf '  Type the word poweroff to continue: '
     read -r answer
     [ "$answer" = "poweroff" ] || die "not confirmed"
-    # Written and synced *before* the signal: nothing after it is guaranteed.
-    printf '%s SIGTERM to PID 1 about to be sent\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | $SUDO tee -a "$POWER_MARK" >/dev/null
+    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" | $SUDO tee -a "$POWER_MARK" >/dev/null
     $SUDO sync
+}
+
+# Did the machine actually go down? If it is still here after the grace
+# period, the trigger did not reach the power path: that is the bug.
+still_up() {
+    sleep 5
+    say "still up after 5s: the $1 path did not fire (that is the bug)"
+    exit 1
+}
+
+cmd_power_test() {
+    [ "$(cat /proc/1/comm 2>/dev/null)" = "zinit" ] || die "PID 1 is not zinit: this test is about the init path"
+    need_socket
+    confirm_power "zctl poweroff asks PID 1 to power the machine off." "zctl poweroff about to be sent"
+    say "sending the operator verb; the machine should go down in an orderly way"
+    "$ZCTL" poweroff || die "zctl poweroff was refused"
+    still_up "poweroff"
+}
+
+# The signal path, as opposed to the operator verb above: Ctrl-Alt-Del is
+# SIGINT (reboot) and SIGTERM is poweroff, straight from the kernel. This is
+# the one an operator cannot type, so it gets its own test.
+cmd_kill_term_1() {
+    [ "$(cat /proc/1/comm 2>/dev/null)" = "zinit" ] || die "PID 1 is not zinit: this test is about the init path"
+    need_socket
+    confirm_power "SIGTERM to PID 1 powers the machine OFF." "SIGTERM to PID 1 about to be sent"
     say "sending SIGTERM to PID 1; the machine should go down in an orderly way"
     $SUDO kill -TERM 1
-    sleep 5
-    say "still up after 5s: the power path did not fire (that is the bug)"
-    exit 1
+    still_up "SIGTERM"
 }
 
 cmd_verify_power() {
@@ -189,10 +225,87 @@ cmd_verify_power() {
     say "logind/init state: $(cat /proc/1/comm 2>/dev/null)"
 }
 
+# Nothing here removes anything: it only says what still owns dinit and what
+# would break first (devmon is the known one). Read-only on purpose.
+cmd_dinit_check() {
+    say "dinit removal check (read-only)"
+    found=0
+    for b in dinit dinitctl; do
+        p=$(command -v "$b" 2>/dev/null || true)
+        if [ -n "$p" ]; then printf '   binary: %s\n' "$p"; found=1; fi
+    done
+    for d in /etc/dinit.d /usr/lib/dinit.d; do
+        if [ -d "$d" ]; then
+            n=$(find "$d" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')
+            printf '   config: %s (%s entries)\n' "$d" "$n"
+            found=1
+        fi
+    done
+    p=$(pgrep -x dinit 2>/dev/null | head -n 1 || true)
+    if [ -n "$p" ]; then printf '   running: dinit pid %s\n' "$p"; found=1; fi
+    if command -v devmon >/dev/null 2>&1; then
+        printf '   devmon: %s (ships in dinit-base; what starts it?)\n' "$(command -v devmon)"
+        found=1
+    fi
+    if [ "$found" = "0" ]; then
+        say "PASS: no dinit binary, config, process or devmon on this machine"
+        return
+    fi
+    say "not removable by this check alone:"
+    printf '   - remove the package that owns the entries above (distro package manager)\n'
+    printf '   - keep dinit-base while devmon is what automounts /run/media or /media\n'
+    printf '   - then verify /sbin/init is zinit and reboot; the box must come back\n'
+}
+
+cmd_after_reboot() {
+    cmd_verify_power
+    cmd_dinit_check
+}
+
+# The night in one command, in the only order that is physically possible: the
+# shutdown test ends the boot, so `after-reboot` is the second half. Nothing
+# here is skipped on a failure: `set -e` stops the chain at the first red step.
+cmd_full() {
+    hours=${1:-24}; dir=${2:-}; sha=${3:-}
+    # Checked here, not only in the shutdown step: 24 hours of soak followed by
+    # "PID 1 is not zinit" is a night wasted on the wrong machine. A dry run
+    # runs on a development box, so it only says what it would check.
+    if [ "$DRY_RUN" = "1" ]; then
+        say "dry run: not checking PID 1 (a real run ends in a power test)"
+    else
+        [ "$(cat /proc/1/comm 2>/dev/null)" = "zinit" ] || die "PID 1 is not zinit: this chain ends in a power test"
+    fi
+    if [ -n "$dir" ]; then cmd_deploy "$dir" "$sha"; else cmd_verify; fi
+    if [ "$DRY_RUN" = "1" ]; then
+        say "dry run: stopping before the soak and the shutdown test"
+        return
+    fi
+    cmd_soak "$hours"
+    say "soak is green; the machine powers off next, then: hw-verification.sh after-reboot"
+    cmd_kill_term_1
+}
+
 SUDO=${SUDO:-}
 [ "$(id -u)" = "0" ] || SUDO=${SUDO:-sudo}
 
+# `--dry-run` is the one flag that belongs to no command: strip it first.
+DRY_RUN=0
+rest=""
+for a in "$@"; do
+    case $a in
+    --dry-run) DRY_RUN=1 ;;
+    *) rest="$rest $a" ;;
+    esac
+done
+# shellcheck disable=SC2086 # the artifact path carries no spaces; POSIX has no arrays
+set -- $rest
+
 case ${1:-} in
+help | -h | --help | '')
+    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+    [ -n "${1:-}" ] && exit 0
+    exit 2
+    ;;
 deploy)
     shift
     sha=""
@@ -209,9 +322,27 @@ verify) cmd_verify ;;
 soak) shift; cmd_soak "${1:-24}" ;;
 soak-report) cmd_soak_report ;;
 power-test) cmd_power_test ;;
+kill-term-1) cmd_kill_term_1 ;;
 verify-power) cmd_verify_power ;;
+dinit-removal-check) cmd_dinit_check ;;
+after-reboot) cmd_after_reboot ;;
+full)
+    shift
+    hours=24
+    dir=""
+    sha=""
+    while [ $# -gt 0 ]; do
+        case $1 in
+        --sha256) sha=${2:-}; shift 2 ;;
+        --hours) hours=${2:-24}; shift 2 ;;
+        -* ) die "unknown flag: $1" ;;
+        *) dir=$1; shift ;;
+        esac
+    done
+    cmd_full "$hours" "$dir" "$sha"
+    ;;
 *)
-    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
-    exit 2
+    die "unknown command: $1 (try --help)"
     ;;
 esac
+

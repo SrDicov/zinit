@@ -13,8 +13,19 @@ name: distro
 # node *inside* the container, and minimal images (void bare, chimera 7.6 MB)
 # lack the loader/libs it expects (`exec /__e/node24/bin/node: no such file
 # or directory`). Only build/test runs in-container; zero action steps do.
-# No cache either: a shared `target/` across libc variants is poison.
-# No clippy/fmt here (covered by `ci.yml`); build + test only.
+#
+# No cache, on purpose: the workspace has exactly one third-party dependency
+# (`libc`), so there are no crate sources worth caching, and a `target/` shared
+# across libc variants is poison (glibc objects in a musl link). The expensive
+# part is the toolchain download, which is per-image and cannot be shared.
+# `docs/CI.md` records the measurements behind this.
+#
+# No clippy/fmt here (covered by `ci.yml`); build + test only. The `cargo
+# build --workspace` is not redundant: the integration suite runs the real
+# `zctl` binary from the target directory, and `cargo test --workspace` does
+# not produce it (the zctl crate has no test target of its own), so without
+# the build every socket test skips itself for lack of a binary. `--all-targets`
+# was dropped: it built the test harnesses twice for nothing.
 on:
   push:
     branches: [main]
@@ -34,7 +45,10 @@ jobs:
   distro:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # A full leg (toolchain + build + 633 tests on musl) ran in ~65 s of test
+    # time once the suite stopped hanging; 25 min leaves room for a slow
+    # runner and still reports a new hang in half the old 45-minute window.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -90,7 +104,7 @@ jobs:
           && (command -v cargo || curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs
           | sh -s -- -y --default-toolchain stable --profile minimal)
           && export PATH="$HOME/.cargo/bin:$PATH"
-          && cargo build --workspace --all-targets
+          && cargo build --workspace
           && cargo test --workspace'
       # The Alpine container builds real musl. Publish its supervisor binary
       # so a cage can measure it: the artifact is how benchmark claims about
