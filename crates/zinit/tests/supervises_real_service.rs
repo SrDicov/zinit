@@ -260,6 +260,15 @@ struct Scratch {
     dir: PathBuf,
 }
 
+/// `target/test-scratch/<tag>-<pid>`, the fallback every scratch list ends with.
+fn manifest_scratch(tag: &str, pid: u32) -> PathBuf {
+    let mut manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest.push("target");
+    manifest.push("test-scratch");
+    manifest.push(format!("{tag}-{pid}"));
+    manifest
+}
+
 impl Scratch {
     fn new(tag: &str) -> Scratch {
         let pid = std::process::id();
@@ -273,12 +282,32 @@ impl Scratch {
             h.push(format!("zinit-{tag}-{pid}"));
             candidates.push(h);
         }
-        let mut manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        manifest.push("target");
-        manifest.push("test-scratch");
-        manifest.push(format!("{tag}-{pid}"));
-        candidates.push(manifest);
+        candidates.push(manifest_scratch(tag, pid));
+        Scratch::pick(tag, candidates)
+    }
 
+    /// A scratch directory that a private `/tmp` cannot hide.
+    ///
+    /// `private-tmp = yes` mounts a fresh tmpfs over `/tmp`, `/var/tmp` and
+    /// `/dev/shm` in the service's mount namespace. A test that asks the
+    /// service to write a file and then reads it from here must not put that
+    /// file in one of those directories: the write lands in the private
+    /// tmpfs, the read sees nothing, and the failure looks like a service
+    /// that never ran. The manifest's `target/` is outside all three.
+    fn new_outside_tmp(tag: &str) -> Scratch {
+        let pid = std::process::id();
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(home) = std::env::var("HOME") {
+            let mut h = PathBuf::from(home);
+            h.push(".cache");
+            h.push(format!("zinit-{tag}-{pid}"));
+            candidates.push(h);
+        }
+        candidates.push(manifest_scratch(tag, pid));
+        Scratch::pick(tag, candidates)
+    }
+
+    fn pick(tag: &str, candidates: Vec<PathBuf>) -> Scratch {
         for dir in candidates {
             let _ = std::fs::remove_dir_all(&dir);
             if std::fs::create_dir_all(&dir).is_err() {
@@ -1481,9 +1510,19 @@ fn zinit_boots_as_pid_one_in_a_namespace() {
     // The supervisor must come up and bind the control socket, and the
     // service must be running: PID 1 mounted what it needed and the
     // supervisor did its job inside the namespace.
+    // The pid the service writes is a pid *inside* the namespace. Checking it
+    // with `kill(pid, 0)` from here asks a different process table: on a real
+    // host the number often exists anyway (pid 3 is a kernel thread), so the
+    // test passed for the wrong reason, and in a container where it does not
+    // exist it failed with a service that was running. The state file is
+    // published by the supervisor into the shared directory and answers the
+    // question the test actually has.
     let start = Instant::now();
     let up = loop {
-        if scratch.pid("svc.pid").is_some_and(pid_alive) {
+        if scratch
+            .read("state/probe")
+            .is_some_and(|s| s.contains("state=Running"))
+        {
             break true;
         }
         if start.elapsed() > Duration::from_secs(10) {
@@ -2142,7 +2181,7 @@ fn a_reload_does_not_repeat_warnings_it_already_announced() {
 #[cfg(target_os = "linux")]
 fn a_private_tmp_covers_the_scratch_directories() {
     let _one = serial();
-    let scratch = Scratch::new("privtmp");
+    let scratch = Scratch::new_outside_tmp("privtmp");
     if unsafe { libc::geteuid() } != 0 {
         let _ = std::fs::write(scratch.at("skipped"), "needs root\n");
         return;
@@ -2155,10 +2194,10 @@ fn a_private_tmp_covers_the_scratch_directories() {
         return;
     }
     let tag = format!("zinit-priv-{}", std::process::id());
-    let marker = format!("/tmp/{tag}");
-    let control_marker = format!("/tmp/{tag}-control");
     // Each instance writes its own marker into all three directories, so a
-    // single shared directory is enough to fail the test.
+    // single shared directory is enough to fail the test. The plain service's
+    // marker is the control: if it is missing, the probe itself is broken and
+    // a missing private marker would prove nothing.
     let probe = |name: &str| {
         format!(
             "/bin/sh -c 'for d in /tmp /var/tmp /dev/shm; do [ -d $d ] && echo x > $d/{tag}-{name}; done; \
@@ -2166,13 +2205,16 @@ fn a_private_tmp_covers_the_scratch_directories() {
             scratch.at(&format!("{name}.done"))
         )
     };
+    let plain_marker = format!("/tmp/{tag}-plain");
     scratch.conf(
         "private.conf",
         &desc(&probe("private"), "private-tmp = yes\n"),
     );
     scratch.conf("plain.conf", &desc(&probe("plain"), ""));
-    let _ = std::fs::remove_file(&marker);
-    let _ = std::fs::remove_file(&control_marker);
+    for dir in ["/tmp", "/var/tmp", "/dev/shm"] {
+        let _ = std::fs::remove_file(format!("{dir}/{tag}-plain"));
+        let _ = std::fs::remove_file(format!("{dir}/{tag}-private"));
+    }
 
     let _sup = Sup::start(&scratch);
     assert!(
@@ -2184,10 +2226,8 @@ fn a_private_tmp_covers_the_scratch_directories() {
         scratch.tail("sup.log")
     );
 
-    // The control proves the probe would leave a marker in a shared
-    // directory, so a missing one below means isolation rather than a typo.
     assert!(
-        std::path::Path::new(&control_marker).exists(),
+        std::path::Path::new(&plain_marker).exists(),
         "the unconfined service must leave its marker: the probe is broken"
     );
     for dir in ["/tmp", "/var/tmp", "/dev/shm"] {
@@ -2196,10 +2236,11 @@ fn a_private_tmp_covers_the_scratch_directories() {
             !std::path::Path::new(&leaked).exists(),
             "private-tmp leaked into {dir}"
         );
-        let _ = std::fs::remove_file(format!("{dir}/{tag}-control"));
     }
-    let _ = std::fs::remove_file(&control_marker);
-    let _ = std::fs::remove_file(&marker);
+    for dir in ["/tmp", "/var/tmp", "/dev/shm"] {
+        let _ = std::fs::remove_file(format!("{dir}/{tag}-plain"));
+        let _ = std::fs::remove_file(format!("{dir}/{tag}-private"));
+    }
 }
 
 /// The post-fork path — ids, capability drop, seccomp, `execve` — without
