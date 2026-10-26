@@ -65,3 +65,19 @@ La regla, desde ya:
   no se pretendía, se saca del índice antes de commitear.
 - Si el commit ya salió con basura, se arregla en un commit de limpieza (no se
   reescribe historia) y se anota aquí.
+
+## Estado 2026-10-26 — `main` = `c22c0c3`, todo verde
+
+- PR #25 (`96906d2`) y PR #26 (`c22c0c3`) mergeados. `ci` y `distro` (7/7) en
+  success sobre `main`. El cuelgue de 45 min de `distro` era **tests sin
+  deadline**, no caché ni lentitud.
+- Mutantes de `zconfig`: 116 → 51 (`value.rs` y `desc.rs` a 0, `plan.rs` a 7).
+  El resto está en `docs/audit/mutants-costs.md` con coste y prioridad.
+- Trampa de CI que costó una ronda: `rust-toolchain.toml` fija `stable` y
+  **gana a `rustup default`**; el job de fuzz necesita `RUSTUP_TOOLCHAIN=nightly`
+  en el job, no basta con `dtolnay/rust-toolchain@nightly`.
+- Trampa de test: `fcntl(fd, F_GETFD)` después de `drop` es una carrera con
+  otros hilos del suite que reutilizan el número. Los tests de fd van en
+  `in_isolated_fd_table` (fork), nunca en el proceso multihilo.
+- Beta pendiente **solo** de hardware: `scripts/hw-verification.sh full` +
+  `after-reboot`, y el tag según `docs/BETA.md`.
