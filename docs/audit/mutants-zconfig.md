@@ -13,8 +13,9 @@ archivo: `value.rs` 208 mutantes, 200 caídos, 8 no viables, **0 missed**;
 `mutants-costs.md` y costaron una sesión, no las 1,5 h estimadas: el techo no
 era el test, era darse cuenta de que el fixture tenía que usar valores
 distintos de los `Default` (un `5 restarts per 1m` es exactamente el default y
-dejaba vivo `From<RestartSpec> for Budget`). `zconfig` queda en 56 missed
-(parser 23, graph 21, plan 12).
+dejaba vivo `From<RestartSpec> for Budget`). `plan.rs` bajó después de 12 a **7** con tests del heap (profundidad y
+invariante de la raíz en cada push); `zconfig` queda en **51 missed**
+(parser 23, graph 21, plan 7).
 
 | archivo | missed | qué muta | razón para no matarlo en alpha | post-alpha |
 |---|---|---|---|---|

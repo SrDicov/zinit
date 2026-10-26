@@ -18,7 +18,9 @@
   `value.rs` 48 → 0 (tabla completa de 41 capabilities, los nueve `help`
   fijados, los dos `From<RestartSpec>` con fixtures no-default, borde
   `tcp:65535`) y `desc.rs` 12 → 0 (overlay silencioso con todos los campos,
-  dedup de directivas acumulativas, accesos de aristas). `zconfig` baja a 56.
+  dedup de directivas acumulativas, accesos de aristas) y `plan.rs` 12 → 7
+  (el heap binario a 0: profundidad real e invariante de la raíz en cada push).
+  `zconfig` baja de 116 a 51.
 
 ## [v0.2.0-alpha] - 2026-10-23
 ### Cierre de alpha

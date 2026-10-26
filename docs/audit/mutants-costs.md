@@ -10,7 +10,7 @@ responde a «¿cuánto cuesta matarlo y cuándo se paga?».
 | `zservice/src/service.rs` | 27 | máquina de estados: listenfds heredados, carrera exec/ready, adopción forking, señales de stop | 3,5-4,5 h (4 grupos de 0,5-1 h) | post-beta (integración con procesos vivos) |
 | `zconfig/src/parser.rs` | 23 (+8 timeouts) | límites de longitud, spans, booleanos, índices de `quote` | 2-3 h + corpus de ficheros inválidos | post-beta |
 | `zconfig/src/graph.rs` | 21 (+2) | `Display`/`span` de errores, `render_cycle`, umbral de `suggest` | 1 h | post-beta |
-| `zconfig/src/plan.rs` | 12 (+2) | DFS de ciclos, orden explícito | 1 h | post-beta |
+| `zconfig/src/plan.rs` | **7** (+2) | cursor de `find_cycle` y el walk required+after; el heap quedó a 0 | 1 h, y hace falta encontrar la forma del grafo | post-beta |
 | `zservice/src/identity.rs` | 10 | `ERANGE` de `getpwuid_r`/`getgrgid_r` sin entrada mayor que el buffer + carrera `AlreadyExists` | 45 min (`grow_until_cap`) | post-beta |
 | `zcore` (varios) | 31 | ya al 15,2 %, disperso y barato | ~2 h | post-beta |
 
@@ -22,6 +22,11 @@ responde a «¿cuánto cuesta matarlo y cuándo se paga?».
 - `zconfig/src/desc.rs`: 12 → **0** (77 mutantes, 77 caídos). Un fixture por
   overlay silencioso con todos los campos, más el dedup de las directivas que
   acumulan y los tres accesos de aristas.
+- `zconfig/src/plan.rs`: 12 → **7**. El heap binario queda a 0 (índice con
+  profundidad de 16 elementos y la raíz comprobada en cada push); los 7 que
+  quedan son el cursor de `find_cycle` y el walk required+after, sin una forma
+  de grafo que los distinga todavía. **No se declaran equivalentes**: falta la
+  prueba escrita que la regla exige.
 
 - `zservice/src/ready.rs`: 47 → **0 libres**, 0 timeouts.
 - `zservice/src/log.rs`: 34 → **0 libres**, 0 timeouts.
