@@ -146,8 +146,10 @@ beta sin soak + power-test: eso es hardware, no código.
   `""` en Alpine: el socket es `0600` y el peer `nobody` ni conectaba. El test
   abre el modo (`0666`, solo durante el test) y un `connect` fallido escribe su
   errno en vez de silencio. 4/4 en podman Alpine.
-- [ ] **A5** `distro` verde en `main` o cada leg rojo documentado como externo.
-  (Bloqueado por el push: el fix está probado en Alpine, falta el run.)
+- [x] **A5** `distro` verde en `main`: los 7 legs en success sobre `c22c0c3`
+  (run `40286289917`). `ci` del mismo commit, success completo (run
+  `40286289942`, `riscv32gc` incluido esta vez). Antes: `96906d2` también con
+  `distro` 7/7 (`40284766894`) y `ci` success (`40284766914`).
 
 - [x] **B1** `docs/audit/mutants-costs.md`: tabla Archivo | Missed | Tipo |
   Coste | Prioridad, con los números ya medidos.

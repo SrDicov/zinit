@@ -94,7 +94,8 @@ Punto de retorno si algo falla: `main` = `840f688`, tag = `32c92d1`.
 - `distro` no está verde en `main` todavía: el 2026-10-23 los 7 legs agotaron
   `timeout-minutes: 45`. **La causa no era caché ni lentitud**: cuatro tests se
   colgaban para siempre y el `Mutex` serial arrastraba a tres más. Arreglado en
-  la rama de cierre (ver abajo); falta el run de `main`.
+  la rama de cierre; los 7 legs están verdes en `main` (ver «Cierre
+  2026-10-26»).
 
 ## Sesión 2026-10-24 — cierre pre-beta (sin hardware)
 
@@ -155,3 +156,39 @@ aislada con `fork`, como los tests de fd 0).
   `#[allow]` ni un `unwrap` defensivo.
 - El socket es `0600`: para probar el chequeo de credenciales el test abre el
   modo (`0666`) antes de que el peer `nobody` conecte. Es test-only.
+
+## Cierre 2026-10-26 — mergeado y verde
+
+- PR #25 → merge `96906d2`: el cuelgue de `distro` (deadlines en los tests),
+  los skips de contenedor, `docs/BETA.md`, `docs/CI.md`, `hw-verification.sh`
+  y los mutantes de `zconfig` (`value.rs` 48→0, `desc.rs` 12→0, `plan.rs`
+  12→7; crate 116→51).
+- PR #26 → merge `c22c0c3`: el job nocturno de libFuzzer corría sobre **stable**
+  porque `rust-toolchain.toml` fija `channel = "stable"` y rustup deja que el
+  fichero gane a `rustup default nightly`; `RUSTUP_TOOLCHAIN: nightly` en el
+  job es el override que sí gana. Verificado con `workflow_dispatch`.
+- Flake real encontrado por CI y arreglado: `drop_closes_the_file_descriptor`
+  leía un fd **reutilizado** por otro hilo de test entre `drop` y `fcntl`
+  (ahora en tabla de fds aislada con `fork`, como los tests de fd 0).
+
+Evidencia sobre `main` = `c22c0c3`:
+
+| run | resultado |
+|---|---|
+| `ci` `40286289942` | **success** (todos los jobs, `riscv32gc` incluido) |
+| `distro` `40286289917` | **7/7 success** |
+| `fuzz` (dispatch sobre la rama) | mutation + libFuzzer **success** |
+
+Local: 641 tests, 0 fallos, 1 ignorado; clippy 0; fmt limpio; `cargo doc
+-D warnings` limpio; `cargo build --release` limpio.
+
+### Lo que queda (todo hardware o post-beta)
+
+1. **Beta**: soak 24 h, `zctl poweroff`, `SIGTERM` a PID 1 y retirada de dinit
+   en la máquina real (`scripts/hw-verification.sh full` + `after-reboot`).
+   Después, tag según `docs/BETA.md`. **Sin hardware no hay tag.**
+2. Mutantes post-beta con coste medido: `spawn.rs` 152, `service.rs` 27,
+   `graph.rs` 17 (+3 timeouts), `parser.rs` 23, `identity.rs` 10, `plan.rs` 7,
+   `zcore` 31.
+3. `riscv32gc`: upstream sin `std` para ese target (hoy pasó por suerte del
+   toolchain; no se depende de ello).
