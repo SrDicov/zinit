@@ -49,6 +49,14 @@ jobs:
     name: libFuzzer parser (nightly, 10 min)
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # `rust-toolchain.toml` pins `stable` for the whole checkout, and rustup
+    # lets that file win over `rustup default`; without this the sanitizer
+    # flags reach a stable cargo and the build dies with "the option `Z` is
+    # only accepted on the nightly compiler". The environment variable is the
+    # one override that beats the file, and cargo-fuzz's child cargo inherits
+    # it.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     # Nightly and manual only: needs nightly rustc and ~15 minutes of
     # machine. Parser PRs keep the proxy above; libFuzzer runs while we
     # sleep. libFuzzer needs no corpus to start, but the seeds in
