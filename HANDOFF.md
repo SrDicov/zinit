@@ -84,5 +84,10 @@ La regla, desde ya:
 - Trampa de test: `fcntl(fd, F_GETFD)` después de `drop` es una carrera con
   otros hilos del suite que reutilizan el número. Los tests de fd van en
   `in_isolated_fd_table` (fork), nunca en el proceso multihilo.
+- Trampa del job `privileged`: `--include-ignored` corre los tests en el
+  **mismo** proceso. Un test que cambia ids/capabilities/grupo del proceso
+  envenena a todos los demás; `child_step_drop_ids_as_root` bajaba el euid a
+  43210 y dejaba `kill` en EPERM, con un `waitpid` bloqueado 30 min hasta
+  cancelar el job. Ese test ahora hace el drop en un hijo bifurcado.
 - Beta pendiente **solo** de hardware: `scripts/hw-verification.sh full` +
   `after-reboot`, y el tag según `docs/BETA.md`.

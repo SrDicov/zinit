@@ -2188,15 +2188,16 @@ mod tests {
     /// The id step is the part of the child path a user namespace cannot
     /// exercise: `setgroups` returns EPERM inside it (see the userns test),
     /// so only real root can prove the order — groups, then gid, then uid.
-    /// Run alone, as root:
     ///
-    ///     sudo cargo test -p zservice --lib child_step_drop_ids_as_root \
-    ///         -- --ignored --test-threads=1
-    ///
-    /// Ignored by default because it permanently drops this test process's
-    /// own privileges, which would poison every other test in the binary.
+    /// The drop happens in a forked child, exactly as production runs it. An
+    /// earlier version called `child_step_ids` in the test process itself,
+    /// which permanently set its euid to 43210: every other test that then
+    /// tried to `kill` a root-owned child got EPERM, and a `SIGKILL` that
+    /// never landed left one of them blocked in `waitpid` forever. The
+    /// `--include-ignored` job made that visible (a 30-minute CI timeout),
+    /// but the test was a landmine for any single-threaded run too.
     #[test]
-    #[ignore = "setgroups is denied inside a user namespace; needs real root"]
+    #[ignore = "needs real root; the drop runs in a forked child"]
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn child_step_drop_ids_as_root() {
         assert_eq!(unsafe { libc::geteuid() }, 0, "must run as real root");
@@ -2206,8 +2207,35 @@ mod tests {
         plan.drop_ids = true;
         plan.uid = 43210;
         plan.gid = 43210;
-        assert!(child_step_ids(plan), "root can setgroups and drop ids");
-        assert_eq!(unsafe { libc::geteuid() }, 43210);
-        assert_eq!(unsafe { libc::getegid() }, 43210);
+        // SAFETY: `fork` takes no arguments. The child only calls
+        // `child_step_ids` (raw syscalls, no allocation) and `_exit`, so it
+        // never returns to the harness or runs a destructor.
+        match unsafe { libc::fork() } {
+            -1 => panic!("fork failed"),
+            0 => {
+                let ok = child_step_ids(plan)
+                    && unsafe { libc::geteuid() } == 43210
+                    && unsafe { libc::getegid() } == 43210;
+                // SAFETY: `_exit` never returns and takes only an int.
+                unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+            }
+            pid => {
+                let mut status = 0;
+                // SAFETY: `status` is a live `c_int`; blocking wait on our
+                // own child.
+                assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid);
+                assert!(libc::WIFEXITED(status), "child died: {status}");
+                assert_eq!(
+                    libc::WEXITSTATUS(status),
+                    0,
+                    "root can setgroups and drop ids in the child"
+                );
+                assert_eq!(
+                    unsafe { libc::geteuid() },
+                    0,
+                    "the parent must still be root"
+                );
+            }
+        }
     }
 }
