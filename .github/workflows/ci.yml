@@ -699,6 +699,49 @@ jobs:
         run: cargo +nightly miri test -p zcore --lib
 
   # ══════════════════════════════════════════════════════════════════════════
+  # 10. The paths that need real root and a privileged kernel surface.
+  #
+  # cgroup creation, mount namespaces, a private /tmp and the seccomp filter
+  # are skipped in every other job: inside `docker run` without CAP_SYS_ADMIN
+  # `unshare -m` is EPERM and the cgroup hierarchy is read-only, so those
+  # tests write `skipped` and pass. That is honest, but it means the
+  # confinement code had no CI evidence at all. This job is the one place
+  # they run for real: a privileged container, root, and `--include-ignored`
+  # for the test that says it needs real root (setgroups in a user namespace
+  # is denied).
+  #
+  # `--privileged` implies `seccomp=unconfined`, which the supervisor needs:
+  # it installs its own filter on the child, and that requires CAP_SYS_ADMIN.
+  #
+  # A privileged container still cannot mount sysfs inside a *user* namespace
+  # that does not own a network namespace, so PID 1 announces that and keeps
+  # going; the test checks the service state, not the mount.
+  # ══════════════════════════════════════════════════════════════════════════
+  privileged:
+    name: privileged (root-only paths)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build and test inside a privileged container
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD:/work" -w /work \
+            -e CARGO_TERM_COLOR=always \
+            -e RUSTFLAGS="-D warnings" \
+            ubuntu:24.04 sh -c '
+              set -eu
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq curl gcc libc6-dev >/dev/null
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain stable --profile minimal >/dev/null
+              . "$HOME/.cargo/env"
+              cargo build --workspace
+              cargo test --workspace -- --include-ignored
+            '
+
+  # ══════════════════════════════════════════════════════════════════════════
   # Static musl release binary for hardware/VM testing (portado de
   # `feat/fase-1-cierre`). Produce el `zinit` estático que `scripts/`
   # `zinit-deploy.sh` empaqueta; el artifact vive 30 días por push.
