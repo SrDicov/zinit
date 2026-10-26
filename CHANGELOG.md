@@ -16,17 +16,19 @@
   gate y qué es red) y `docs/audit/mutants-costs.md` (coste por mutante).
 - Job de CI `privileged`: el suite completo como root en un contenedor
   `--privileged`, con `--include-ignored`. Cgroup, sandbox, private-tmp y
-  PID 1 en un namespace dejan de saltarse (648 tests, 0 fallos) y destaparon
+  PID 1 en un namespace dejan de saltarse (658 tests, 0 fallos) y destaparon
   dos tests que nunca podían pasar.
 - Mutantes de `zconfig` que eran «pre-beta, unitario puro», cerrados a 0:
   `value.rs` 48 → 0 (tabla completa de 41 capabilities, los nueve `help`
   fijados, los dos `From<RestartSpec>` con fixtures no-default, borde
   `tcp:65535`) y `desc.rs` 12 → 0 (overlay silencioso con todos los campos,
-  dedup de directivas acumulativas, accesos de aristas), `graph.rs` 21 → 3 y
+  dedup de directivas acumulativas, accesos de aristas), `graph.rs` 21 → 3,
   `plan.rs` 12 → 6 (el heap a 0 de verdad: invariante estructural tras cada
-  push y la secuencia mínima que rompe un índice de padre erróneo). Los 9 que
-  quedan son equivalentes con la prueba escrita en el código. `zconfig` baja
-  de 116 a 32 missed (23 de ellos `parser.rs`).
+  push y la secuencia mínima que rompe un índice de padre erróneo) y
+  `parser.rs` 23 → 3 (bordes exactos de los tres límites, W001, lista de
+  ayuda, truncación de `quote`, offsets con escape multibyte, duplicados en
+  las tres listas de `depends`). Los 12 que quedan son equivalentes con la
+  prueba escrita en el código. `zconfig` baja de 116 a **12 missed**.
 
 ## [v0.2.0-alpha] - 2026-10-23
 ### Cierre de alpha

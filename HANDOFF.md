@@ -8,11 +8,11 @@
 - `main` lleva el merge `--no-ff` de `testing`; el árbol de `main` y `testing`
   es el mismo.
 - Trabajo post-alpha, por coste (el detalle está en `docs/audit/`):
-  1. `zconfig/value.rs`: tabla de capabilities — 30-45 min, mata 34 mutantes.
-  2. `zconfig/desc.rs` (30-45 min), `graph.rs` (1 h), `plan.rs` (1 h),
-     `parser.rs` (2-3 h).
-  3. `zservice/identity.rs`: extraer `grow_until_cap` — 45 min, mata 10.
-  4. `zservice/service.rs` (3-4 h) y `spawn.rs` (4-6 h con job privilegiado).
+  1. `zconfig`: **cerrado**. `value.rs`, `desc.rs`, `graph.rs`, `plan.rs` y
+     `parser.rs` no aportan missed; los 12 que quedan son equivalentes con la
+     prueba escrita en el código (15 timeouts son bucles que el harness corta).
+  2. `zservice/identity.rs`: extraer `grow_until_cap` — 45 min, mata 10.
+  3. `zservice/service.rs` (3-4 h) y `spawn.rs` (4-6 h con job privilegiado).
 - Beta **no** espera a los mutantes: espera hardware real
   (`scripts/hw-verification.sh`, soak 24 h, `docs/HW-VERIFICATION.md`).
 
@@ -66,13 +66,18 @@ La regla, desde ya:
 - Si el commit ya salió con basura, se arregla en un commit de limpieza (no se
   reescribe historia) y se anota aquí.
 
-## Estado 2026-10-26 — `main` = `c22c0c3`, todo verde
+## Estado 2026-10-26 — `main` = `3c57181`, todo verde
 
-- PR #25 (`96906d2`) y PR #26 (`c22c0c3`) mergeados. `ci` y `distro` (7/7) en
-  success sobre `main`. El cuelgue de 45 min de `distro` era **tests sin
-  deadline**, no caché ni lentitud.
-- Mutantes de `zconfig`: 116 → 51 (`value.rs` y `desc.rs` a 0, `plan.rs` a 7).
-  El resto está en `docs/audit/mutants-costs.md` con coste y prioridad.
+- PR #25 (`96906d2`), #26 (`c22c0c3`), #27 (`a1704ab`) y #28 (`3c57181`)
+  mergeados. `ci` y `distro` (7/7) en success sobre `main`. El cuelgue de
+  45 min de `distro` era **tests sin deadline**, no caché ni lentitud.
+- `ci.yml` tiene el job **`privileged`**: el suite como root en un contenedor
+  `--privileged` con `--include-ignored`; medido 658 tests, 0 fallos, frente a
+  656 + 1 ignorado en un runner. Cgroup, sandbox, private-tmp y PID 1 en un
+  namespace dejan de saltarse.
+- Mutantes de `zconfig`: 116 → **12**, todos equivalentes con prueba escrita
+  (`value.rs`, `desc.rs`, `graph.rs`, `plan.rs`, `parser.rs`). El resto está en
+  `docs/audit/mutants-costs.md` con coste y prioridad.
 - Trampa de CI que costó una ronda: `rust-toolchain.toml` fija `stable` y
   **gana a `rustup default`**; el job de fuzz necesita `RUSTUP_TOOLCHAIN=nightly`
   en el job, no basta con `dtolnay/rust-toolchain@nightly`.

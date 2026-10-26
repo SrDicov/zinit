@@ -8,7 +8,7 @@ responde a «¿cuánto cuesta matarlo y cuándo se paga?».
 |---|---|---|---|---|
 | `zservice/src/spawn.rs` | 152 | camino del hijo post-`fork`: fds, cgroup, ids, mounts, ctty, orden de llamadas | 4-6 h + job privilegiado | **post-beta** (lo cubierto por el test de userns ya está probado; el resto pide root real) |
 | `zservice/src/service.rs` | 27 | máquina de estados: listenfds heredados, carrera exec/ready, adopción forking, señales de stop | 3,5-4,5 h (4 grupos de 0,5-1 h) | post-beta (integración con procesos vivos) |
-| `zconfig/src/parser.rs` | 23 (+8 timeouts) | límites de longitud, spans, booleanos, índices de `quote` | 2-3 h + corpus de ficheros inválidos | post-beta |
+| `zconfig/src/parser.rs` | **3** (+9 timeouts) | tres equivalentes con prueba escrita (columna del comentario, índice de `comment_offset`, dedup de `depends`) | 0 | cerrado |
 | `zconfig/src/graph.rs` | **3** (+3 timeouts) | tres equivalentes con prueba escrita (dos `+=` del merge y un `<` de `suggest`) | 0 | cerrado |
 | `zconfig/src/plan.rs` | **6** (+3 timeouts) | seis equivalentes con prueba escrita (cursor de `find_cycle`, `<=` con valores iguales, brazo `1` del pop) | 0 | cerrado |
 | `zservice/src/identity.rs` | 10 | `ERANGE` de `getpwuid_r`/`getgrgid_r` sin entrada mayor que el buffer + carrera `AlreadyExists` | 45 min (`grow_until_cap`) | post-beta |
@@ -29,6 +29,15 @@ responde a «¿cuánto cuesta matarlo y cuándo se paga?».
   fijan `span()` variante a variante, `render_cycle`, los umbrales de
   `suggest` (presupuesto y holgura de longitud, en las dos direcciones), el
   desempate de nombres y el W101 con dos aristas dobles.
+- `zconfig/src/parser.rs`: 23 → **3**, los 3 equivalentes con prueba escrita
+  (`>=` en la columna del comentario: igualdad implicaría valor vacío y E003
+  antes; el índice de `comment_offset` recorre bytes de continuación que nunca
+  son `\\` ni `#`; el `==` del dedup solo cambia filas que terminan en el
+  `if in_required` de abajo). Los tests nuevos fijan los bordes de
+  `MAX_LINE_BYTES`/`MAX_TEXT_BYTES`/`MAX_LINES`, el W001, la lista de ayuda de
+  `unknown_key_error`, la truncación exacta de `quote`, los offsets de
+  `split_list_spans` con escape multibyte, el corte de `split_directive` en
+  `#` y la idempotencia de duplicados en las tres listas de `depends`.
 - `zconfig/src/plan.rs`: 12 → **6**, los 6 equivalentes con prueba escrita
   (el cursor de `find_cycle` no puede agotar dependencias antes de cerrar el
   ciclo; `<=` solo intercambia valores iguales; el brazo `1` del pop hace lo

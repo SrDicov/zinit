@@ -73,8 +73,8 @@ El job `privileged` de `ci.yml` corre el suite completo en un contenedor
 real (`setgroups` dentro de un user namespace está denegado). Ahí sí se
 ejecutan `a_service_with_a_cgroup_lands_in_it`, `the_sandbox_really_confines`,
 `a_private_tmp_covers_the_scratch_directories` y
-`zinit_boots_as_pid_one_in_a_namespace`; medido: **648 tests, 0 fallos** en ese
-contenedor frente a 641 + 1 ignorado en un runner normal.
+`zinit_boots_as_pid_one_in_a_namespace`; medido: **658 tests, 0 fallos** en ese
+contenedor frente a 656 + 1 ignorado en un runner normal.
 
 Dos límites siguen siendo del entorno, no del código: dentro de un user
 namespace que no posee un network namespace no se puede montar `sysfs` (PID 1
