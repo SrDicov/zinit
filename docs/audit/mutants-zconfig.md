@@ -13,17 +13,20 @@ archivo: `value.rs` 208 mutantes, 200 caídos, 8 no viables, **0 missed**;
 `mutants-costs.md` y costaron una sesión, no las 1,5 h estimadas: el techo no
 era el test, era darse cuenta de que el fixture tenía que usar valores
 distintos de los `Default` (un `5 restarts per 1m` es exactamente el default y
-dejaba vivo `From<RestartSpec> for Budget`). `plan.rs` bajó después de 12 a **7** con tests del heap (profundidad y
-invariante de la raíz en cada push); `zconfig` queda en **51 missed**
-(parser 23, graph 21, plan 7).
+dejaba vivo `From<RestartSpec> for Budget`). `graph.rs` bajó de 21 a **3** y `plan.rs` de 12 a **6**; los 9 que quedan son
+equivalentes con la prueba escrita en el código. `zconfig` queda en **32
+missed**: 23 son `parser.rs` (necesita un corpus de ficheros inválidos con
+span esperado) y 9 son equivalentes documentados. Además hay 11 timeouts
+(mutantes que dejan un bucle sin avanzar: el test se cuelga y el harness lo
+corta, no pasan desapercibidos).
 
 | archivo | missed | qué muta | razón para no matarlo en alpha | post-alpha |
 |---|---|---|---|---|
 | `value.rs` | 48 | 34 brazos de `parse_capability` (nombre → bit), texto de `ValueError`, dos `From<RestartSpec>` con `Default` | es una tabla de datos: el test que la cubre recorre los 41 nombres, no 41 casos sueltos | **cerrado: 0** |
 | `parser.rs` | 23 (+8 timeouts) | límites de longitud y línea en `parse_service_with_diagnostics`, spans de `split_list_spans`, booleanos de `parse_depends`, índices de `quote`, `unknown_key_error` | grammar y spans: matarlos exige un corpus de ficheros inválidos con span esperado y casos de borde de índice | 2-3 h |
-| `graph.rs` | 21 (+2 timeouts) | `Display`/`span` de `GraphError`, texto de `render_cycle`, `is_empty`, umbrales de `suggest` | diagnósticos (comparar strings exactos) y heurística de sugerencia (tabla de nombres parecidos) | 1 h |
+| `graph.rs` | 21 (+2 timeouts) — **cerrado: 3 equivalentes** | `Display`/`span` de `GraphError`, texto de `render_cycle`, `is_empty`, umbrales de `suggest` | diagnósticos (comparar strings exactos) y heurística de sugerencia (tabla de nombres parecidos) | 1 h |
 | `desc.rs` | 12 (histórico; **cerrado: 0**) | 10 en `overlay_onto` (precedencia "lo explícito gana"), 2 en `budget`/`restart_policy` devolviendo `Default` | unitario puro, pero exige pares base+drop-in construidos a mano | 30-45 min |
-| `plan.rs` | 12 (+2 timeouts) | DFS de `find_cycle`, `check_order_acyclic`, `service_plan` | grafos con ciclo y orden explícito construidos en el test | 1 h |
+| `plan.rs` | 12 (+2 timeouts) — **cerrado: 6 equivalentes** | DFS de `find_cycle`, `check_order_acyclic`, `service_plan` | grafos con ciclo y orden explícito construidos en el test | 1 h |
 
 Los cinco son camino crítico: `value.rs` y `parser.rs` deciden qué significa un
 fichero, `graph.rs` el orden, `desc.rs` y `plan.rs` qué se ejecuta. El coste es

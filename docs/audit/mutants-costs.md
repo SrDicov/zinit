@@ -9,8 +9,8 @@ responde a «¿cuánto cuesta matarlo y cuándo se paga?».
 | `zservice/src/spawn.rs` | 152 | camino del hijo post-`fork`: fds, cgroup, ids, mounts, ctty, orden de llamadas | 4-6 h + job privilegiado | **post-beta** (lo cubierto por el test de userns ya está probado; el resto pide root real) |
 | `zservice/src/service.rs` | 27 | máquina de estados: listenfds heredados, carrera exec/ready, adopción forking, señales de stop | 3,5-4,5 h (4 grupos de 0,5-1 h) | post-beta (integración con procesos vivos) |
 | `zconfig/src/parser.rs` | 23 (+8 timeouts) | límites de longitud, spans, booleanos, índices de `quote` | 2-3 h + corpus de ficheros inválidos | post-beta |
-| `zconfig/src/graph.rs` | 21 (+2) | `Display`/`span` de errores, `render_cycle`, umbral de `suggest` | 1 h | post-beta |
-| `zconfig/src/plan.rs` | **7** (+2) | cursor de `find_cycle` y el walk required+after; el heap quedó a 0 | 1 h, y hace falta encontrar la forma del grafo | post-beta |
+| `zconfig/src/graph.rs` | **3** (+3 timeouts) | tres equivalentes con prueba escrita (dos `+=` del merge y un `<` de `suggest`) | 0 | cerrado |
+| `zconfig/src/plan.rs` | **6** (+3 timeouts) | seis equivalentes con prueba escrita (cursor de `find_cycle`, `<=` con valores iguales, brazo `1` del pop) | 0 | cerrado |
 | `zservice/src/identity.rs` | 10 | `ERANGE` de `getpwuid_r`/`getgrgid_r` sin entrada mayor que el buffer + carrera `AlreadyExists` | 45 min (`grow_until_cap`) | post-beta |
 | `zcore` (varios) | 31 | ya al 15,2 %, disperso y barato | ~2 h | post-beta |
 
@@ -22,11 +22,18 @@ responde a «¿cuánto cuesta matarlo y cuándo se paga?».
 - `zconfig/src/desc.rs`: 12 → **0** (77 mutantes, 77 caídos). Un fixture por
   overlay silencioso con todos los campos, más el dedup de las directivas que
   acumulan y los tres accesos de aristas.
-- `zconfig/src/plan.rs`: 12 → **7**. El heap binario queda a 0 (índice con
-  profundidad de 16 elementos y la raíz comprobada en cada push); los 7 que
-  quedan son el cursor de `find_cycle` y el walk required+after, sin una forma
-  de grafo que los distinga todavía. **No se declaran equivalentes**: falta la
-  prueba escrita que la regla exige.
+- `zconfig/src/graph.rs`: 21 → **3**, y los 3 son equivalentes con la prueba
+  escrita en el código (`// equivalent (cargo-mutants)`): dos avances de
+  cursor que el siguiente brazo Less/Greater corrige (listas ordenadas y sin
+  duplicados) y un `<` que solo compara valores iguales. Los tests nuevos
+  fijan `span()` variante a variante, `render_cycle`, los umbrales de
+  `suggest` (presupuesto y holgura de longitud, en las dos direcciones), el
+  desempate de nombres y el W101 con dos aristas dobles.
+- `zconfig/src/plan.rs`: 12 → **6**, los 6 equivalentes con prueba escrita
+  (el cursor de `find_cycle` no puede agotar dependencias antes de cerrar el
+  ciclo; `<=` solo intercambia valores iguales; el brazo `1` del pop hace lo
+  mismo que el general). El heap queda a 0 de verdad: invariante estructural
+  tras cada push y la secuencia mínima que rompe un índice de padre erróneo.
 
 - `zservice/src/ready.rs`: 47 → **0 libres**, 0 timeouts.
 - `zservice/src/log.rs`: 34 → **0 libres**, 0 timeouts.
