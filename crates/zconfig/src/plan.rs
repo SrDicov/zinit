@@ -377,6 +377,14 @@ fn reverse_edges(graph: &Graph) -> (Vec<usize>, Vec<Idx>) {
 fn find_cycle(graph: &Graph, placed: &[bool]) -> Vec<Idx> {
     let n = graph.len();
     // `unplaced(i)` = "Kahn never released i" = candidate cycle member.
+    //
+    // equivalent (cargo-mutants): `i <= n` would index out of bounds, but the
+    // guard is defensive only — every caller passes an index from
+    // `required_of` or from `0..n`, so `i == n` never happens. `&&` -> `||`
+    // is also equivalent: for `i < n` the result is `!placed[i]` either way,
+    // and a *placed* node has all its required deps placed (that is what Kahn
+    // released it for), so entering it cannot lead back into the residual set
+    // and the reported cycle is unchanged.
     let unplaced = |i: Idx| i < n && !placed[i];
 
     // Start at the lowest unplaced index, so the same graph always yields the
@@ -399,6 +407,13 @@ fn find_cycle(graph: &Graph, placed: &[bool]) -> Vec<Idx> {
 
     while let Some(&i) = stack.last() {
         let deps = graph.required_of(i);
+        // equivalent (cargo-mutants): `<` -> `<=` and `+=` -> `*=` cannot be
+        // observed. Every node this walk visits is unplaced, and an unplaced
+        // node always has an unplaced required dep (Kahn), so following those
+        // deps reaches the residual cycle and the walk returns at the first
+        // repeat. `step` therefore advances once per node visited and never
+        // reaches `deps.len()`, which is the only state the two mutants would
+        // change.
         if step[i] < deps.len() {
             let d = deps[step[i]];
             step[i] += 1;
@@ -669,6 +684,11 @@ fn sift_down(heap: &mut [Idx], mut parent: usize) {
         }
         let right = left + 1;
         let mut best = left;
+        // equivalent (cargo-mutants): the surviving mutant is the second
+        // comparison, `heap[right] <= heap[left]` — swapping two equal values
+        // changes no value and no later comparison. The `right < n` half is
+        // load-bearing and is not the mutant: at `right == n` the index would
+        // be past the slice.
         if right < n && heap[right] < heap[left] {
             best = right;
         }
@@ -711,6 +731,9 @@ fn heap_push(heap: &mut Vec<Idx>, value: Idx) {
 fn heap_pop(heap: &mut Vec<Idx>) -> Option<Idx> {
     match heap.len() {
         0 => None,
+        // equivalent (cargo-mutants): deleting this arm falls into the general
+        // one, where `top = heap[0]`, `last = 0`, `swap(0, 0)`, `pop()` and a
+        // sift_down over an empty slice return the same element.
         1 => heap.pop(),
         _ => {
             let top = heap[0];
@@ -1291,6 +1314,30 @@ mod tests {
         }
     }
 
+    /// A loop that only closes through an `after` edge, entered after a
+    /// required edge was walked.
+    ///
+    /// `a` requires `b` and waits for `c`; `c` waits for `a`. The walk must
+    /// exhaust `a`'s required list and then index the after list at
+    /// `step - required.len()`, which is the one arithmetic step the simpler
+    /// mixed test never reaches (there the loop closes on the first dep).
+    #[test]
+    fn a_loop_reached_through_an_after_edge_is_fatal() {
+        let mut a = desc_with("a", ServiceKind::Process, &["b"], &[]);
+        a.depends_after = vec![String::from("c")];
+        let mut c = desc_with("c", ServiceKind::Process, &[], &[]);
+        c.depends_after = vec![String::from("a")];
+        let err = build_plan(&[a, desc_with("b", ServiceKind::Process, &[], &[]), c])
+            .expect_err("a mutual after wait must not freeze");
+        match err {
+            GraphError::Cycle { path } => {
+                assert_eq!(path.first(), path.last(), "a cycle must close: {path:?}");
+                assert!(path.contains(&String::from("a")) && path.contains(&String::from("c")));
+            }
+            other => panic!("expected Cycle, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_mixed_required_after_loop_is_fatal() {
         // Required one way, order-only back: each side waits on the other
@@ -1503,6 +1550,20 @@ mod tests {
         }
     }
 
+    /// The textbook min-heap invariant: every child is at least its parent.
+    ///
+    /// Stronger than "the root is the minimum", which a heap that only repairs
+    /// itself on pop also satisfies. The index arithmetic is what breaks, so
+    /// the assertion has to look at the arithmetic's own output.
+    fn assert_heap(heap: &[Idx], when: &str) {
+        for i in 1..heap.len() {
+            assert!(
+                heap[(i - 1) / 2] <= heap[i],
+                "heap invariant broken at {i} after {when}: {heap:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_heap_picks_the_smallest_index_first() {
         let mut h: Vec<Idx> = vec![9, 3, 7, 1, 5];
@@ -1536,10 +1597,15 @@ mod tests {
         let mut pushed: Vec<Idx> = Vec::new();
         for v in [11usize, 3, 7, 0, 15, 2, 2, 9, 14, 1, 8, 3, 12, 5, 10, 6] {
             heap_push(&mut pushed, v);
-            // The invariant after *every* push, not just at the end: a push
-            // that leaves the root wrong but a pop-repairing heap would still
-            // sort correctly when everything is popped.
-            assert_eq!(pushed[0], *pushed.iter().min().expect("not empty"));
+            assert_heap(&pushed, "deep push");
+        }
+        // The shortest sequence that catches a wrong parent index
+        // (`(child - 1) / 2` mutated to `child / 2`): the root stays right,
+        // but the seventh element lands under a parent that is not its own.
+        let mut tricky: Vec<Idx> = Vec::new();
+        for v in [0usize, 0, 1, 0, 1, 1, 0] {
+            heap_push(&mut tricky, v);
+            assert_heap(&tricky, "duplicate-heavy push");
         }
         let mut out = Vec::new();
         while let Some(v) = heap_pop(&mut pushed) {

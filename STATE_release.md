@@ -182,6 +182,26 @@ Evidencia sobre `main` = `c22c0c3`:
 Local: 641 tests, 0 fallos, 1 ignorado; clippy 0; fmt limpio; `cargo doc
 -D warnings` limpio; `cargo build --release` limpio.
 
+## 2026-10-26 (segunda mitad) — el job `privileged` y los mutantes de `graph`/`plan`
+
+- `ci.yml` gana el job **`privileged`**: contenedor `--privileged` como root y
+  `--include-ignored`. Los tests que se saltaban en los legs de `distro`
+  (cgroup, sandbox, private-tmp, PID 1 en un namespace) corren de verdad:
+  **648 passed, 0 failed** en ese contenedor (641 + 1 ignorado en el runner
+  normal).
+- Dos bugs de test que solo aparecían al ejecutarlos con privilegios, y que
+  llevaban ahí desde que se escribieron:
+  `a_private_tmp_covers_the_scratch_directories` metía su scratch en `/tmp`,
+  que es justo lo que privatiza (el fichero de respuesta se escribía en el
+  tmpfs privado), y esperaba un marcador `/tmp/<tag>-control` que el servicio
+  nunca escribía (`-plain`); `zinit_boots_as_pid_one_in_a_namespace` comprobaba
+  con `kill(pid, 0)` un pid **del namespace** — en un host real pasaba por
+  casualidad (pid 3 es un kernel thread), en un contenedor fallaba con el
+  servicio vivo. Ahora lee el `state/probe` compartido.
+- Mutantes: `graph.rs` 21 → **3** y `plan.rs` 12 → **6**, los 9 con
+  `// equivalent (cargo-mutants)` y su prueba escrita. `zconfig` queda en 32
+  missed (23 de ellos `parser.rs`) y 11 timeouts.
+
 ### Lo que queda (todo hardware o post-beta)
 
 1. **Beta**: soak 24 h, `zctl poweroff`, `SIGTERM` a PID 1 y retirada de dinit

@@ -5,7 +5,7 @@ un timeout para tapar un cuelgue.
 
 | workflow | cuándo | qué decide |
 |---|---|---|
-| `ci.yml` | push a `main`, PR | **El gate.** build, clippy `-D warnings`, fmt, tests en la matriz de targets, fuzz/property/security. Un rojo aquí bloquea el merge. |
+| `ci.yml` | push a `main`, PR | **El gate.** build, clippy `-D warnings`, fmt, tests en la matriz de targets, fuzz/property/security, y un job `privileged` con los caminos que necesitan root. Un rojo aquí bloquea el merge. |
 | `distro.yml` | push a `main`, PR, manual | Red de portabilidad: el mismo suite en 7 imágenes x86_64. Un rojo aquí **no** bloquea el merge, pero cada rojo es un hallazgo que se documenta o se arregla. |
 
 ## Los 7 legs y la superficie que cubre cada uno
@@ -59,6 +59,27 @@ targets de test propios), así que sin un build previo las pruebas de socket se
 saltan solas por falta de binario — y un skip silencioso en CI es peor que un
 fallo. El build es de `--workspace` a secas: `--all-targets` compilaba los
 harnesses dos veces para nada.
+
+## El job `privileged`
+
+Los caminos de confinamiento (crear un cgroup, montar un tmpfs privado,
+`unshare -m`, instalar el filtro seccomp) se **saltan** en los legs de
+`distro`: dentro de `docker run` sin `CAP_SYS_ADMIN` el `unshare -m` es EPERM
+y el cgroup es de solo lectura. Eso es honesto, pero durante meses significó
+que ese código no tenía ninguna evidencia en CI.
+
+El job `privileged` de `ci.yml` corre el suite completo en un contenedor
+`--privileged` como root, con `--include-ignored` para el test que pide root
+real (`setgroups` dentro de un user namespace está denegado). Ahí sí se
+ejecutan `a_service_with_a_cgroup_lands_in_it`, `the_sandbox_really_confines`,
+`a_private_tmp_covers_the_scratch_directories` y
+`zinit_boots_as_pid_one_in_a_namespace`; medido: **648 tests, 0 fallos** en ese
+contenedor frente a 641 + 1 ignorado en un runner normal.
+
+Dos límites siguen siendo del entorno, no del código: dentro de un user
+namespace que no posee un network namespace no se puede montar `sysfs` (PID 1
+lo anuncia y sigue), y el contenedor no es una máquina real — el soak y los
+caminos de apagado siguen pidiendo hardware.
 
 ## Fallos de entorno, no de código
 
