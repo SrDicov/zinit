@@ -66,10 +66,11 @@ La regla, desde ya:
 - Si el commit ya salió con basura, se arregla en un commit de limpieza (no se
   reescribe historia) y se anota aquí.
 
-## Estado 2026-10-26 — `main` = `3c57181`, todo verde
+## Estado 2026-10-26 — `main` = `01914da`, todo verde
 
-- PR #25 (`96906d2`), #26 (`c22c0c3`), #27 (`a1704ab`) y #28 (`3c57181`)
-  mergeados. `ci` y `distro` (7/7) en success sobre `main`. El cuelgue de
+- PR #25 (`96906d2`), #26 (`c22c0c3`), #27 (`a1704ab`), #28 (`3c57181`) y
+  #29 (`01914da`) mergeados. `01914da` es el tip verificado; un commit de
+  docs posterior puede avanzar `main` sin cambiar el árbol de código. `ci` y `distro` (7/7) en success sobre `main`. El cuelgue de
   45 min de `distro` era **tests sin deadline**, no caché ni lentitud.
 - `ci.yml` tiene el job **`privileged`**: el suite como root en un contenedor
   `--privileged` con `--include-ignored`; medido 658 tests, 0 fallos, frente a

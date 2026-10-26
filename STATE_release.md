@@ -201,6 +201,12 @@ Local: 641 tests, 0 fallos, 1 ignorado; clippy 0; fmt limpio; `cargo doc
 - Mutantes: `graph.rs` 21 → **3**, `plan.rs` 12 → **6** y `parser.rs` 23 → **3**,
   los 12 con `// equivalent (cargo-mutants)` y su prueba escrita. `zconfig`
   queda en **12 missed, todos equivalentes documentados**, y 15 timeouts.
+- El job `privileged` de `main` se canceló a los 30 min en `3c57181`:
+  `child_step_drop_ids_as_root` bajaba el euid del **proceso de test** a 43210
+  bajo `--include-ignored`, y un `kill` posterior daba EPERM; un `waitpid` se
+  quedó bloqueado. El drop ahora ocurre en un hijo bifurcado. 40/40 pasadas
+  del suite completo en el contenedor privilegiado, y `main` = `01914da`
+  verde (`ci`, `distro` 7/7, `alpine-e2e`).
 
 ### Lo que queda (todo hardware o post-beta)
 
