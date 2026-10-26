@@ -73,8 +73,16 @@ El job `privileged` de `ci.yml` corre el suite completo en un contenedor
 real (`setgroups` dentro de un user namespace está denegado). Ahí sí se
 ejecutan `a_service_with_a_cgroup_lands_in_it`, `the_sandbox_really_confines`,
 `a_private_tmp_covers_the_scratch_directories` y
-`zinit_boots_as_pid_one_in_a_namespace`; medido: **648 tests, 0 fallos** en ese
-contenedor frente a 641 + 1 ignorado en un runner normal.
+`zinit_boots_as_pid_one_in_a_namespace`; medido: **658 tests, 0 fallos** en ese
+contenedor frente a 656 + 1 ignorado en un runner normal.
+
+`--include-ignored` ejecuta el test de ids en el **mismo proceso** que el resto
+del suite, y `child_step_drop_ids_as_root` cambiaba el euid del proceso a
+43210: los demás tests dejaban de poder matar a sus hijos (EPERM) y uno se
+quedó bloqueado en `waitpid` hasta cancelar el job a los 30 min. Ahora el drop
+ocurre en un hijo bifurcado, como en producción, y el padre sigue siendo root.
+Cualquier test futuro que cambie ids, capabilities o el grupo del proceso debe
+hacer lo mismo: `--include-ignored` no lo aísla.
 
 Dos límites siguen siendo del entorno, no del código: dentro de un user
 namespace que no posee un network namespace no se puede montar `sysfs` (PID 1

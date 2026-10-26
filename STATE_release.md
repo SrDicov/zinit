@@ -187,7 +187,7 @@ Local: 641 tests, 0 fallos, 1 ignorado; clippy 0; fmt limpio; `cargo doc
 - `ci.yml` gana el job **`privileged`**: contenedor `--privileged` como root y
   `--include-ignored`. Los tests que se saltaban en los legs de `distro`
   (cgroup, sandbox, private-tmp, PID 1 en un namespace) corren de verdad:
-  **648 passed, 0 failed** en ese contenedor (641 + 1 ignorado en el runner
+  **658 passed, 0 failed** en ese contenedor (656 + 1 ignorado en el runner
   normal).
 - Dos bugs de test que solo aparecían al ejecutarlos con privilegios, y que
   llevaban ahí desde que se escribieron:
@@ -198,9 +198,9 @@ Local: 641 tests, 0 fallos, 1 ignorado; clippy 0; fmt limpio; `cargo doc
   con `kill(pid, 0)` un pid **del namespace** — en un host real pasaba por
   casualidad (pid 3 es un kernel thread), en un contenedor fallaba con el
   servicio vivo. Ahora lee el `state/probe` compartido.
-- Mutantes: `graph.rs` 21 → **3** y `plan.rs` 12 → **6**, los 9 con
-  `// equivalent (cargo-mutants)` y su prueba escrita. `zconfig` queda en 32
-  missed (23 de ellos `parser.rs`) y 11 timeouts.
+- Mutantes: `graph.rs` 21 → **3**, `plan.rs` 12 → **6** y `parser.rs` 23 → **3**,
+  los 12 con `// equivalent (cargo-mutants)` y su prueba escrita. `zconfig`
+  queda en **12 missed, todos equivalentes documentados**, y 15 timeouts.
 
 ### Lo que queda (todo hardware o post-beta)
 
@@ -208,7 +208,8 @@ Local: 641 tests, 0 fallos, 1 ignorado; clippy 0; fmt limpio; `cargo doc
    en la máquina real (`scripts/hw-verification.sh full` + `after-reboot`).
    Después, tag según `docs/BETA.md`. **Sin hardware no hay tag.**
 2. Mutantes post-beta con coste medido: `spawn.rs` 152, `service.rs` 27,
-   `graph.rs` 17 (+3 timeouts), `parser.rs` 23, `identity.rs` 10, `plan.rs` 7,
-   `zcore` 31.
+   `identity.rs` 10, `zcore` 31. `zconfig` ya no aporta missed: sus 12 son
+   equivalentes con prueba escrita y sus 15 timeouts son bucles que el harness
+   corta (detectados, no silenciosos).
 3. `riscv32gc`: upstream sin `std` para ese target (hoy pasó por suerte del
    toolchain; no se depende de ello).
