@@ -130,11 +130,13 @@ costó una vuelta: un fixture `5 restarts per 1m` **es** el `Default`, así que
 `From<RestartSpec>` mutado a `Default::default()` pasaba; hay que usar valores
 que no coincidan con el default.
 
-Dos fallos de CI que solo aparecieron al correr los legs de verdad (no en el
+Tres fallos de CI que solo aparecieron al correr los legs de verdad (no en el
 contenedor local): `macos-aarch64` no tiene `SOCK_NONBLOCK` en `libc` (connect
-portable ahora) y los legs corren como root, donde un `chmod 0555` no niega la
+portable ahora), los legs corren como root, donde un `chmod 0555` no niega la
 escritura (el test de rotación pregunta si el modo tomó efecto antes de
-afirmar).
+afirmar), y `drop_closes_the_file_descriptor` leía un fd **reutilizado** por
+otro hilo de test entre `drop` y `fcntl` (ahora corre en una tabla de fds
+aislada con `fork`, como los tests de fd 0).
 
 ### Lo único que falta para beta
 

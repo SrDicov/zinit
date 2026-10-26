@@ -935,20 +935,25 @@ pub(crate) mod tests {
     /// `Drop` runs `close`: a handle leaving scope must not leak the sink
     /// descriptor into the table — `<impl Drop for LogHandle>::drop with ()`
     /// would quietly burn an fd per service teardown.
+    ///
+    /// Runs in an isolated fd table (fork), like the fd-0 tests: the rest of
+    /// the suite runs in threads, and another test can open a descriptor
+    /// between `drop` and `fcntl`, taking the number that was just freed.
+    /// The check then reads a *live* fd and calls it a leak — a false
+    /// failure seen once on x86_64-glibc CI.
     #[test]
     fn drop_closes_the_file_descriptor() {
-        let h = open_sink(&zcore::LogSink::None).expect("open");
-        let fd = h.fd();
-        drop(h);
-        // SAFETY: `F_GETFD` only observes one descriptor and retains nothing.
-        let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        assert_eq!(
-            rc,
-            -1,
-            "dropping the handle must close its fd: {}",
-            io::Error::last_os_error()
+        assert!(
+            in_isolated_fd_table(|| {
+                let h = open_sink(&zcore::LogSink::None).expect("open");
+                let fd = h.fd();
+                drop(h);
+                // SAFETY: `F_GETFD` only observes one descriptor and retains nothing.
+                let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                rc == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+            }),
+            "dropping the handle must close its fd with EBADF"
         );
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
     }
 
     /// A directory blocking a generation makes the shift's rename fail with
