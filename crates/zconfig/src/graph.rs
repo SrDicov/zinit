@@ -773,6 +773,13 @@ fn report_double_qualified_edges(
                         message,
                         Some("declare the dependency once, with or without `opt:`".to_string()),
                     ));
+                    // equivalent (cargo-mutants): `a *= 1` (or `b`) here is
+                    // unobservable. Both edge lists are sorted and
+                    // deduplicated, so the comparison right after an `Equal`
+                    // cannot be `Equal` again: it is `Less` or `Greater`, and
+                    // that arm advances the cursor the multiply left behind.
+                    // The findings are the same; only the number of loop
+                    // iterations differs, and no caller sees that.
                     a += 1;
                     b += 1;
                 }
@@ -824,6 +831,9 @@ fn suggest(name: &str, by_name: &[(String, Idx)]) -> Option<String> {
     let mut best: Option<(usize, &str)> = None;
     for (candidate, _) in by_name {
         let bytes = candidate.as_bytes();
+        // equivalent (cargo-mutants): `>=` here changes nothing. When the two
+        // lengths are equal both arms compute `0 - 0`; the arms only differ
+        // when one is longer, and then both `>` and `>=` take the same one.
         let len_gap = if bytes.len() > needle.len() {
             bytes.len() - needle.len()
         } else {
@@ -1504,6 +1514,165 @@ mod tests {
         assert_eq!(g.required_of(0), &[] as &[Idx]);
         assert_eq!(g.optional_of(1), &[] as &[Idx]);
         assert!(g.dependents_of(0).is_empty());
+    }
+
+    #[test]
+    fn a_non_empty_graph_is_not_empty() {
+        // The empty case above is the one that reads like a tautology; the
+        // half that matters is that a graph with nodes says so.
+        let g = Graph::build(&[desc("a")]).expect("valid graph");
+        assert!(!g.is_empty());
+    }
+
+    #[test]
+    fn span_is_the_line_for_line_errors_and_none_for_set_errors() {
+        // Constructed directly, one arm at a time: `span()` is a table over
+        // the variants, and a wrong arm points the operator at the wrong line
+        // or invents a position for an error that is about the whole set.
+        let name_error = || crate::desc::NameError::Empty;
+        assert_eq!(
+            GraphError::InvalidName {
+                name: "x".into(),
+                reason: name_error(),
+                source: "s".into(),
+                line: 7,
+            }
+            .span(),
+            Some(Span::point(7, 1))
+        );
+        assert_eq!(
+            GraphError::InvalidDependencyName {
+                service: "a".into(),
+                dep: "x".into(),
+                reason: name_error(),
+                source: "s".into(),
+                line: 9,
+            }
+            .span(),
+            Some(Span::point(9, 1))
+        );
+        assert_eq!(
+            GraphError::SelfDependency {
+                service: "a".into(),
+                source: "s".into(),
+                line: 11,
+            }
+            .span(),
+            Some(Span::point(11, 1))
+        );
+        assert_eq!(
+            GraphError::NoCommand {
+                service: "a".into(),
+                kind: ServiceKind::Process,
+                source: "s".into(),
+                line: 13,
+            }
+            .span(),
+            Some(Span::point(13, 1))
+        );
+        // Line 0 means "the caller never supplied one": no span, not line 0.
+        assert_eq!(
+            GraphError::SelfDependency {
+                service: "a".into(),
+                source: "s".into(),
+                line: 0,
+            }
+            .span(),
+            None
+        );
+        // Set-level errors have no line at all.
+        assert_eq!(
+            GraphError::DuplicateName {
+                name: "a".into(),
+                first: "x".into(),
+                second: "y".into(),
+            }
+            .span(),
+            None
+        );
+        assert_eq!(
+            GraphError::Cycle {
+                path: vec!["a".into(), "a".into()],
+            }
+            .span(),
+            None
+        );
+        assert_eq!(GraphError::TooManyServices { count: 3 }.span(), None);
+        assert_eq!(
+            GraphError::UnresolvedIdentity {
+                service: "a".into(),
+                name: "nobody".into(),
+            }
+            .span(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_cycle_renders_as_an_arrow_chain() {
+        assert_eq!(
+            render_cycle(&["a".to_string(), "b".to_string(), "a".to_string()]),
+            "a -> b -> a"
+        );
+        assert_eq!(render_cycle(&["only".to_string()]), "only");
+        assert_eq!(render_cycle(&[]), "");
+    }
+
+    #[test]
+    fn suggestions_respect_the_budget_and_the_length_slack() {
+        let names = |v: &[&str]| -> Vec<(String, Idx)> {
+            v.iter()
+                .enumerate()
+                .map(|(i, n)| (String::from(*n), i))
+                .collect()
+        };
+        // Exactly the budget (3 edits), no length gap: offered.
+        assert_eq!(suggest("abc", &names(&["xyz"])).as_deref(), Some("xyz"));
+        // One edit past the budget: not offered.
+        assert_eq!(suggest("abc", &names(&["wxyz"])), None);
+        // A length gap of exactly SLACK (2) with two edits: still offered.
+        assert_eq!(
+            suggest("abcdef", &names(&["abcdefgh"])).as_deref(),
+            Some("abcdefgh")
+        );
+        // One past the slack, even though the distance is only the budget.
+        assert_eq!(suggest("abcdef", &names(&["abcdefghi"])), None);
+        // The same slack in the other direction: the needle is the long one.
+        assert_eq!(suggest("abcdefghi", &names(&["abcdef"])), None);
+    }
+
+    #[test]
+    fn suggestion_ties_keep_the_smaller_name_and_improvements_win() {
+        let names = |v: &[&str]| -> Vec<(String, Idx)> {
+            v.iter()
+                .enumerate()
+                .map(|(i, n)| (String::from(*n), i))
+                .collect()
+        };
+        // "aa" is one edit from both; the smaller name wins on the tie.
+        assert_eq!(suggest("aa", &names(&["ab", "ba"])).as_deref(), Some("ab"));
+        // A strictly better later candidate must replace the earlier one.
+        assert_eq!(suggest("aa", &names(&["az", "aa"])).as_deref(), Some("aa"));
+    }
+
+    #[test]
+    fn a_double_qualified_dependency_is_one_warning() {
+        // Declared both `x` and `opt:x`: one edge, required wins, and the
+        // operator is told once. Two findings here would mean the merge is
+        // reported per spelling instead of per dependency.
+        // Two of them, so both cursors in the merge loop have to advance: a
+        // loop that only ever moves one cursor reports the first and then
+        // stalls or skips the second.
+        let (_, findings) = Graph::build_with_findings(&[
+            desc_with("a", ServiceKind::Process, &["b", "c"], &["b", "c"]),
+            desc_with("b", ServiceKind::Process, &[], &[]),
+            desc_with("c", ServiceKind::Process, &[], &[]),
+        ])
+        .expect("a double declaration is a warning, not a failure");
+        let w101: Vec<&Diagnostic> = findings.iter().filter(|d| d.code == "W101").collect();
+        assert_eq!(w101.len(), 2, "findings: {findings:?}");
+        assert!(w101[0].message.contains("`b`"));
+        assert!(w101[1].message.contains("`c`"));
     }
 
     #[test]
