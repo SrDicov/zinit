@@ -684,6 +684,11 @@ pub fn parse_service_with_diagnostics(name: &str, text: &str) -> Result<ParsedSe
                 // much whitespace the line starts with.
                 if let Some(off) = comment_at {
                     let comment_col = off as u32 + 1;
+                    // equivalent (cargo-mutants): `>=` cannot be observed.
+                    // `comment_col == value_col` means the `#` is the first
+                    // byte of the value; the value would then be empty and
+                    // E003 returns before this point. So the two are never
+                    // equal when the comparison runs.
                     if comment_col > value_col {
                         warnings.push(Diagnostic::warning(
                             Some(Span::point(n, comment_col)),
@@ -1268,6 +1273,15 @@ fn comment_offset(line: &str) -> Option<usize> {
             b'\\' => {
                 // `i` is on a `\\`, which is one byte, so `i + 1` is a boundary.
                 {
+                    // equivalent (cargo-mutants): `line[i + 1..]` mutated to
+                    // `line[i * 1..]` reads the backslash itself. Its
+                    // `len_utf8` is 1, so the mutant advances by two bytes
+                    // instead of 1 + the escaped character's length. When the
+                    // escaped character is multi-byte the mutant lands on a
+                    // continuation byte, and continuation bytes are never `\`
+                    // or `#`; it walks them one by one and rejoins the
+                    // original at the next character boundary. The `?` case
+                    // (backslash at end of line) is `None` both ways.
                     let c = line[i + 1..].chars().next()?;
                     i += 1 + c.len_utf8()
                 }
@@ -1595,6 +1609,12 @@ fn parse_depends(
         let in_required = desc.requires(name);
         let in_optional = desc.depends_optional.iter().any(|n| n == name);
         let in_after = desc.depends_after.iter().any(|n| n == name);
+        // equivalent (cargo-mutants): the first `==` mutated to `!=` is not
+        // observable. At most one of the three `in_*` flags is true (the
+        // branches below keep the lists disjoint), so the only changed rows
+        // are `class != 0` with the name already in `required`: the mutant
+        // makes `same` true and skips, and the original makes it false and
+        // then skips on `if in_required` a few lines down. Same outcome.
         let same =
             (class == 0 && in_required) || (class == 1 && in_optional) || (class == 2 && in_after);
         if same {
@@ -2605,6 +2625,18 @@ rlimit-nofile = 8192
     }
 
     #[test]
+    fn an_unescaped_hash_inside_a_command_warns() {
+        // The comment is stripped, so the command is `/bin/true` and the rest
+        // is gone: that is exactly the silent truncation W001 exists to
+        // report. An escaped `#` is a literal and must not warn.
+        let bag = warns("command = /bin/true # trailing\n");
+        let w = bag.iter().find(|d| d.code == "W001").expect("a warning");
+        assert_eq!(w.span.expect("a span").column, 21);
+        assert!(w.message.contains("/bin/true"), "{}", w.message);
+        assert!(!has_warning(&warns("command = /bin/true\\#x\n"), "W001"));
+    }
+
+    #[test]
     fn ready_none_on_a_process_warns_but_does_not_fail() {
         let bag = warns("command = /bin/true\nready = none\n");
         let w = bag.iter().find(|d| d.code == "W003").expect("a warning");
@@ -2651,6 +2683,22 @@ rlimit-nofile = 8192
         // An unknown bare word does not get that treatment.
         let e2 = err("prose\n");
         assert!(e2.message.contains("no `=`"), "{}", e2.message);
+    }
+
+    #[test]
+    fn the_unknown_key_help_is_a_comma_separated_list() {
+        // `i > 0` is the separator guard: `>=` and `==` would put a comma in
+        // front of the first directive, `<` would drop every separator and
+        // run the names together.
+        let e = err("bogus = 1\n");
+        assert_eq!(e.code, "E004");
+        assert!(e.help.starts_with("known directives: `"), "{}", e.help);
+        assert!(
+            e.help.contains("`command`, `type`, `depends`"),
+            "{}",
+            e.help
+        );
+        assert!(!e.help.contains("directives: ,"), "{}", e.help);
     }
 
     #[test]
@@ -2745,6 +2793,16 @@ rlimit-nofile = 8192
     }
 
     #[test]
+    fn duplicates_are_idempotent_in_every_list() {
+        // The `same` predicate is a table over the three classes. Required is
+        // covered above; optional and order-only have their own arms, and a
+        // wrong arm turns an exact duplicate into E010.
+        let d = ok("command = /bin/true\ndepends = opt:a, opt:a, after:b, after:b\n");
+        assert_eq!(d.depends_optional, ["a"]);
+        assert_eq!(d.depends_after, ["b"]);
+    }
+
+    #[test]
     fn a_name_declared_required_first_wins_over_a_later_opt() {
         let d = ok("command = /bin/true\ndepends = a, opt:a\n");
         assert_eq!(d.depends_required, ["a"]);
@@ -2765,10 +2823,12 @@ rlimit-nofile = 8192
     #[test]
     fn soft_lists_contradict_each_other() {
         // opt: ignores, after: waits: no first-wins, the file cannot mean both.
-        assert_eq!(
-            err("command = /bin/true\ndepends = opt:a, after:a\n").code,
-            "E010"
-        );
+        let e = err("command = /bin/true\ndepends = opt:a, after:a\n");
+        assert_eq!(e.code, "E010");
+        // The message says the two *soft* classes disagree; the required
+        // branch would say "is now declared required", which is not what the
+        // file wrote.
+        assert!(e.message.contains("declared softly"), "{}", e.message);
         assert_eq!(
             err("command = /bin/true\ndepends = after:a, opt:a\n").code,
             "E010"
@@ -2960,6 +3020,19 @@ rlimit-nofile = 8192
     }
 
     #[test]
+    fn the_line_limit_is_exactly_64_kibibytes() {
+        // `64 * 1024`, not `64 + 1024`: a line at the documented limit must
+        // parse, and the limit must not shrink to a thousand bytes by an
+        // arithmetic slip. The rejection half is above; this is the half that
+        // proves where the boundary is.
+        assert_eq!(MAX_LINE_BYTES, 65_536);
+        let prefix = "command = ";
+        let line = format!("{prefix}{}", "a".repeat(MAX_LINE_BYTES - prefix.len()));
+        assert_eq!(line.len(), MAX_LINE_BYTES);
+        assert_eq!(ok(&line).command.len(), MAX_LINE_BYTES - prefix.len());
+    }
+
+    #[test]
     fn an_enormous_text_is_rejected_before_anything_is_allocated() {
         let mut big = String::with_capacity(MAX_TEXT_BYTES + 1);
         while big.len() <= MAX_TEXT_BYTES {
@@ -2971,6 +3044,29 @@ rlimit-nofile = 8192
     }
 
     #[test]
+    fn text_at_the_byte_limit_is_accepted_and_one_over_is_not() {
+        // The limit is a `>` on the whole text, so exactly MAX_TEXT_BYTES is a
+        // valid description and MAX_TEXT_BYTES + 1 is E015. `>=` would reject
+        // the first, `==` would accept the second.
+        let mut t = String::from("command = /bin/true\n");
+        while t.len() < MAX_TEXT_BYTES {
+            t.push('#');
+            let room = MAX_TEXT_BYTES - t.len() - 1;
+            for _ in 0..room.min(1000) {
+                t.push('a');
+            }
+            t.push('\n');
+        }
+        assert_eq!(t.len(), MAX_TEXT_BYTES);
+        assert!(parse_service("sshd", &t).is_ok(), "exactly at the limit");
+        t.push('\n');
+        assert_eq!(t.len(), MAX_TEXT_BYTES + 1);
+        let e = err(&t);
+        assert_eq!(e.code, "E015");
+        assert!(e.message.contains("byte limit"), "{}", e.message);
+    }
+
+    #[test]
     fn a_description_of_a_million_lines_is_rejected() {
         let mut many = String::new();
         for _ in 0..(MAX_LINES as usize + 1) {
@@ -2979,6 +3075,17 @@ rlimit-nofile = 8192
         let e = err(&many);
         assert_eq!(e.code, "E015");
         assert!(e.message.contains("line limit"), "{}", e.message);
+    }
+
+    #[test]
+    fn exactly_the_line_limit_is_accepted() {
+        // `n > MAX_LINES`: line MAX_LINES is fine, MAX_LINES + 1 is not.
+        // `>=` would reject the last valid line and `==` would let the extra
+        // one through.
+        let many = "\n".repeat(MAX_LINES as usize);
+        assert!(parse_service("sshd", &many).is_ok(), "line MAX_LINES");
+        let too_many = "\n".repeat(MAX_LINES as usize + 1);
+        assert_eq!(err(&too_many).code, "E015");
     }
 
     /// Run the parser under `catch_unwind`, so "did not panic" is a real
@@ -3253,6 +3360,20 @@ rlimit-nofile = 8192
     }
 
     #[test]
+    fn quoting_keeps_exactly_the_bytes_that_fit() {
+        // The bounds above are satisfied by almost any truncation, so they do
+        // not pin the boundary. These do: 48 ASCII bytes are kept whole, the
+        // 49th is dropped, and a two-byte character that would cross the line
+        // is left out rather than half-written.
+        let at = "a".repeat(MAX_QUOTE_BYTES);
+        assert_eq!(quote(&at), at);
+        let over = "a".repeat(MAX_QUOTE_BYTES + 1);
+        assert_eq!(quote(&over), format!("{at}..."));
+        let mixed = format!("{at}ñ");
+        assert_eq!(quote(&mixed), format!("{at}..."));
+    }
+
+    #[test]
     fn number_parsing_is_strict() {
         // The shared scanner, reached through the `rlimit-*` directive: the
         // same answer a `tcp:` port gets.
@@ -3374,6 +3495,30 @@ rlimit-nofile = 8192
             (0, 3),
             "the range covers the input"
         );
+    }
+
+    #[test]
+    fn an_escaped_multibyte_character_advances_by_its_byte_length() {
+        // `\ñ` is three bytes: the backslash and a two-byte character. The
+        // offset after it is what the next entry's `start` is measured from,
+        // so an off-by-one here puts every later diagnostic on the wrong
+        // column.
+        let value = "\"a\\ñ\", b";
+        let parts = split_list_spans(value);
+        assert_eq!(parts[0].text, "añ");
+        assert_eq!((parts[0].start, parts[0].end), (0, 6));
+        assert_eq!(parts[1].text, " b");
+        assert_eq!((parts[1].start, parts[1].end), (7, 9));
+        assert_eq!(&value[parts[1].start..parts[1].end], " b");
+    }
+
+    #[test]
+    fn a_comment_marker_is_not_part_of_a_directive() {
+        // Comment stripping normally removes it first, but the function's own
+        // contract is that `#` ends the scan; without that arm `a#b = c`
+        // becomes the key `a#b`.
+        assert_eq!(split_directive("a#b = c"), None);
+        assert_eq!(split_directive("a = b#c"), Some(("a", " b#c")));
     }
 
     /// A xorshift64, so the "fuzz" test is a fixed regression test that fails
